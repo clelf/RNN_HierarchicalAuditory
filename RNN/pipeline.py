@@ -44,7 +44,9 @@ def train(model, gm_name, model_config, data_config):
 
             # Call model
             x = torch.tensor(y, dtype=torch.float, requires_grad=False).to(DEVICE)
-            obs_mean, obs_var, ... = model(x)
+            obs = model(x)
+            mu      = obs[..., [0]]
+            sigma   = torch.log(1 + torch.exp(obs[..., [1]]))
 
             # Compute loss
             loss = model.loss(estim, target, loss_function=loss_function)
@@ -70,12 +72,6 @@ def test():
 
 if __name__=='__main__':
 
-    # Define training parameters
-    num_epochs      = 150
-    batch_res       = 10   # Store and report loss every batch_res batches
-    batch_size      = 128
-    learning_rate   = 5e-4
-    optimizer       = torch.optim.Adam
 
     # Define experiment parameters (non-hierarchical)
     n_trials    = 5000 # Single tones
@@ -98,10 +94,19 @@ if __name__=='__main__':
     phi_z_dim       = rnn_hidden_dim
     phi_prior_dim   = rnn_hidden_dim
 
+    # Define training parameters
+    num_epochs      = 150
+    batch_res       = 10   # Store and report loss every batch_res batches
+    batch_size      = 128
+    learning_rate   = 5e-4
+    optimizer       = torch.optim.Adam
+    loss_function   = torch.nn.GaussianNNL # GaussianNNL
+
+
         
     # Define model
-    rnn     = SimpleRNN(x_dim=input_dim, hidden_dim=rnn_hidden_dim, n_layers=rnn_n_layers)
-    vrnn    = VRNN(x_dim=input_dim, latent_dim=latent_dim, phi_x_dim=phi_x_dim, phi_z_dim=phi_z_dim, phi_prior_dim=phi_prior_dim, rnn_hidden_states_dim=rnn_hidden_dim, rnn_n_layers=rnn_n_layers)
+    rnn     = SimpleRNN(x_dim=input_dim, output_dim=dim_out_obs, hidden_dim=rnn_hidden_dim, n_layers=rnn_n_layers)
+    vrnn    = VRNN(x_dim=input_dim, output_dim=dim_out_obs, latent_dim=latent_dim, phi_x_dim=phi_x_dim, phi_z_dim=phi_z_dim, phi_prior_dim=phi_prior_dim, rnn_hidden_states_dim=rnn_hidden_dim, rnn_n_layers=rnn_n_layers)
 
     for model in [rnn, vrnn]:    
         train(model, optimizer=optimizer, lr=learning_rate)
