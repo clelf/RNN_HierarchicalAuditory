@@ -11,7 +11,7 @@ import numpy as np
 
 
 class SimpleRNN(nn.Module):
-    def __init__(self, x_dim, output_dim, hidden_dim, n_layers, loss_func=nn.BCELoss, device=torch.device('cpu')):
+    def __init__(self, x_dim, output_dim, hidden_dim, n_layers, batch_size=None, loss_func=nn.BCELoss, device=torch.device('cpu')):
         super().__init__()
 
         self.name = 'rnn'
@@ -25,20 +25,33 @@ class SimpleRNN(nn.Module):
 
         self.loss_func = loss_func
 
+        if batch_size is not None:
+            self.init_hidden(batch_size)
+        else:
+            self.hidden_states = None
+
+    def init_hidden(self, batch_size):
+        h_size = [self.n_layers, batch_size, self.n_hidden]
+        self.hidden_states = torch.zeros(*h_size).to(self.dev)
+
     def forward(self, x, hx=None):
-        output_seq, h_t = self.rnn(x, hx)  # output_seq is the sequence of final hidden states after the last layer / h_last is the final hidden state of each layer
+        if hx is None: hx=self.hidden_states
+        output_seq, self.hidden_states = self.rnn(x, hx)  # output_seq is the sequence of final hidden states after the last layer / h_last is the final hidden state of each layer
         output = self.output_layer(output_seq)
-        return output, h_t
+        return output
     
-    def loss(self, out_estim, y_target, loss_func=nn.BCELoss, **kwargs):
+    def loss(self, target, output, loss_func=nn.BCELoss, **kwargs):
+        out_estim = output[0]
         if loss_func is None: loss_func=self.loss_func
         if kwargs: loss_func = partial(loss_func, **kwargs) # In case more arguements are passed, depending on the loss_func considered
         if self.output_dim>1: 
             # If the model is learning sufficient stats of the distribution the estimation rather than the estimation,
             # then out_estim contains 2 variables: mu and var
-            return loss_func(out_estim[:,:,0], y_target, out_estim[:,:,1])
+            out_estim_mu    = out_estim[:,:,0]
+            out_estim_var   = F.softplus(out_estim[:,:, 1]) + 1e-6 # Ensure the variance is stricly positive
+            return loss_func(out_estim_mu, target, out_estim_var)
         else:
-            return loss_func(out_estim, y_target)
+            return loss_func(out_estim, target)
 
 
 class VAE(nn.Module):
@@ -104,37 +117,40 @@ class VAE(nn.Module):
         z = self.encoder(x, self.x_dim, self.hidden_units_dim)
 
         # Reparametrize the latent variable
-        mu = self.fc_mu(z)
-        logvar = self.fc_var(z)
-        z = self.reparameterize(mu, logvar)
+        latent_mu = self.fc_mu(z)
+        latent_logvar = self.fc_var(z)
+        z = self.reparameterize(latent_mu, latent_logvar)
 
         # Decode (reconstruct / generate)
         x_ = self.decoder(z, self.hidden_units_dim, self.x_dim)
 
-        return x_, mu, logvar
+        return x_, latent_mu, latent_logvar
 
 
-    def loss(self, x_output, x, mu, logvar, loss_func=nn.BCELoss, **kwargs):
-        return self.vae_loss_function(self, x_output, x, mu, logvar, loss_func=loss_func, **kwargs)
+    def loss(self, x_target, x_output, latent_mu, latent_logvar, loss_func=nn.BCELoss, **kwargs):
+        return self.vae_loss_function(self, x_target, x_output, latent_mu, latent_logvar, loss_func=loss_func, **kwargs)
 
 
-    def vae_loss_function(self, x_output, x, mu, logvar, loss_func=nn.BCELoss, **kwargs):
+    def vae_loss_function(self, x_target, x_output, latent_mu, latent_logvar, loss_func=nn.BCELoss, **kwargs):
         # (from pytorch's VAE implementation: https://github.com/pytorch/examples/blob/main/vae/main.py#L85)
         #Reconstruction + KL divergence losses summed over all elements and batch
         
         if kwargs: loss_func = partial(loss_func, **kwargs) # In case more arguements are passed, depending on the loss_func considered
         
-        if self.output_dim>1: 
-            recon_loss = loss_func(x_output[:, :, 0], x.view(-1, self.x_dim), x_output[:, :, 1], **kwargs) # TODO: verify if want to keep BCE over MSE
-        else:
+        if self.output_dim==2:
+            # In case output contains mu and var
+            recon_loss = loss_func(x_output[:, :, 0], x_target.view(-1, self.x_dim), x_output[:, :, 1], **kwargs)
+        elif self.output_dim==1
             x_output = torch.sigmoid(x_output)
-            recon_loss = loss_func(x_output, x.view(-1, self.x_dim), **kwargs)
-
+            recon_loss = loss_func(x_output, x_target.view(-1, self.x_dim), **kwargs) # in case dealing with point estimates and not distributions, # TODO: verify if want to keep BCE over MSE
+        else:
+            raise ValueError('output_dim must be 1 or 2') 
+        
         # see Appendix B from VAE paper:
         # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
         # https://arxiv.org/abs/1312.6114
         # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())
 
         return recon_loss + kl_loss
     
@@ -142,7 +158,7 @@ class VAE(nn.Module):
 
 class VRNN(VAE): # Or rather, inherit from VAE
 
-    def __init__(self, x_dim, output_dim, latent_dim, phi_x_dim, phi_z_dim, phi_prior_dim, rnn_hidden_states_dim, rnn_n_layers, hidden_units_dim=None):
+    def __init__(self, x_dim, output_dim, latent_dim, phi_x_dim, phi_z_dim, phi_prior_dim, rnn_hidden_states_dim, rnn_n_layers, batch_size, hidden_units_dim=None):
         """_summary_
 
         Parameters
@@ -182,7 +198,7 @@ class VRNN(VAE): # Or rather, inherit from VAE
 
 
         # RNN part
-        self.recurrence = SimpleRNN(self.phi_x_dim + self.phi_z_dim, self.rnn_hidden_states_dim,  self.rnn_n_layers)
+        self.recurrence = SimpleRNN(self.phi_x_dim + self.phi_z_dim, self.rnn_hidden_states_dim,  self.rnn_n_layers, batch_size=batch_size)
 
         # self.rnn = nn.GRU(self.x_dim + self.latent_dim, self.rnn_hidden_states_dim, self.rnn_n_layers, batch_first=True, device=device)
         # self.output_layer = nn.Linear(self.rnn_hidden_states_dim, x_dim, device=device)
@@ -196,14 +212,6 @@ class VRNN(VAE): # Or rather, inherit from VAE
         return module
 
 
-    # def reccurrence(self, x, hx=None):
-    #     # Defined like SimpleRNN's forward
-    #     # output_seq is the sequence of final hidden states after the last layer / h_last is the final hidden state of each layer
-    #     output_seq, h_t = self.rnn(x, hx)  
-    #     output = self.output_layer(output_seq)
-    #     return output, h_t
-   
-
     def forward(self, x):
 
         seq_len, batch_size, x_dim = x.size()
@@ -211,10 +219,12 @@ class VRNN(VAE): # Or rather, inherit from VAE
 
         hidden_states = torch.zeros(self.rnn_n_layers, batch_size, self.rnn_hidden_states_dim)
         h_prev = hidden_states
-        h_t = h_prev
+        h_t = h_prev # TODO: decide if still necessary given hidden_states of RNN are now handled internally in RNN class and not a just a method parameter anymore?
         # h = torch.zeros(B, self.rnn_hidden_states_dim, device=x.device)
         outputs = []
         rnn_outputs = []
+        latent_mus = []
+        latent_logvars = []
         prior_mus = []
         prior_logvars = []
 
@@ -225,9 +235,11 @@ class VRNN(VAE): # Or rather, inherit from VAE
             z_t = self.encoder(torch.cat([self.phi_x(x_t), h_prev], dim=-1)) # Eq. 9
 
             # Reparametrize the latent variable
-            mu_seq = self.fc_mu(z_t)
-            logvar_seq = self.fc_logvar(z_t)
-            z_t = self.reparameterize(mu_seq, logvar_seq)
+            latent_mu = self.fc_mu(z_t)
+            latent_logvar = self.fc_logvar(z_t)
+            prior_mus.append(prior_mu)
+            prior_logvars.append(prior_logvar)
+            z_t = self.reparameterize(latent_mu, latent_logvar)
 
             # Prior
             z_prior = self.phi_prior(h_prev) # Eq. 5
@@ -242,41 +254,45 @@ class VRNN(VAE): # Or rather, inherit from VAE
             outputs.append(x_t_)
             
             # Recurrence
-            rnn_output, h_t = self.recurrence(torch.cat([self.phi_x(x_t), self.phi_z(z_t)], dim=-1), h_prev) # Eq. 7
+            rnn_output = self.recurrence(torch.cat([self.phi_x(x_t), self.phi_z(z_t)], dim=-1), h_prev) # Eq. 7
             rnn_outputs.append(rnn_output)
-            h_prev = h_t
+            h_prev = self.recurrence.hidden_states
 
+        self.rnn_hidden_states = self.recurrence.hidden_states
 
         # Stack across time
         outputs = torch.stack(outputs, dim=0)             # [T, B, x_dim]
-        mu_seq = torch.stack(mu_seq, dim=0)               # [T, B, latent_dim]
-        logvar_seq = torch.stack(logvar_seq, dim=0)       # [T, B, latent_dim]
+        latent_mus = torch.stack(latent_mus, dim=0)               # [T, B, latent_dim]
+        latent_logvars = torch.stack(latent_logvars, dim=0)       # [T, B, latent_dim]
         prior_mus = torch.stack(prior_mus, dim=0)         # [T, B, latent_dim]
         prior_logvars = torch.stack(prior_logvars, dim=0) # [T, B, latent_dim]
                 
 
-        return outputs, mu_seq, logvar_seq, prior_mus, prior_logvars
+        return outputs, latent_mus, latent_logvars, prior_mus, prior_logvars
     
     
-    def loss(self, x_output, x, mu, logvar, mu_prior, logvar_prior, loss_func=nn.BCELoss, **kwargs):
-        return self.vrnn_loss(x_output, x, mu, logvar, mu_prior, logvar_prior, loss_func=loss_func, **kwargs)
+    def loss(self, x_target, x_output, mu_latent, logvar, mu_prior, logvar_prior, loss_func=nn.BCELoss, **kwargs):
+        return self.vrnn_loss(x_target, x_output, mu_latent, logvar, mu_prior, logvar_prior, loss_func=loss_func, **kwargs)
     
 
-    def vrnn_loss(self, x_output, x, mu, logvar, mu_prior, logvar_prior, loss_func=nn.BCELoss, **kwargs): # KL divergence
+    def vrnn_loss(self, x_target, x_output, mu_latent, logvar_latent, mu_prior, logvar_prior, loss_func=nn.BCELoss, **kwargs): # KL divergence
         
         if kwargs: loss_func = partial(loss_func, **kwargs) # In case more arguements are passed, depending on the loss_func considered
         
-        if self.output_dim>1: 
-            recon_loss = loss_func(x_output[:, :, 0], x.view(-1, self.x_dim), x_output[:, :, 1], **kwargs) # TODO: verify if want to keep BCE over MSE
-        else:
+        if self.output_dim==2:
+            # In case output contains mu and var
+            recon_loss = loss_func(x_output[:, :, 0], x_target.view(-1, self.x_dim), x_output[:, :, 1], **kwargs)
+        elif self.output_dim==1
             x_output = torch.sigmoid(x_output)
-            recon_loss = loss_func(x_output, x.view(-1, self.x_dim), **kwargs)
-
+            recon_loss = loss_func(x_output, x_target.view(-1, self.x_dim), **kwargs) # in case dealing with point estimates and not distributions, # TODO: verify if want to keep BCE over MSE
+        else:
+            raise ValueError('output_dim must be 1 or 2')
+        
         # KL divergence between two Gaussians per timestep & batch
         # KL(q||p) closed form between N(mu, var) and N(mu_prior, logvar_prior)
         kl_element = (
-            logvar_prior - logvar
-            + (logvar.exp() + (mu - mu_prior).pow(2)) / logvar_prior.exp()
+            logvar_prior - logvar_latent
+            + (logvar_latent.exp() + (mu_latent - mu_prior).pow(2)) / logvar_prior.exp()
             - 1
         )
 
