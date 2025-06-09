@@ -228,7 +228,7 @@ class AuditGenerativeModel:
         # tau = self._sample_TN_(0, 1, self.mu_tau, self.si_tau, (np.max(contexts)+1, contexts.shape[0])) # TODO: check if okay to replace with len(np.unique(contexts))
         # lim = self._sample_N_(self.mu_lim, self.si_lim, (np.max(contexts)+1, contexts.shape[0]))
 
-        states = dict([(c, np.zeros(contexts.shape)) for c in np.unique(contexts)])
+        states = dict([(int(c), np.zeros(contexts.shape)) for c in np.unique(contexts)])
 
         for c in np.unique(contexts):  # np.unique(contexts)=range(2)
 
@@ -338,6 +338,8 @@ class AuditGenerativeModel:
         # ! Except for the dictionary variable like states, that should keep the keys separate
         # res_reshaped = [np.stack([x for x in var_list], axis=0) for var_list in zip(*batches)]
         res_reshaped = [reshape_batch_variable(var_list) for var_list in zip(*batches)]
+
+        # TODO: PROBLEME AVEC BATCH: certains ne retournent que 1 batch
 
         return res_reshaped
 
