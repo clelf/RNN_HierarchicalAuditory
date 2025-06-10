@@ -138,14 +138,14 @@ class VAE(nn.Module):
                 
         if self.output_dim==2 and x_output.size(2)==2:
             # In case output contains mu and var
-            out_estim_mu    = x_output[:,:,0]
-            out_estim_var   = F.softplus(x_output[:,:, 1]) + 1e-6 # Ensure the variance is stricly positive
-            if kwargs: recon_loss = loss_func(out_estim_mu, x_target.view(-1, self.x_dim), out_estim_var, **kwargs)
-            else: recon_loss = loss_func(out_estim_mu, x_target.view(-1, self.x_dim), out_estim_var)
+            out_estim_mu    = x_output[:, :, [0]]
+            out_estim_var   = F.softplus(x_output[:, :, [1]]) + 1e-6 # Ensure the variance is stricly positive
+            if kwargs: recon_loss = loss_func(out_estim_mu, x_target, out_estim_var, **kwargs)
+            else: recon_loss = loss_func(out_estim_mu, x_target, out_estim_var)
         elif self.output_dim==1 and x_output.size(2)==1:
             x_output = torch.sigmoid(x_output)
-            if kwargs: recon_loss = loss_func(x_output, x_target.view(-1, self.x_dim), **kwargs) # in case dealing with point estimates and not distributions, # TODO: verify if want to keep BCE over MSE
-            else: recon_loss = loss_func(x_output, x_target.view(-1, self.x_dim))
+            if kwargs: recon_loss = loss_func(x_output, x_target, **kwargs) # in case dealing with point estimates and not distributions, # TODO: verify if want to keep BCE over MSE
+            else: recon_loss = loss_func(x_output, x_target)
         else:
             raise ValueError('output_dim must be 1 or 2') 
         
@@ -202,7 +202,7 @@ class VRNN(VAE): # Or rather, inherit from VAE
 
         # RNN part
         # self.recurrence = SimpleRNN(x_dim=self.phi_x_dim + self.phi_z_dim, output_dim=..., hidden_dim=self.rnn_hidden_states_dim, n_layers=self.rnn_n_layers, batch_size=batch_size)
-        self.rnn = nn.GRU(input_size=self.x_dim + self.latent_dim, hidden_size=self.rnn_hidden_states_dim, num_layers=self.rnn_n_layers, batch_first=True, device=device)
+        self.rnn = nn.GRU(input_size=self.phi_x_dim + self.phi_z_dim, hidden_size=self.rnn_hidden_states_dim, num_layers=self.rnn_n_layers, batch_first=False, device=device)
         # self.output_layer = nn.Linear(self.rnn_hidden_states_dim, x_dim, device=device)
 
 
@@ -219,7 +219,7 @@ class VRNN(VAE): # Or rather, inherit from VAE
         seq_len, batch_size, x_dim = x.size()
         if x_dim!=self.x_dim: raise ValueError("Incorrect dimensions for input x")
 
-        h_prev          = torch.zeros(self.rnn_n_layers, batch_size, self.rnn_hidden_states_dim, device=self.device)
+        h_prev  = torch.zeros(self.rnn_n_layers, batch_size, self.rnn_hidden_states_dim, device=self.device)
         outputs = []
         latent_mus = []
         latent_logvars = []
@@ -248,8 +248,8 @@ class VRNN(VAE): # Or rather, inherit from VAE
 
 
             # Decode
-            x_t_ = self.decoder(torch.cat([self.phi_z(z_t), h_prev[-1]], dim=-1)) # Eq. 6
-            outputs.append(x_t_)
+            x_t_out = self.decoder(torch.cat([self.phi_z(z_t), h_prev[-1]], dim=-1)) # Eq. 6
+            outputs.append(x_t_out)
             
             # Recurrence
             # rnn_output = self.recurrence(torch.cat([self.phi_x(x_t), self.phi_z(z_t)], dim=-1), h_prev) # Eq. 7
@@ -281,15 +281,15 @@ class VRNN(VAE): # Or rather, inherit from VAE
         
         # In case output contains mu and var
         if self.output_dim==2:
-            out_estim_mu = x_output[:, :, 0]
-            out_estim_var = F.softplus(x_output[:, :, 1]) + 1e-06
-            if kwargs: recon_loss = loss_func(out_estim_mu, x_target.view(-1, self.x_dim), out_estim_var, **kwargs)
-            else: recon_loss = loss_func(out_estim_mu, x_target.view(-1, self.x_dim), out_estim_var)
+            out_estim_mu = x_output[:, :, [0]]
+            out_estim_var = F.softplus(x_output[:, :, [1]]) + 1e-06
+            if kwargs: recon_loss = loss_func(out_estim_mu, x_target, out_estim_var, **kwargs)
+            else: recon_loss = loss_func(out_estim_mu, x_target, out_estim_var)
         # Or just point estimation
         elif self.output_dim==1 and x_output.size(2)==1:
             x_output = torch.sigmoid(x_output)
-            if kwargs: recon_loss = loss_func(x_output, x_target.view(-1, self.x_dim), **kwargs) # in case dealing with point estimates and not distributions, # TODO: verify if want to keep BCE over MSE
-            else: recon_loss = loss_func(x_output, x_target.view(-1, self.x_dim))
+            if kwargs: recon_loss = loss_func(x_output, x_target, **kwargs) # in case dealing with point estimates and not distributions, # TODO: verify if want to keep BCE over MSE
+            else: recon_loss = loss_func(x_output, x_target) # DELETED .view(-1, self.x_dim) from x_target.view(-1, self.x_dim)
         
         # KL divergence between two Gaussians per timestep & batch
         # KL(q||p) closed form between N(mu, var) and N(mu_prior, logvar_prior)

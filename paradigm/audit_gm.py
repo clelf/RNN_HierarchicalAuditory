@@ -53,6 +53,8 @@ class AuditGenerativeModel:
         self.si_q = params["si_q"]
         self.si_r = params["si_r"]
 
+        if "N_ctx" not in params.keys(): self.N_ctx = 2 # context refers to being a std / dvt
+
     # Auxiliary samplers from goin.coin.GenerativeModel
 
     def _sample_N_(self, mu, si, size=1):
@@ -209,28 +211,23 @@ class AuditGenerativeModel:
         # d = self._sample_N_(0, self.si_d, (np.max(contexts)+1, contexts.shape[0]))
 
         # Sample params for each block
-        tau, lim = np.zeros((2, self.N_blocks)), np.zeros(
-            (2, self.N_blocks)
-        )  # 2 as for len({std, dvt})
+        tau, lim = np.zeros((2, self.N_blocks)), np.zeros((2, self.N_blocks))  # 2 as for len({std, dvt})
+
         for b in range(self.N_blocks):
             # Sample one pair of std/dvt lim values for each block
             mu_lim = self.sample_uniform_pair(self.tones_values)
 
-            for c in np.unique(contexts):  # np.unique(contexts)=range(2)
+            for c in range(self.N_ctx):  # 2 contexts: std or dvt
                 # Sample dynamics params for each context (std and dvt)
-                tau[c, b] = self._sample_TN_(
-                    1, 50, self.mu_tau, self.si_tau
-                ).item()  # A high boundary
-                lim[c, b] = self._sample_N_(
-                    mu_lim[c], self.si_lim
-                ).item()  # TODO: check values
+                tau[c, b] = self._sample_TN_(1, 50, self.mu_tau, self.si_tau).item()  # A high boundary
+                lim[c, b] = self._sample_N_(mu_lim[c], self.si_lim).item()  # TODO: check values
 
         # tau = self._sample_TN_(0, 1, self.mu_tau, self.si_tau, (np.max(contexts)+1, contexts.shape[0])) # TODO: check if okay to replace with len(np.unique(contexts))
         # lim = self._sample_N_(self.mu_lim, self.si_lim, (np.max(contexts)+1, contexts.shape[0]))
 
-        states = dict([(int(c), np.zeros(contexts.shape)) for c in np.unique(contexts)])
+        states = dict([(int(c), np.zeros(contexts.shape)) for c in range(self.N_ctx)])
 
-        for c in np.unique(contexts):  # np.unique(contexts)=range(2)
+        for c in range(self.N_ctx):  # self.N_ctx == 2
 
             # Initialize with a sample from distribution of mean and std the LGD stationary values
             # states[c][:,0] = self._sample_N_(d[c]/(1-a[c]), self.si_q/((1-a[c]**2)**.5), (contexts.shape[0], 1))
@@ -319,7 +316,7 @@ class AuditGenerativeModel:
         fig.tight_layout()
         plt.show()
 
-    def generate_batch(self, N_batch=None):
+    def generate_batch(self, N_batch=None, save=False):
         # Store latent rules and timbres, states and observations from N_batch batches
         # TODO: find a better way to store batches
 
@@ -372,18 +369,14 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
         self, N_blocks=None, N_tones=None, mu_rho_ctx=None, si_rho_ctx=None
     ):
 
-        if N_blocks is None:
-            N_blocks = self.N_blocks
-        if N_tones is None:
-            N_tones = self.N_tones
-        if mu_rho_ctx is None:
-            mu_rho_ctx = self.mu_rho_ctx
-        if si_rho_ctx is None:
-            si_rho_ctx = self.si_rho_ctx
+        if N_blocks is None:    N_blocks    = self.N_blocks
+        if N_tones is None:     N_tones     = self.N_tones
+        if mu_rho_ctx is None:  mu_rho_ctx  = self.mu_rho_ctx
+        if si_rho_ctx is None:  si_rho_ctx  = self.si_rho_ctx
 
         # Get std/dvt contexts
         contexts = self.sample_contexts(
-            N=N_tones, N_ctx=2, mu_rho_ctx=mu_rho_ctx, si_rho_ctx=si_rho_ctx
+            N=N_tones, N_ctx=self.N_ctx, mu_rho_ctx=mu_rho_ctx, si_rho_ctx=si_rho_ctx
         )
         contexts = contexts.reshape((N_blocks, N_tones))
 
@@ -393,6 +386,7 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
 
         # Flatten rules_long, contexts, (states, ) timbres and obs
         contexts = contexts.flatten()
+        pass
         states = dict([(key, states[key].flatten()) for key in states.keys()])
         obs = obs.flatten()
 
@@ -436,9 +430,7 @@ class HierarchicalAuditGM(AuditGenerativeModel):
             Sequence of rules associated with blocks for each block of N_blocks blocks
         """
 
-        return self.sample_contexts(
-            N_blocks, N_rules, mu_rho_rules, si_rho_rules, return_pi
-        )
+        return self.sample_contexts(N=N_blocks, N_ctx=N_rules, mu_rho_ctx=mu_rho_rules, si_rho_ctx=si_rho_rules, return_pi=return_pi)
 
     def sample_timbres(self, rules_seq, N_timbres, mu_rho_timbres, si_rho_timbres):
         """Sample timbres, mediated by a Markov chain transition process too
@@ -713,16 +705,10 @@ if __name__ == "__main__":
 
     gm = HierarchicalAuditGM(config_H)
 
-    rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs = (
-        gm.generate_run()
-    )
-    rules_, rules_long_, dpos_, timbres_, timbres_long_, contexts_, states_, obs_ = (
-        gm.generate_batch(N_batch=2)
-    )
+    rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs = gm.generate_run()
+    rules_, rules_long_, dpos_, timbres_, timbres_long_, contexts_, states_, obs_ = gm.generate_batch(N_batch=2)
 
-    gm.plot_contexts_rules_states_obs(
-        states[0][0 : gm.N_tones], states[1], obs, contexts, rules, dpos
-    )
+    gm.plot_contexts_rules_states_obs(states[0][0 : gm.N_tones], states[1], obs, contexts, rules, dpos)
     gm.plot_rules_dpos(rules, dpos)
     gm.plot_contexts_states_obs(
         contexts[0 : gm.N_tones],
@@ -749,9 +735,7 @@ if __name__ == "__main__":
     gm_NH = NonHierachicalAuditGM(config_NH)
 
     contexts_NH, states_NH, obs_NH = gm_NH.generate_run()
-    gm_NH.plot_contexts_states_obs(
-        contexts_NH, obs_NH, states_NH[0], states_NH[1], gm_NH.N_tones, figsize=(20, 6)
-    )
+    gm_NH.plot_contexts_states_obs(contexts_NH, obs_NH, states_NH[0], states_NH[1], gm_NH.N_tones, figsize=(20, 6))
 
     contexts_NH, states_NH, obs_NH = gm_NH.generate_batch(N_batch=2)
 
