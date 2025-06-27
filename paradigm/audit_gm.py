@@ -54,6 +54,7 @@ class AuditGenerativeModel:
         self.si_r = params["si_r"]
 
         if "N_ctx" not in params.keys(): self.N_ctx = 2 # context refers to being a std / dvt
+        else: self.N_ctx = params["N_ctx"]
 
     # Auxiliary samplers from goin.coin.GenerativeModel
 
@@ -101,14 +102,17 @@ class AuditGenerativeModel:
 
         return np.array(ss.truncnorm.rvs((a - mu) / si, (b - mu) / si, mu, si, size))
 
-    def sample_uniform_choice(self, set):
-        return np.random.choice(set)
+    def sample_uniform_choice(self, set_values):
+        """ Sample a choice of one value from a set of possible values
+        """
+        return np.random.choice(set_values)
 
-    def sample_uniform_pair(self, set):
-        pair = np.random.choice(set, size=(2,), replace=False)
-        # y_std = pair[0]
-        # y_dvt = pair[1]
-        return pair
+    def sample_uniform_set(self, set_values, N=2):
+        """ Sample a set of N value choices without replacement from a set of possible values
+        Note: len(values) should be > N
+        """
+        set = np.random.choice(set_values, size=(N,), replace=False)
+        return set
 
     def sample_next_markov_state(
         self, current_state, states_values, states_trans_matrix
@@ -131,15 +135,19 @@ class AuditGenerativeModel:
             Transition matrix
         """
 
-        # Sample parameters
-        rho = self._sample_TN_(0, 1, mu_rho, si_rho).item()
-        eps = [np.random.uniform() for n in range(N)]
+        if N>1:
+            # Sample parameters
+            rho = self._sample_TN_(0, 1, mu_rho, si_rho).item()
+            eps = [np.random.uniform() for n in range(N)]
 
-        # Delta has a zero diagonal and the rest of the elements of a row (for a rule) are partitions from 1 using the corresponding eps[row] (parameter for that rule), controlling for the sum to be 1
-        delta = np.array([[(0 if i == j else (eps[i] * (1 - eps[i]) ** j if (j < i and j < N - 2) else (eps[i] * (1 - eps[i]) ** (j - 1) if i < j < N - 1 else 1 - sum([eps[i] * (1 - eps[i]) ** k for k in range(N - 2)])))) for j in range(N)] for i in range(N)])
-        
-        # Transition matrix
-        pi = rho * np.eye(N) + (1 - rho) * delta
+            # Delta has a zero diagonal and the rest of the elements of a row (for a rule) are partitions from 1 using the corresponding eps[row] (parameter for that rule), controlling for the sum to be 1
+            delta = np.array([[(0 if i == j else (eps[i] * (1 - eps[i]) ** j if (j < i and j < N - 2) else (eps[i] * (1 - eps[i]) ** (j - 1) if i < j < N - 1 else 1 - sum([eps[i] * (1 - eps[i]) ** k for k in range(N - 2)])))) for j in range(N)] for i in range(N)])
+            
+            # Transition matrix
+            pi = rho * np.eye(N) + (1 - rho) * delta
+        else:
+            # if N==1:
+            pi = np.eye(N)
         return pi
 
     def sample_contexts(self, N, N_ctx, mu_rho_ctx, si_rho_ctx, return_pi=False):
@@ -193,7 +201,7 @@ class AuditGenerativeModel:
         contexts : integer np.array
             2-dimensional sequence of contexts filled with 0 or 1 (std or dvt), of size (N_blocks, N_tones)
         return_pars: bool
-            also returns the retention and drift parameters for each state
+            also returns the time constant and sationary value (previously: retention and drift) parameters for each state
 
 
         Returns
@@ -201,29 +209,25 @@ class AuditGenerativeModel:
         states : dict
             dictionary encoding the latent state values (one-dimensional np.array) for each
             context c (keys).
-        tau: time constants parameters for each context (only if return_pars set to True)
-        d: steady state parameters for each context (only if return_pars set to True)
+        tau: time constant parameter for each context (only if return_pars set to True)
+        lim: stationary value parameter for each context
+       
+        # Note that time constant and sationary value (previously: retention and drift) are sampled in every call 
 
         """
 
-        # # Note that retention and drift are sampled in every call
-        # a = self._sample_TN_(0, 1, self.mu_a, self.si_a, (np.max(contexts)+1, contexts.shape[0])) # TODO: check if okay to replace with len(np.unique(contexts))
-        # d = self._sample_N_(0, self.si_d, (np.max(contexts)+1, contexts.shape[0]))
+        # Initialize arrays of params
+        tau, lim = np.zeros((self.N_ctx, self.N_blocks)), np.zeros((self.N_ctx, self.N_blocks))  # self.N_ctx normally = 2 as for len({std, dvt})
 
         # Sample params for each block
-        tau, lim = np.zeros((2, self.N_blocks)), np.zeros((2, self.N_blocks))  # 2 as for len({std, dvt})
-
         for b in range(self.N_blocks):
             # Sample one pair of std/dvt lim values for each block
-            mu_lim = self.sample_uniform_pair(self.tones_values)
-
+            mu_lim_Cs = self.sample_uniform_set(self.tones_values) 
+            
             for c in range(self.N_ctx):  # 2 contexts: std or dvt
                 # Sample dynamics params for each context (std and dvt)
                 tau[c, b] = self._sample_TN_(1, 50, self.mu_tau, self.si_tau).item()  # A high boundary
-                lim[c, b] = self._sample_N_(mu_lim[c], self.si_lim).item()  # TODO: check values
-
-        # tau = self._sample_TN_(0, 1, self.mu_tau, self.si_tau, (np.max(contexts)+1, contexts.shape[0])) # TODO: check if okay to replace with len(np.unique(contexts))
-        # lim = self._sample_N_(self.mu_lim, self.si_lim, (np.max(contexts)+1, contexts.shape[0]))
+                lim[c, b] = self._sample_N_(mu_lim_Cs[c], self.si_lim).item()  # TODO: check values
 
         states = dict([(int(c), np.zeros(contexts.shape)) for c in range(self.N_ctx)])
 
@@ -231,11 +235,7 @@ class AuditGenerativeModel:
 
             # Initialize with a sample from distribution of mean and std the LGD stationary values
             # states[c][:,0] = self._sample_N_(d[c]/(1-a[c]), self.si_q/((1-a[c]**2)**.5), (contexts.shape[0], 1))
-            states[c][:, 0] = self._sample_N_(
-                lim[c, :],
-                self.si_q * tau[c, :] / ((2 * tau[c, :] - 1) ** 0.5),
-                (contexts.shape[0],),
-            )
+            states[c][:, 0] = self._sample_N_(lim[c, :], self.si_q * tau[c, :] / ((2 * tau[c, :] - 1) ** 0.5), (contexts.shape[0],))
 
             for b in range(self.N_blocks):
 
@@ -246,15 +246,11 @@ class AuditGenerativeModel:
 
                 for t in range(1, contexts.shape[1]):
                     # states[c][:,t] = a[c] * states[c][:,t-1] + d[c] + w[:,t-1]
-                    states[c][b, t] = (
-                        states[c][b, t - 1]
-                        + 1 / tau[c, b] * (lim[c, b] - states[c][b, t - 1])
-                        + w[b, t - 1]
-                    )
+                    states[c][b, t] = states[c][b, t - 1] + 1 / tau[c, b] * (lim[c, b] - states[c][b, t - 1]) + w[b, t - 1]
 
         if return_pars:
             # return states, a, d
-            return states, tau, lim
+            return states, (tau.squeeze(), lim.squeeze())
         else:
             return states
 
@@ -316,7 +312,7 @@ class AuditGenerativeModel:
         fig.tight_layout()
         plt.show()
 
-    def generate_batch(self, N_batch=None, save=False):
+    def generate_batch(self, N_batch=None, return_pars=False):
         # Store latent rules and timbres, states and observations from N_batch batches
         # TODO: find a better way to store batches
 
@@ -327,16 +323,14 @@ class AuditGenerativeModel:
 
         for batch in range(N_batch):
             # Generate a batch of N_blocks sequences, sampling parameters and generating the paradigm's observations
-            # *res == rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs (HGM) // contexts, states, obs (NHGM)
-            res = self.generate_run()
+            # *res == rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs(, pars) (HGM) // contexts, states, obs(, pars) (NHGM)
+            res = self.generate_run(return_pars=return_pars)
             batches.append([*res])
 
         # Reorganize data as objects of size (N_batch, {obj_len}, 1) rather than a N_batch-long list of objects of size ({obj_len}, 1)
         # ! Except for the dictionary variable like states, that should keep the keys separate
         # res_reshaped = [np.stack([x for x in var_list], axis=0) for var_list in zip(*batches)]
-        res_reshaped = [reshape_batch_variable(var_list) for var_list in zip(*batches)]
-
-        # TODO: PROBLEME AVEC BATCH: certains ne retournent que 1 batch
+        res_reshaped = (reshape_batch_variable(var_list) for var_list in zip(*batches))
 
         return res_reshaped
 
@@ -366,7 +360,7 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
         self.si_rho_ctx = params["si_rho_ctx"]
 
     def generate_run(
-        self, N_blocks=None, N_tones=None, mu_rho_ctx=None, si_rho_ctx=None
+        self, N_blocks=None, N_tones=None, mu_rho_ctx=None, si_rho_ctx=None, return_pars=False
     ):
 
         if N_blocks is None:    N_blocks    = self.N_blocks
@@ -381,7 +375,11 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
         contexts = contexts.reshape((N_blocks, N_tones))
 
         # Sample states and observations
-        states = self.sample_states(contexts)
+        if return_pars:
+            states, pars = self.sample_states(contexts, return_pars)
+        else:
+            states = self.sample_states(contexts, return_pars)
+
         obs = self.sample_observations(contexts, states)
 
         # Flatten rules_long, contexts, (states, ) timbres and obs
@@ -390,7 +388,10 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
         states = dict([(key, states[key].flatten()) for key in states.keys()])
         obs = obs.flatten()
 
-        return contexts, states, obs
+        if return_pars:
+                    return contexts, states, obs, pars
+        else:
+            return contexts, states, obs
 
 
 class HierarchicalAuditGM(AuditGenerativeModel):
@@ -510,24 +511,17 @@ class HierarchicalAuditGM(AuditGenerativeModel):
         si_rho_rules=None,
         mu_rho_timbres=None,
         si_rho_timbres=None,
+        return_pars = False
     ):
 
-        if N_blocks is None:
-            N_blocks = self.N_blocks
-        if N_rules is None:
-            N_rules = self.N_rules
-        if N_tones is None:
-            N_tones = self.N_tones
-        if rules_dpos_set is None:
-            rules_dpos_set = self.rules_dpos_set
-        if mu_rho_rules is None:
-            mu_rho_rules = self.mu_rho_rules
-        if si_rho_rules is None:
-            si_rho_rules = self.si_rho_rules
-        if mu_rho_timbres is None:
-            mu_rho_timbres = self.mu_rho_timbres
-        if si_rho_timbres is None:
-            si_rho_timbres = self.si_rho_timbres
+        if N_blocks is None:        N_blocks = self.N_blocks
+        if N_rules is None:         N_rules = self.N_rules
+        if N_tones is None:         N_tones = self.N_tones
+        if rules_dpos_set is None:  rules_dpos_set = self.rules_dpos_set
+        if mu_rho_rules is None:    mu_rho_rules = self.mu_rho_rules
+        if si_rho_rules is None:    si_rho_rules = self.si_rho_rules
+        if mu_rho_timbres is None:  mu_rho_timbres = self.mu_rho_timbres
+        if si_rho_timbres is None:  si_rho_timbres = self.si_rho_timbres
 
         # Sample sequence of rules ids
         rules = self.sample_rules(N_blocks, N_rules, mu_rho_rules, si_rho_rules)
@@ -546,7 +540,11 @@ class HierarchicalAuditGM(AuditGenerativeModel):
         contexts = self.get_contexts(dpos, self.N_blocks, self.N_tones)
 
         # Sample states and observations
-        states = self.sample_states(contexts)
+        # Sample states and observations
+        if return_pars:
+            states, pars = self.sample_states(contexts, return_pars)
+        else:
+            states = self.sample_states(contexts, return_pars)
         obs = self.sample_observations(contexts, states)
 
         # Flatten rules_long, contexts, (states, ) timbres and obs
@@ -556,7 +554,10 @@ class HierarchicalAuditGM(AuditGenerativeModel):
         states = dict([(key, states[key].flatten()) for key in states.keys()])
         obs = obs.flatten()
 
-        return rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs
+        if return_pars:
+            return rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs
+        else:
+            return rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs, pars
 
     def plot_contexts_rules_states_obs(self, y_stds, y_dvts, ys, Cs, rules, dpos):
         """For the hierachical evolution of rules and contexts (NOTE: timbres not included in this viz atm)
