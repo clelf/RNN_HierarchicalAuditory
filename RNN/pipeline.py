@@ -67,6 +67,10 @@ class MinMaxScaler():
 
 
 def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_id, gm_name, data_config, kalman=False):
+    
+    # Define loss instance
+    loss_function   = torch.nn.GaussianNLLLoss(reduction='sum') # GaussianNLL
+
 
     # Define data generative model
     if gm_name == 'NonHierarchicalGM': gm = NonHierachicalAuditGM(data_config)
@@ -74,6 +78,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
     else: raise ValueError("Invalid GM name")
 
     # Prepare to save the results
+    lr_title = f"Learning rate: {lr:>6.0e}"
     save_path = Path(f'/home/clevyfidel/Documents/Workspace/RNN_paradigm/training_results/N_ctx_{data_config["N_ctx"]}/{model.name}/')
     if not os.path.exists(save_path):
         os.makedirs(save_path)
@@ -101,8 +106,8 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
             y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
 
             # Transform data
-            minmax = MinMaxScaler()
-            x = minmax.fit_normalize(y, margin=data_config["si_r"]+data_config["si_q"])
+            minmax_train = MinMaxScaler()
+            x = minmax_train.fit_normalize(y, margin=data_config["si_r"]+data_config["si_q"])
 
             # Call model
             model_output = model(x) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
@@ -159,7 +164,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
                 if model.name=='vrnn': model_output_dist = model_output[0]
                 else: model_output_dist = model_output
                 x_denorm    = minmax_valid.denormalize_mean(x).squeeze()
-                estim_mu    = minmax_valid.denormalize_mean(model_output_dist[...,0])
+                estim_mu    = minmax_valid.denormalize_mean(F.sigmoid(model_output_dist[...,0]))
                 estim_var   = minmax_valid.denormalize_var(F.softplus(model_output_dist[..., 1]) + 1e-6)
                 estim_sigma = torch.sqrt(estim_var)
                 valid_sigma.append(estim_sigma)
@@ -176,7 +181,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
 
             # Save valid samples
             if epoch % epoch_res == epoch_res-1:                         
-                plot_samples(x_denorm, estim_mu, estim_sigma, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', kalman_mu=kalman_mu, kalman_sigma=kalman_sigma)
+                plot_samples(x_denorm, estim_mu, estim_sigma, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=kalman_mu, kalman_sigma=kalman_sigma)
 
             avg_valid_loss = np.mean(valid_losses)
             avg_valid_mse = np.mean(valid_mse)
@@ -198,14 +203,13 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
             f.write(f'{sprint}\n')
 
     lossplotfile = save_path/f'loss_trainvalid_lr{lr_id}.png'
-    plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_report, x_label='Training steps', y_label='Loss', save_path=lossplotfile)
-
-    plot_var(valid_steps, valid_sigma_report, save_path/f'variance_valid_lr{lr_id}.png')
+    plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_report, x_label='Training steps', y_label='Loss', title=lr_title, save_path=lossplotfile)
+    plot_var(valid_steps, valid_sigma_report, title=lr_title, save_path=save_path/f'variance_valid_lr{lr_id}.png')
 
     # Save model's weights
     torch.save(model.state_dict(), f'{save_path}/lr{lr_id}_weights.pth')
 
-    return minmax
+    return minmax_train
  
 
 
@@ -213,12 +217,13 @@ def test():
     return NotImplementedError
 
 
-def plot_var(valid_steps, valid_sigma, save_path):
+def plot_var(valid_steps, valid_sigma, title, save_path):
     plt.figure(figsize=(10, 5))
     plt.plot(valid_steps, valid_sigma, label="valid std")
     plt.xlabel("Training steps")
     plt.ylabel("Valid variance (std)")
     plt.legend()
+    plt.title(title)
     plt.savefig(save_path)
     plt.close()
 
@@ -233,7 +238,7 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.close()
 
 
-def plot_samples(obs, estim_mu, estim_sigma, save_path, kalman_mu=None, kalman_sigma=None):
+def plot_samples(obs, estim_mu, estim_sigma, save_path, title=None, kalman_mu=None, kalman_sigma=None):
     obs = obs.squeeze() # for safety
             
     # for some 8 samples out of the whole batch of length obs.size(0)
@@ -255,6 +260,7 @@ def plot_samples(obs, estim_mu, estim_sigma, save_path, kalman_mu=None, kalman_s
             plt.fill_between(range(len(kalman_mu[i])), kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
 
         plt.legend()
+        plt.title(title)
         plt.savefig(f'{save_path}_s{id}.png')
         plt.close()
 
@@ -269,7 +275,7 @@ if __name__=='__main__':
     dim_out_obs = 2 # learn the sufficient statistics mu and var
     # RNN bit
     output_dim      = input_dim
-    rnn_hidden_dim  = 8 # 64 # from goin. could also take varying values like [2**n for n in range(1, 9)]
+    rnn_hidden_dim  = 8 # 64 # from goin. could also take varying values like [2**n for n in range(1, 9)] # In VRNN paper: 2000
     rnn_n_layers    = 1 # from goin
     # VRNN specific
     latent_dim      = 4 # 16 # needs to be < input_dim :thinks: --> in a VAE, yes, but in a VRNN, needs to be <input_dim + rnn_hidden_dim
@@ -286,7 +292,6 @@ if __name__=='__main__':
     n_batches       = 20 # 20
     learning_rate   = 5e-4
     weight_decay    = 1e-5 
-    loss_function   = torch.nn.GaussianNLLLoss() # GaussianNLL
 
 
     # Define models
@@ -313,13 +318,12 @@ if __name__=='__main__':
         "si_r": 2,  # measurement noise
     }
 
-    for lr_id, learning_rate in enumerate([0.001, 0.00001]):
-    # for lr_id, learning_rate in enumerate([0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001, 0.00005, 0.00001]):
-        # for model in [vrnn, rnn]:
-        for model in [vrnn]:
-            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-            train(model, n_batches=n_batches, num_epochs=num_epochs, batch_res=batch_res, epoch_res=epoch_res, optimizer=optimizer, 
-                  lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=config_NH, kalman=True)
+    for lr_id, learning_rate in enumerate([0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001, 0.00005, 0.00001]): # TODO: delete 0.1, 0.5
+        if lr_id in [7, 8]:
+            for model in [rnn, vrnn]:
+                optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+                train(model, n_batches=n_batches, num_epochs=num_epochs, batch_res=batch_res, epoch_res=epoch_res, optimizer=optimizer, 
+                    lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=config_NH, kalman=True)
 
 
             # test(...)
