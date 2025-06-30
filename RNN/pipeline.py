@@ -227,7 +227,7 @@ def plot_var(valid_steps, valid_sigma, title, save_path):
     plt.savefig(save_path)
     plt.close()
 
-def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_report, x_label, y_label, save_path):
+def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_report, x_label, y_label, title, save_path):
     plt.figure(figsize=(10, 5))
     plt.plot(train_steps, train_losses_report, label="train loss")
     plt.plot(valid_steps, valid_losses_report, label="valid loss")
