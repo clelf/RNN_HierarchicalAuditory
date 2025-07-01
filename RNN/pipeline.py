@@ -68,10 +68,6 @@ class MinMaxScaler():
 
 def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_id, gm_name, data_config, kalman=False):
     
-    # Define loss instance
-    loss_function   = torch.nn.GaussianNLLLoss(reduction='sum') # GaussianNLL
-
-
     # Define data generative model
     if gm_name == 'NonHierarchicalGM': gm = NonHierachicalAuditGM(data_config)
     elif gm_name == 'HierarchicalGM': gm = HierarchicalAuditGM(data_config)
@@ -90,15 +86,19 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
     valid_steps         = []
     valid_mse_report    = []
     valid_sigma_report  = []
-    kalman_mse_report   = []
+
+    # Define loss instance
+    loss_function   = torch.nn.GaussianNLLLoss(reduction='sum') # GaussianNLL
 
     for epoch in range(num_epochs):
+
+        ### TRAINING
         train_losses = []
         tt = time.time()
+        model.train()
 
         for batch in range(n_batches):
-            # TRAIN
-            model.train()
+
             optimizer.zero_grad()
 
             # Generate data (outside of train loop maybe?)
@@ -135,10 +135,9 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
         avg_train_loss = np.mean(train_losses) # average loss for current epoch
 
 
-        # VALIDATION
+        ### VALIDATION
         valid_losses = []
         valid_mse = []
-        # kalman_mse = []
         valid_sigma = []
 
         model.eval()
@@ -163,21 +162,20 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
                 # Get estimated distribution
                 if model.name=='vrnn': model_output_dist = model_output[0]
                 else: model_output_dist = model_output
-                x_denorm    = minmax_valid.denormalize_mean(x).squeeze()
                 estim_mu    = minmax_valid.denormalize_mean(F.sigmoid(model_output_dist[...,0]))
                 estim_var   = minmax_valid.denormalize_var(F.softplus(model_output_dist[..., 1]) + 1e-6)
                 estim_sigma = torch.sqrt(estim_var)
                 valid_sigma.append(estim_sigma)
+                x_denorm    = minmax_valid.denormalize_mean(x).squeeze()
+
 
                 # Evaluate MSE to true value
                 mse = ((estim_mu-x_denorm)**2).mean()
                 valid_mse.append(mse)
 
                 # Compare with Kalman
-                kalman_mu, kalman_sigma = kalman_batch(x_denorm, pars, C=1, Q=data_config["si_q"], R=data_config["si_r"], x0s=x_denorm[...,0])
-                # COMPUTING KALMAN MSE DOESNT MAKE ANY CONCEPTUAL SENSE
-                # mse_k = ((kalman_mu-x_denorm)**2).mean() 
-                # kalman_mse.append(mse_k)
+                kalman_mu, kalman_sigma = kalman_batch(x_denorm, pars, C=1, Q=data_config["si_q"], R=data_config["si_r"], x0s=x_denorm[...,0]) # COMPUTING KALMAN MSE DOESNT MAKE ANY CONCEPTUAL SENSE
+
 
             # Save valid samples
             if epoch % epoch_res == epoch_res-1:                         
@@ -185,7 +183,6 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
 
             avg_valid_loss = np.mean(valid_losses)
             avg_valid_mse = np.mean(valid_mse)
-            # avg_kalman_mse = np.mean(kalman_mse)
             avg_valid_sigma = np.mean(valid_sigma)
         
         valid_mse_report.append(avg_valid_mse)
@@ -193,8 +190,6 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
         valid_steps.append(epoch*n_batches+n_batches)
 
         valid_sigma_report.append(avg_valid_sigma)
-
-        # kalman_mse_report.append(avg_kalman_mse)
 
         print(f"Model: {model.name:>4}, LR: {lr:>6.0e}, Epoch: {epoch:>3}, Training Loss: {avg_train_loss:>7.4f}, Valid Loss: {avg_valid_loss:>7.4f}")
         sprint=f'LR: {lr:>6.0e}; epoch: {epoch:>3}; batch: {batch:>3}; loss: {loss:>7.4f}; batch loss: {loss_report:7.4f}; MSE: {avg_valid_mse:>7.4f}; time: {time.time()-tt:>.2f}; training step: {epoch * n_batches + batch}'
@@ -234,6 +229,7 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.xlabel(x_label)
     plt.ylabel(y_label)
     plt.legend()
+    plt.title(title)
     plt.savefig(save_path)
     plt.close()
 
@@ -278,7 +274,7 @@ if __name__=='__main__':
     rnn_hidden_dim  = 8 # 64 # from goin. could also take varying values like [2**n for n in range(1, 9)] # In VRNN paper: 2000
     rnn_n_layers    = 1 # from goin
     # VRNN specific
-    latent_dim      = 4 # 16 # needs to be < input_dim :thinks: --> in a VAE, yes, but in a VRNN, needs to be <input_dim + rnn_hidden_dim
+    latent_dim      = 4 # 16 # needs to be < input_dim --> in a VAE, yes, but in a VRNN, needs to be <input_dim + rnn_hidden_dim
     phi_x_dim       = rnn_hidden_dim
     phi_z_dim       = rnn_hidden_dim
     phi_prior_dim   = rnn_hidden_dim
@@ -318,9 +314,9 @@ if __name__=='__main__':
         "si_r": 2,  # measurement noise
     }
 
-    for lr_id, learning_rate in enumerate([0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001, 0.00005, 0.00001]): # TODO: delete 0.1, 0.5
-        if lr_id in [7, 8]:
-            for model in [rnn, vrnn]:
+    for lr_id, learning_rate in enumerate([0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001, 0.00005, 0.00001, 0.000005, 0.000001]): # TODO: delete 0.1, 0.5
+        if lr_id in [5, 6, 7, 8, 9, 10]:
+            for model in [vrnn]:
                 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
                 train(model, n_batches=n_batches, num_epochs=num_epochs, batch_res=batch_res, epoch_res=epoch_res, optimizer=optimizer, 
                     lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=config_NH, kalman=True)
