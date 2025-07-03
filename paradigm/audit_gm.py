@@ -34,11 +34,6 @@ class AuditGenerativeModel:
         si_q: float; variance of the noise in the process LGD
         si_r: float; variance of the noise in the observation LGD
 
-    Methods
-    -------
-
-
-
     """
 
     def __init__(self, params):
@@ -120,13 +115,15 @@ class AuditGenerativeModel:
         return np.random.choice(states_values, p=states_trans_matrix[current_state])
 
     def sample_pi(self, N, mu_rho, si_rho):
-        """A transition matrix with a sticky diagonal
+        """A transition matrix with a sticky diagonal, controlled by the concentration parameter rho.
+        rho is comprised between 0 and 1 and is is sampled from a truncated normal distribution of 
+        mean mu_rho and standard deviation si_rho
 
         Parameters
         ----------
-        mu_rho : _type_
-            _description_
-        si_rho : _type_
+        mu_rho : float
+            Mean parameter of the normal distribution to sample 
+        si_rho : float
             _description_
 
         Returns
@@ -189,10 +186,9 @@ class AuditGenerativeModel:
             return ctx
 
     def sample_states(self, contexts, return_pars=False):
-        """Generates a single data sequence y_t given a sequence of contexts c_t a sequence of
-        states x_t^c containing the states of standard and deviant
+        """Generates a dictionary of data sequence for each context (std or dvt) dynamics given a sequence of contexts
 
-        Here contexts is the sequence of tone-by-tone boolean value stnding for {std, dvt} that has been
+        Here contexts is the sequence of tone-by-tone boolean value standing for {std: 0, dvt: 1} that has been
         hierarchically defined prior to the call of sample_states
 
 
@@ -201,16 +197,17 @@ class AuditGenerativeModel:
         contexts : integer np.array
             2-dimensional sequence of contexts filled with 0 or 1 (std or dvt), of size (N_blocks, N_tones)
         return_pars: bool
-            also returns the time constant and sationary value (previously: retention and drift) parameters for each state
+            also returns the time constant and sationary value (previously: retention and drift) parameters for each state at each block
 
 
         Returns
         -------
         states : dict
-            dictionary encoding the latent state values (one-dimensional np.array) for each
+            dictionary encoding the hidden state values (one-dimensional np.array) for each
             context c (keys).
-        tau: time constant parameter for each context (only if return_pars set to True)
-        lim: stationary value parameter for each context
+        pars (optional):
+            tau: time constant parameter for each context (only if return_pars set to True)
+            lim: stationary value parameter for each context
        
         # Note that time constant and sationary value (previously: retention and drift) are sampled in every call 
 
@@ -263,7 +260,7 @@ class AuditGenerativeModel:
         contexts : integer np.array
             2-dimensional sequence of contexts filled with 0 or 1 (std or dvt), of size (N_blocks, N_tones)
         states : dict
-            dictionary encoding the latent state values (one-dimensional np.array) for each
+            dictionary encoding the hidden state values (one-dimensional np.array) for each
             context c (keys).
 
         Returns
@@ -313,6 +310,21 @@ class AuditGenerativeModel:
         plt.show()
 
     def generate_batch(self, N_batch=None, return_pars=False):
+        """Calls generate_run N_batch times and concatenates the return obsjects as (N_batch, object_size) size objects
+
+        Parameters
+        ----------
+        N_batch : int, optional
+            number of batches if None takes value defined upon init of instance, by default None
+        return_pars : bool, optional
+            to return the hidden states (individual std and dvt) dynamics parameters tau and lim for each block in each batch, by default False
+
+        Returns
+        -------
+        objects as in generate_run
+            rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs(, pars) (im the case of HGM) // contexts, states, obs(, pars) (in the case of N-HGM)
+        """
+
         # Store latent rules and timbres, states and observations from N_batch batches
         # TODO: find a better way to store batches
 
@@ -346,13 +358,18 @@ def reshape_batch_variable(var):
 
 class NonHierachicalAuditGM(AuditGenerativeModel):
     """A generative model that only presents one level of context for a tone: to be a standard or a deviant tone
-
-    Methods
-    -------
-    generate_run :
+    Since data is not clustered in blocks defined by rules, there is only one "block" (N_block = 1)
     """
 
     def __init__(self, params):
+        """
+        Parameters
+        ----------
+        mu_rho_ctx :
+            Mean of the truncated normal distribution to sample rho, the concentration (sticky) parameter of the transition matrix of contexts
+        si_rho_ctx :
+            Std of rho
+        """
 
         super().__init__(params)
         self.N_blocks = 1
@@ -360,10 +377,22 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
         self.si_rho_ctx = params["si_rho_ctx"]
 
     def generate_run(
-        self, N_blocks=None, N_tones=None, mu_rho_ctx=None, si_rho_ctx=None, return_pars=False
+        self, N_tones=None, mu_rho_ctx=None, si_rho_ctx=None, return_pars=False
     ):
+        """Generate data for one run of experiment: contexts, hidden states dynamics, observation
 
-        if N_blocks is None:    N_blocks    = self.N_blocks
+        Returns
+        -------
+        contexts:
+            List of whether a tone is considered a dvt or a std --> contexts[t] = (current tone == dvt) (length = N_tones*N_blocks)
+        states:
+            List ynamics of both std (states[0]) and dvt (states[1]) at each "time step" (length = N_tones*N_blocks)
+        obs:
+            Observed tone at each time step (length = N_tones*N_blocks)
+        pars: optional
+            Time constant and sationary value parameters for each state at each block
+        """
+
         if N_tones is None:     N_tones     = self.N_tones
         if mu_rho_ctx is None:  mu_rho_ctx  = self.mu_rho_ctx
         if si_rho_ctx is None:  si_rho_ctx  = self.si_rho_ctx
@@ -372,7 +401,7 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
         contexts = self.sample_contexts(
             N=N_tones, N_ctx=self.N_ctx, mu_rho_ctx=mu_rho_ctx, si_rho_ctx=si_rho_ctx
         )
-        contexts = contexts.reshape((N_blocks, N_tones))
+        contexts = contexts.reshape((self.N_blocks, N_tones))
 
         # Sample states and observations
         if return_pars:
@@ -513,6 +542,30 @@ class HierarchicalAuditGM(AuditGenerativeModel):
         si_rho_timbres=None,
         return_pars = False
     ):
+        """Generate data for one run of experiment: rules, dvt positions, timbres, contexts (std or dvt),
+        states (hidden states dynamics), observation
+
+        Returns
+        -------
+        rules:
+            List of the rules that apply to each block of N_tones tones --> rules[b] = rule for current block (length = N_blocks)
+        rules_long:
+            List of rules that apply to each tone in the whole list of tones --> rules_long[t] is the same for every 8 consecutive t (length = N_tones*N_blocks)
+        dpos:
+            Positions of the dvt within each block (length = N_blocks)
+        timbres:
+            List of timbres associated with each block (NOTE: dynamics correct but physical values TBD, not implemented ATM) (length = N_blocks)
+        timbres_long:
+            Same as in rules_long, per tone list of timbres (length = N_tones*N_blocks)
+        contexts:
+            List of whether a tone is considered a dvt or a std --> contexts[t] = (current tone == dvt) (length = N_tones*N_blocks)
+        states:
+            List ynamics of both std (states[0]) and dvt (states[1]) at each "time step" (length = N_tones*N_blocks)
+        obs:
+            Observed tone at each time step (length = N_tones*N_blocks)
+        pars: optional
+            Time constant and sationary value parameters for each state at each block
+        """
 
         if N_blocks is None:        N_blocks = self.N_blocks
         if N_rules is None:         N_rules = self.N_rules
@@ -555,9 +608,9 @@ class HierarchicalAuditGM(AuditGenerativeModel):
         obs = obs.flatten()
 
         if return_pars:
-            return rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs
-        else:
             return rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs, pars
+        else:
+            return rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs
 
     def plot_contexts_rules_states_obs(self, y_stds, y_dvts, ys, Cs, rules, dpos):
         """For the hierachical evolution of rules and contexts (NOTE: timbres not included in this viz atm)
@@ -707,10 +760,15 @@ if __name__ == "__main__":
     gm = HierarchicalAuditGM(config_H)
 
     rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs = gm.generate_run()
-    rules_, rules_long_, dpos_, timbres_, timbres_long_, contexts_, states_, obs_ = gm.generate_batch(N_batch=2)
+    rules_, rules_long_, dpos_, timbres_, timbres_long_, contexts_, states_, obs_ = gm.generate_batch(N_batch=2) # calls generate_run N_batch times and concatenates the return obsjects as (N_batch, object_size) size objects
 
+    # States, current blocks' rules, contexts based on rules and sampled deviant positions, and observations sampled from states based on context
     gm.plot_contexts_rules_states_obs(states[0][0 : gm.N_tones], states[1], obs, contexts, rules, dpos)
+
+    # Deviant position for each rule
     gm.plot_rules_dpos(rules, dpos)
+
+    # An example of the states and observation sampling for one block
     gm.plot_contexts_states_obs(
         contexts[0 : gm.N_tones],
         obs[0 : gm.N_tones],
@@ -736,6 +794,8 @@ if __name__ == "__main__":
     gm_NH = NonHierachicalAuditGM(config_NH)
 
     contexts_NH, states_NH, obs_NH = gm_NH.generate_run()
+
+    # States and observation sampled based on contexts
     gm_NH.plot_contexts_states_obs(contexts_NH, obs_NH, states_NH[0], states_NH[1], gm_NH.N_tones, figsize=(20, 6))
 
     contexts_NH, states_NH, obs_NH = gm_NH.generate_batch(N_batch=2)
