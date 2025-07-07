@@ -148,7 +148,7 @@ class AuditGenerativeModel:
         return pi
 
     def sample_contexts(self, N, N_ctx, mu_rho_ctx, si_rho_ctx, return_pi=False):
-        """Samples a sequence of N events that can each be associated with a context out of of N_ctx values in range(N_ctx), and evolve
+        """Samples a 1D sequence of N events that can each be associated with a context out of of N_ctx values in range(N_ctx), and evolve
         through a Markov-chain manner with a transition matrix of parameters mu_rho_ctx and si_rho_ctx.
 
         Parameters
@@ -169,7 +169,7 @@ class AuditGenerativeModel:
         ctx = np.zeros(N, dtype=np.int64)
 
         # Initilize context (assign to 0, randomly, or from the distribution from which the transition probas also come from)
-        ctx[0] = 0
+        ctx[0] = 0 # TODO: decide if going for this?
         # rules[0] = np.random.choice(N_rules)
 
         for s in range(1, N):
@@ -278,7 +278,7 @@ class AuditGenerativeModel:
 
         return obs
 
-    def plot_contexts_states_obs(self, Cs, ys, y_stds, y_dvts, T, figsize=(10, 6)):
+    def plot_contexts_states_obs(self, Cs, ys, x_stds, x_dvts, T, figsize=(10, 6)):
         """For a non-hierarchical situation (only contexts std/dvt, no rules)
 
         Parameters
@@ -287,15 +287,15 @@ class AuditGenerativeModel:
             sequence of contexts
         ys : _type_
             observations
-        y_stds : _type_
+        x_stds : _type_
             states of std
-        y_dvts : _type_
+        x_dvts : _type_
             states of dvt
         """
 
         fig, ax1 = plt.subplots(figsize=figsize)
-        ax1.plot(y_stds, label="y_std", color="green", linestyle="dotted", linewidth=2)
-        ax1.plot(y_dvts, label="y_dvt", color="blue", linestyle="dotted", linewidth=2)
+        ax1.plot(x_stds, label="x_std", color="green", linestyle="dotted", linewidth=2)
+        ax1.plot(x_dvts, label="x_dvt", color="blue", linestyle="dotted", linewidth=2)
         ax1.plot(ys, label="y", color="red", linestyle="dashed", linewidth=2)
         ax1.set_ylabel("y")
 
@@ -612,14 +612,14 @@ class HierarchicalAuditGM(AuditGenerativeModel):
         else:
             return rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs
 
-    def plot_contexts_rules_states_obs(self, y_stds, y_dvts, ys, Cs, rules, dpos):
+    def plot_contexts_rules_states_obs(self, x_stds, x_dvts, ys, Cs, rules, dpos):
         """For the hierachical evolution of rules and contexts (NOTE: timbres not included in this viz atm)
 
         Parameters
         ----------
-        y_stds : _type_
+        x_stds : _type_
             _description_
-        y_dvts : _type_
+        x_dvts : _type_
             _description_
         ys : _type_
             _description_
@@ -632,8 +632,8 @@ class HierarchicalAuditGM(AuditGenerativeModel):
         # Visualize tone frequencies
         fig, ax1 = plt.subplots(figsize=(20, 6))
         ax1.plot(
-            y_stds,
-            label="y_std",
+            x_stds,
+            label="x_std",
             color="green",
             marker="o",
             markersize=4,
@@ -642,8 +642,8 @@ class HierarchicalAuditGM(AuditGenerativeModel):
             alpha=0.5,
         )
         ax1.plot(
-            y_dvts,
-            label="y_dvt",
+            x_dvts,
+            label="x_dvt",
             color="blue",
             marker="o",
             markersize=4,
@@ -769,13 +769,7 @@ if __name__ == "__main__":
     gm.plot_rules_dpos(rules, dpos)
 
     # An example of the states and observation sampling for one block
-    gm.plot_contexts_states_obs(
-        contexts[0 : gm.N_tones],
-        obs[0 : gm.N_tones],
-        states[0][0 : gm.N_tones],
-        states[1][0 : gm.N_tones],
-        gm.N_tones,
-    )
+    gm.plot_contexts_states_obs(contexts[0:gm.N_tones], obs[0:gm.N_tones], states[0][0:gm.N_tones], states[1][0:gm.N_tones], gm.N_tones)
 
     config_NH = {
         "N_batch": 1,

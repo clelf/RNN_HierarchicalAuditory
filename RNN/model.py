@@ -5,9 +5,6 @@ from functools import partial
 import numpy as np
 
 # TODO: handle device switch, autograd...
-# TODO: models should infer observations as distributions (to account for uncertainty).
-# TODO: make sure about what "prediction" refers to: based on data up until current time step, current time step estimation, or next time step prediction
-# --> input sequence estimation
 # TODO: learn contexts representation as another network (later)
 
 
@@ -22,22 +19,20 @@ class SimpleRNN(nn.Module):
         self.n_layers = n_layers
         self.device = device
 
-        self.rnn = nn.GRU(self.x_dim, self.hidden_dim, self.n_layers, batch_first=False, device=device) # expect x of size (N_batch, seq_len, input_dim)
+        self.rnn = nn.GRU(self.x_dim, self.hidden_dim, self.n_layers, batch_first=True, device=device) # expect x of size (N_batch, seq_len, input_dim)
         self.output_layer = nn.Linear(self.hidden_dim, self.output_dim, device=device)
 
 
     def init_hidden(self, batch_size):
-        h_size = [self.n_layers, batch_size, self.hidden_dim]
-        return torch.zeros(*h_size).to(self.device)
+        return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
 
     def forward(self, x, hx=None):
         if hx is None:
-            batch_size = x.size(1)
+            batch_size = x.size(0)         # batch_size, seq_len, x_dim = x.size()
             hx = self.init_hidden(batch_size)
 
-        output_last, _ = self.rnn(x, hx)  # output_seq is the sequence of final hidden states after the last layer / h_last is the final hidden state of each layer
+        output_last, _ = self.rnn(x, hx)  # output_last is the sequence of final hidden states after the last layer / h_last is the final hidden state of each layer
         output_seq = self.output_layer(output_last)
-
 
         return output_seq # has last dimension = output_dim
     
@@ -96,15 +91,21 @@ class VAE(nn.Module):
         )
     
     def build_fc_mu(self, in_dim, out_dim):
-        return nn.Linear(in_dim, out_dim)
+        return nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.Sigmoid()
+        )
     
     def build_fc_logvar(self, in_dim, out_dim):
-        return nn.Linear(in_dim, out_dim)
-
+        return nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.Softplus()
+        )
+    
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        return mu + eps * std # TODO: check if should be point-wise multiplication?
+        return mu + eps * std 
     
 
     def forward(self, x):
@@ -119,18 +120,19 @@ class VAE(nn.Module):
         # Decode (reconstruct / generate)
         x_ = self.decoder(z, self.hidden_units_dim, self.x_dim)
 
-
         return x_, mu_latent, logvar_latent
 
 
-    def loss(self, forward_output, loss_func):
-        x_target, x_output, mu_latent, logvar_latent = forward_output
-        return self.vae_loss_function(self, x_target, x_output, mu_latent, logvar_latent, loss_func=loss_func)
+    def loss(self, x_target, forward_output, loss_func):
+        x_output, mu_latent, logvar_latent = forward_output
+        return self.vae_loss_function(x_target, x_output, mu_latent, logvar_latent, loss_func=loss_func)
 
 
     def vae_loss_function(self, x_target, x_output, mu_latent, logvar_latent, loss_func):
         # (from pytorch's VAE implementation: https://github.com/pytorch/examples/blob/main/vae/main.py#L85)
         #Reconstruction + KL divergence losses summed over all elements and batch
+
+        # TODO: get rid of sigmoid and softplus if taken care of in decoder and encoder
         out_estim_mu    = F.sigmoid(x_output[:, :, [0]])
         out_estim_var   = F.softplus(x_output[:, :, [1]]) + 1e-6 # Ensure the variance is stricly positive
         recon_loss = loss_func(out_estim_mu, x_target, out_estim_var)
@@ -138,8 +140,8 @@ class VAE(nn.Module):
         # see Appendix B from VAE paper:
         # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
         # https://arxiv.org/abs/1312.6114
-        # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-        kl_loss = -0.5 * torch.sum(1 + logvar_latent - mu_latent.pow(2) - logvar_latent.exp())
+        # - 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        kl_loss = - 0.5 * torch.sum(1 + logvar_latent - mu_latent.pow(2) - logvar_latent.exp())
 
         return recon_loss + kl_loss
     
@@ -167,14 +169,14 @@ class VRNN(VAE): # Or rather, inherit from VAE
         # Feature extractors 
         self.phi_x = self.build_feature_extractor(self.x_dim, self.phi_x_dim)  # shared with standard RNN (S.4 Models)
         self.phi_z = self.build_feature_extractor(self.latent_dim, self.phi_z_dim)
-        self.phi_prior = self.build_feature_extractor(self.rnn_hidden_states_dim, self.phi_prior_dim) # rnn_hidden_states_dim	phi_prior_dim
+        self.phi_prior = self.build_feature_extractor(self.rnn_hidden_states_dim, self.phi_prior_dim)
         self.prior_mu = self.build_fc_mu(self.phi_prior_dim, self.latent_dim)
         self.prior_logvar = self.build_fc_logvar(self.phi_prior_dim, self.latent_dim)
 
 
         # RNN part
         # self.recurrence = SimpleRNN(x_dim=self.phi_x_dim + self.phi_z_dim, output_dim=..., hidden_dim=self.rnn_hidden_states_dim, n_layers=self.rnn_n_layers, batch_size=batch_size)
-        self.rnn = nn.GRU(input_size=self.phi_x_dim + self.phi_z_dim, hidden_size=self.rnn_hidden_states_dim, num_layers=self.rnn_n_layers, batch_first=False, device=device)
+        self.rnn = nn.GRU(input_size=self.phi_x_dim + self.phi_z_dim, hidden_size=self.rnn_hidden_states_dim, num_layers=self.rnn_n_layers, batch_first=True, device=device)
         # self.output_layer = nn.Linear(self.rnn_hidden_states_dim, x_dim, device=device)
 
 
@@ -188,21 +190,23 @@ class VRNN(VAE): # Or rather, inherit from VAE
 
     def forward(self, x):
 
+        # TODO: agree on batch_first order!!!!!!
+
         batch_size, seq_len, x_dim = x.size()
         if x_dim!=self.x_dim: raise ValueError("Incorrect dimensions for input x")
 
-        h_prev  = torch.zeros(self.rnn_n_layers, batch_size, self.rnn_hidden_states_dim, device=self.device)
+        h_prev  = torch.zeros(self.rnn_n_layers, batch_size, self.rnn_hidden_states_dim, device=self.device) # self.n_layers, batch_size, self.hidden_dim
         outputs = []
         mus_latent = []
         logvars_latent = []
-        prior_mus = []
+        mus_prior = []
         prior_logvars = []
 
         for t in range(seq_len):            
-            x_t = x[:, t, :] # x_t has shape (1, batch_size, x_dim)
+            x_t = x[:, t, :] # x_t has shape (batch_size, 1, x_dim) # TODO make sure here!!!!!!!
             
             # Encode 
-            z_t = self.encoder(torch.cat([self.phi_x(x_t), h_prev[-1]], dim=-1)) # Eq. 9
+            z_t = self.encoder(torch.cat([self.phi_x(x_t), h_prev[-1]], dim=-1)) # Eq. 9 # TODO: dim=-1 or 1?
 
             # Reparametrize the latent variable
             mu_latent = self.fc_mu_latent(z_t)
@@ -215,7 +219,7 @@ class VRNN(VAE): # Or rather, inherit from VAE
             z_prior = self.phi_prior(h_prev[-1]) # Eq. 5
             prior_mu = self.prior_mu(z_prior)
             prior_logvar = self.prior_logvar(z_prior)
-            prior_mus.append(prior_mu)
+            mus_prior.append(prior_mu)
             prior_logvars.append(prior_logvar)
 
 
@@ -226,20 +230,19 @@ class VRNN(VAE): # Or rather, inherit from VAE
             # Recurrence
             # rnn_output = self.recurrence(torch.cat([self.phi_x(x_t), self.phi_z(z_t)], dim=-1), h_prev) # Eq. 7
             # h_prev = self.recurrence.hidden_states
-            _, h = self.rnn(torch.cat([self.phi_x(x_t), self.phi_z(z_t)], dim=-1).unsqueeze(0), h_prev) # Eq. 7
+            _, h = self.rnn(torch.cat([self.phi_x(x_t), self.phi_z(z_t)], dim=-1).unsqueeze(1), h_prev) # Eq. 7 # since we're considering (B, T, feature_dim) with T=1, unsqueeze extra dimension at dim=1 to make up for T=1
             h_prev = h
 
         # self.rnn_hidden_states = self.recurrence.hidden_states
 
         # Stack across time
         outputs = torch.stack(outputs, dim=1)             # [B, T, x_dim]
-
         mus_latent = torch.stack(mus_latent, dim=1)               # [B, T, latent_dim]
         logvars_latent = torch.stack(logvars_latent, dim=1)       # [B, T, latent_dim]
-        prior_mus = torch.stack(prior_mus, dim=1)         # [B, T, latent_dim]
+        mus_prior = torch.stack(mus_prior, dim=1)         # [B, T, latent_dim]
         prior_logvars = torch.stack(prior_logvars, dim=1) # [B, T, latent_dim]      
 
-        return outputs, mus_latent, logvars_latent, prior_mus, prior_logvars
+        return outputs, mus_latent, logvars_latent, mus_prior, prior_logvars
     
     
     def loss(self, x_target, forward_output, loss_func):
@@ -261,8 +264,10 @@ class VRNN(VAE): # Or rather, inherit from VAE
             - 1
         )
 
-        # KL loss = - KL divergence
-        kl_loss =  - 0.5 * torch.sum(kl_element) 
+        # KL loss
+        # kl_loss = - 0.5 * torch.sum(kl_element) 
+        kl_loss = 0.5 * torch.sum(kl_element) 
+
 
         return recon_loss + kl_loss # Eq. 11 : - KL divergence + log posterior
 
