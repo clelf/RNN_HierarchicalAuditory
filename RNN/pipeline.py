@@ -31,7 +31,6 @@ FREQ_MAX = 1650
 # - load params
 
 
-
 class MinMaxScaler():
     def __init__(self):
         self.freq_min = FREQ_MIN
@@ -61,6 +60,9 @@ class MinMaxScaler():
 
 
 def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_id, gm_name, data_config, kalman=False):
+
+    # As a check:
+    if data_config["N_ctx"] > 1: kalman=False
     
     # Define data generative model
     if gm_name == 'NonHierarchicalGM': gm = NonHierachicalAuditGM(data_config)
@@ -103,8 +105,9 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
 
             # Generate data
             _, states, y = gm.generate_batch(N_batch=batch_size)
-            states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
             y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
+            if kalman: # and if data_config["N_ctx"] == 1
+                states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
 
             # Transform data
             minmax_train = MinMaxScaler()
@@ -146,7 +149,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
 
         ### VALIDATION
         valid_losses = []
-        valid_mae = []
+        valid_mse = []
         valid_sigma = []
         if kalman:
             kalman_mses = []
@@ -156,8 +159,9 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
             for batch in range(n_batches):
                 # Generate data
                 _, states, y, pars = gm.generate_batch(N_batch=batch_size, return_pars=True)
-                states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
                 y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
+                if kalman:
+                    states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
 
                 # Transform data
                 # minmax_valid = MinMaxScaler()
@@ -189,26 +193,24 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
                 valid_sigma.append(estim_sigma)
 
                 # Denormalize input variables
-                states_denorm = minmax_train.denormalize_mean(y_norm).squeeze()
                 y_denorm    = minmax_train.denormalize_mean(y_norm).squeeze()
+                if kalman: 
+                    states_denorm = minmax_train.denormalize_mean(states_norm).squeeze()
 
                 # Evaluate MSE or MAE to true value that the model was trained on (observations or hidden process states)
                 if kalman:
-                    # mse = ((estim_mu-states_denorm)**2).mean()
-                    mae = (abs(estim_mu - states_denorm)).mean()
+                    mse = ((estim_mu-states_denorm)**2).mean()
+                    # mae = (abs(estim_mu - states_denorm)).mean()
                 else:
-                    # mse = ((estim_mu-y_denorm)**2).mean()
-                    mae = (abs(estim_mu - states_denorm)).mean()
+                    mse = ((estim_mu-y_denorm)**2).mean()
+                    # mae = (abs(estim_mu - states_denorm)).mean()
 
-                # valid_mse.append(mse)
-                valid_mae.append(mae)
-
-
-                # Compare with Kalman
-                kalman_mu, kalman_sigma = kalman_batch(y_denorm, pars, C=1, Q=data_config["si_q"], R=data_config["si_r"], x0s=y_denorm[...,0]) 
+                valid_mse.append(mse)
+                # valid_mae.append(mae)
                 
-                # If kalman=True, this is the MSE referring to the Kalman filter's attempt at hidden states estimation
                 if kalman:
+                    # Compare with Kalman
+                    kalman_mu, kalman_sigma = kalman_batch(y_denorm, pars, C=1, Q=data_config["si_q"], R=data_config["si_r"], x0s=y_denorm[...,0]) 
                     kalman_mse = ((kalman_mu-states_denorm.numpy())**2).mean()
                     kalman_mses.append(kalman_mse)
 
@@ -217,11 +219,11 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
                 if kalman:
                     plot_samples(y_denorm, estim_mu, estim_sigma, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=kalman_mu, kalman_sigma=kalman_sigma, states=states_denorm)
                 else:
-                    plot_samples(y_denorm, estim_mu, estim_sigma, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=kalman_mu, kalman_sigma=kalman_sigma)
+                    plot_samples(y_denorm, estim_mu, estim_sigma, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title)
 
 
             avg_valid_loss = np.mean(valid_losses)
-            avg_valid_mae = np.mean(valid_mae)
+            avg_valid_mae = np.mean(valid_mse)
             avg_valid_sigma = np.mean(valid_sigma)
             if kalman:
                 avg_kalman_mse = np.mean(kalman_mse)
@@ -231,9 +233,11 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
         valid_steps.append(epoch*n_batches+n_batches)
         epoch_steps.append(epoch)
         valid_sigma_report.append(avg_valid_sigma)
+        if kalman:
+            kalman_mse_report.mse(avg_kalman_mse)
 
         print(f"Model: {model.name:>4}, LR: {lr:>6.0e}, Epoch: {epoch:>3}, Training Loss: {avg_train_loss:>7.2f}, Valid Loss: {avg_valid_loss:>7.2f}")
-        sprint=f'LR: {lr:>6.0e}; epoch: {epoch:>3}; batch: {batch:>3}; loss: {loss:>7.2f}; batch loss: {loss_report:7.2f}; MAE: {avg_valid_mae:>7.2f}; time: {time.time()-tt:>.2f}; training step: {epoch * n_batches + batch}'
+        sprint=f'LR: {lr:>6.0e}; epoch: {epoch:>3}; batch: {batch:>3}; loss: {loss:>7.2f}; batch loss: {loss_report:7.2f}; MSE: {avg_valid_mae:>7.2f}; time: {time.time()-tt:>.2f}; training step: {epoch * n_batches + batch}'
         if kalman:
             sprint += f'; Kalman MSE: {avg_kalman_mse:>7.2f}'
         logfilename = save_path / f'training_log_lr{lr_id}.txt'
@@ -244,8 +248,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, optimizer, lr, lr_
     plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_report, x_label='Training steps', y_label='Loss', title=lr_title, save_path=lossplotfile)
     # plot_losses(train_steps, valid_steps, epoch_steps, train_losses_report, valid_losses_report, x_label='Training steps', y_label='Loss', title=lr_title, save_path=lossplotfile)
     plot_var(epoch_steps, valid_sigma_report, title=lr_title, save_path=save_path/f'variance_valid_lr{lr_id}.png')
-    plot_diff(epoch_steps, valid_mae_report, which='MAE', title=lr_title, save_path=save_path/f'mae_valid_lr{lr_id}.png')
-
+    plot_diff(epoch_steps, valid_mae_report, which='MAE', title=lr_title, save_path=save_path/f'mse_valid_lr{lr_id}.png')
 
     # Save model's weights
     torch.save(model.state_dict(), f'{save_path}/lr{lr_id}_weights.pth')
@@ -284,7 +287,7 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.xlabel(x_label)
     plt.ylabel(y_label)
     plt.legend()
-    # plt.title(title)
+    plt.title(title)
     # sec = plt.gca().secondary_xaxis(location=0)
     # sec.set_xticks(epoch_steps)
     # sec.set_xlabel(f'epoch=', loc='left', labelpad=-9)
@@ -343,7 +346,7 @@ if __name__=='__main__':
 
     
     # Define training parameters
-    num_epochs      = 200 # 150
+    num_epochs      = 200 # 200 # 150
     epoch_res       = 10
     batch_res       = 10    # Store and report loss every batch_res batches
     batch_size      = 32 # 128   # batch_size = N_batch too # TODO: check this
@@ -362,7 +365,7 @@ if __name__=='__main__':
     gm_name = 'NonHierarchicalGM'
 
     config_NH = {
-        "N_ctx": 1,
+        "N_ctx": 2,
         "N_batch": batch_size,
         "N_blocks": 1,
         "N_tones": n_trials,
@@ -376,10 +379,11 @@ if __name__=='__main__':
         "si_r": 2,  # measurement noise
     }
 
-    for kalman_on in [True, False]:
-        for lr_id, learning_rate in enumerate([0.005, 0.001, 0.0005, 0.0001, 0.00005, 0.00001, 0.000005, 0.000001]):
+    for kalman_on in [False]: # [True, False]
+        # for lr_id, learning_rate in enumerate([0.005, 0.001, 0.0005, 0.0001, 0.00005, 0.00001, 0.000005, 0.000001]):
+        for lr_id, learning_rate in enumerate([0.00001, 0.000005, 0.000001]):
             # if lr_id in [4]: #, 8, 9, 10]:
-            for model in [rnn, vrnn]:
+            for model in [rnn]: # vrnn
                 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
                 train(model, n_batches=n_batches, num_epochs=num_epochs, batch_res=batch_res, epoch_res=epoch_res, optimizer=optimizer, 
                     lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=config_NH, kalman=kalman_on)
