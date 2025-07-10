@@ -272,10 +272,10 @@ class AuditGenerativeModel:
         obs = np.zeros(contexts.shape)
         v = self._sample_N_(0, self.si_r, contexts.shape)
 
-        for (s, t), c in np.ndenumerate(contexts):
-            # Noisy observation of one of the two states (std or dvt), as imposed by the current context c
-            obs[s, t] = states[c][s, t] + v[s, t]
-
+        for (b, t), c in np.ndenumerate(contexts):
+            # Picking the state corresponding to current context c and adding normal noise
+            obs[b, t] = states[c][b, t] + v[b, t]
+        
         return obs
 
     def plot_contexts_states_obs(self, Cs, ys, x_stds, x_dvts, T, figsize=(10, 6)):
@@ -413,7 +413,6 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
 
         # Flatten rules_long, contexts, (states, ) timbres and obs
         contexts = contexts.flatten()
-        pass
         states = dict([(key, states[key].flatten()) for key in states.keys()])
         obs = obs.flatten()
 
