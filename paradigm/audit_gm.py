@@ -16,8 +16,19 @@ from matplotlib.ticker import MaxNLocator
 import random
 
 
-# TODO: fill classes and methods descriptions
 
+##### UTILS
+
+def reshape_batch_variable(var):
+    if isinstance(var[0], dict):
+        # Recursively process each dict key
+        return {key: np.stack([batch[key] for batch in var], axis=0) for key in var[0]}
+    else:
+        # Direct array
+        return np.stack([x for x in var], axis=0)
+    
+
+##### GENERATIVE MODEL CLASSES
 
 class AuditGenerativeModel:
     """Generic class for building a generative model.
@@ -26,7 +37,7 @@ class AuditGenerativeModel:
 
     Attributes
     ----------
-        N_batch: int; number of data batches to generate
+        N_samples: int; number of data batches to generate
         N_blocks: int; number of blocks a batch contains
         N_tones: int; number of tones per block (usually 8)
         tones_values: list-like; a set of tone frequencies to sample a pair from, to assign to the pair of standard and deviant tones
@@ -38,21 +49,49 @@ class AuditGenerativeModel:
 
     def __init__(self, params):
 
-        self.N_batch = params["N_batch"]
+        self.N_samples = params["N_samples"]
         self.N_blocks = params["N_blocks"]
         self.N_tones = params["N_tones"]
-        self.tones_values = params["tones_values"]
-        self.mu_tau = params["mu_tau"]  # Std and dvt process
+        if "tones_values" in params.keys():
+            self.tones_values = params["tones_values"]
+        if "mu_tau" in params.keys():
+            self.mu_tau = params["mu_tau"]  # Std and dvt process
         self.si_tau = params["si_tau"]  # Std and dvt process
         self.si_lim = params["si_lim"]  # Std and dvt process
-        self.si_q = params["si_q"]
+        # self.si_q = params["si_q"] # Obsolete TODO: replace by below si_stat and later define si_q_dev and si_q_std
+        if "si_stat" in params.keys():
+            self.si_stat = params["si_stat"]
         self.si_r = params["si_r"]
 
         if "N_ctx" not in params.keys(): self.N_ctx = 2 # context refers to being a std / dvt
         else: self.N_ctx = params["N_ctx"]
 
-    # Auxiliary samplers from goin.coin.GenerativeModel
+        # NOTE: this only happens in contexts where N_ctx is also == 1
+        if "params_testing" in params.keys():
+            self.params_testing = True
+            self.mu_tau_set, self.mu_lim_set, self.si_stat_set = None, None, None
+            if "mu_tau_bounds" in params.keys():
+                self.mu_tau_bounds = params["mu_tau_bounds"]
+                self.mu_tau_set = 10 ** np.random.uniform(
+                    low=np.log10(self.mu_tau_bounds["low"]),
+                    high=np.log10(self.mu_tau_bounds["high"]),
+                    size=self.N_samples
+                )
+            if "mu_lim_bounds" in params.keys():
+                self.mu_lim_bounds = params["mu_lim_bounds"]
+                self.mu_lim_set = np.random.uniform(self.mu_lim_bounds["low"], self.mu_lim_bounds["high"], self.N_samples)
+            if "si_stat_bounds" in params.keys():
+                self.si_stat_bounds = params["si_stat_bounds"]
+                self.si_stat_set = 10 ** np.random.uniform(
+                    low=np.log10(self.si_stat_bounds["low"]),
+                    high=np.log10(self.si_stat_bounds["high"]),
+                    size=self.N_samples
+                )
+        else:
+            self.params_testing = False
 
+
+    # Auxiliary samplers from goin.coin.GenerativeModel
     def _sample_N_(self, mu, si, size=1):
         """Samples from a normal distribution
 
@@ -214,40 +253,53 @@ class AuditGenerativeModel:
         """
 
         # Initialize arrays of params
-        tau, lim = np.zeros((self.N_ctx, self.N_blocks)), np.zeros((self.N_ctx, self.N_blocks))  # self.N_ctx normally = 2 as for len({std, dvt})
+        tau, lim, si_stat, si_q = np.zeros((self.N_ctx, self.N_blocks)), np.zeros((self.N_ctx, self.N_blocks)), np.zeros((1, self.N_blocks)), np.zeros((self.N_ctx, self.N_blocks))  # self.N_ctx normally = 2 as for len({std, dvt})
 
         # Sample params for each block
         for b in range(self.N_blocks):
             # Sample one pair of std/dvt lim values for each block
-            mu_lim_Cs = self.sample_uniform_set(self.tones_values) 
+            mu_lim_Cs = self.sample_uniform_set(self.tones_values, N=self.N_ctx) 
             
             for c in range(self.N_ctx):  # 2 contexts: std or dvt
-                # Sample dynamics params for each context (std and dvt)
-                tau[c, b] = self._sample_TN_(1, 50, self.mu_tau, self.si_tau).item()  # A high boundary
-                lim[c, b] = self._sample_N_(mu_lim_Cs[c], self.si_lim).item()  # TODO: check values
+                if self.params_testing and self.mu_tau_set is not None and self.mu_lim_set is not None :
+                    # In that case, parameters have already been sampled, no need to sample more
+                    tau[c, b] = self.mu_tau
+                    lim[c, b] = self.tones_values[c]
+                    si_stat[c, b] = self.si_stat
+                else:
+                    # Sample dynamics params for each context (std and dvt)
+                    tau[c, b]       = self._sample_TN_(1, 50, self.mu_tau, self.si_tau).item()  # A high boundary
+                    lim[c, b]       = self._sample_N_(mu_lim_Cs[c], self.si_lim).item()
+                    si_stat[c, b] = self._sample_TN_(0.1, 20, self.si_stat, 1).item() # NOTE: not sure, TODO: check if this is a good idea
 
+                # Compute si_q from them
+                si_q[c, b]  = si_stat * ((2 * tau[c, b] - 1) ** 0.5) / tau[c, b]
+
+        # Initialize states
         states = dict([(int(c), np.zeros(contexts.shape)) for c in range(self.N_ctx)])
 
+        # States dynamics
         for c in range(self.N_ctx):  # self.N_ctx == 2
 
-            # Initialize with a sample from distribution of mean and std the LGD stationary values
-            # states[c][:,0] = self._sample_N_(d[c]/(1-a[c]), self.si_q/((1-a[c]**2)**.5), (contexts.shape[0], 1))
-            states[c][:, 0] = self._sample_N_(lim[c, :], self.si_q * tau[c, :] / ((2 * tau[c, :] - 1) ** 0.5), (contexts.shape[0],))
+            # Initialize first state with a sample from distribution of mean and std the LGD stationary values
+            # states[c][:,0] = self._sample_N_(d[c]/(1-a[c]), self.si_q/((1-a[c]**2)**.5), (contexts.shape[0], 1)) # Obsolete (alternative LGD formulation)
+            # si_stat = self.si_q * tau[c, :] / ((2 * tau[c, :] - 1) ** 0.5)            # Obsolete
+            # states[c][:, 0] = self._sample_N_(lim[c, :], si_stat, (contexts.shape[0],)) # Obsolete
+            states[c][:, 0] = self._sample_N_(lim[c, :], self.si_stat, (contexts.shape[0],))
 
             for b in range(self.N_blocks):
 
                 # Sample noise
-                w = self._sample_N_(0, self.si_q, contexts.shape)
+                w = self._sample_N_(0, si_q[c, b], contexts.shape)
 
                 # Here the states exist independently of the contexts
-
                 for t in range(1, contexts.shape[1]):
                     # states[c][:,t] = a[c] * states[c][:,t-1] + d[c] + w[:,t-1]
                     states[c][b, t] = states[c][b, t - 1] + 1 / tau[c, b] * (lim[c, b] - states[c][b, t - 1]) + w[b, t - 1]
 
         if return_pars:
             # return states, a, d
-            return states, (tau.squeeze(), lim.squeeze())
+            return states, (tau.squeeze(), lim.squeeze(), si_stat.squeeze(), si_q.squeeze()) # states, (tau, mu_li, si_stat, si_q)
         else:
             return states
 
@@ -309,13 +361,14 @@ class AuditGenerativeModel:
         fig.tight_layout()
         plt.show()
 
-    def generate_batch(self, N_batch=None, return_pars=False):
-        """Calls generate_run N_batch times and concatenates the return obsjects as (N_batch, object_size) size objects
+    def generate_batch(self, N_samples=None, return_pars=False):
+        """Calls generate_run N_samples times and concatenates the return obsjects as (N_samples, *object_size) size objects
+        I.e. generates N_samples samples / single sequences
 
         Parameters
         ----------
-        N_batch : int, optional
-            number of batches if None takes value defined upon init of instance, by default None
+        N_samples : int, optional
+            number of samples in one batch; if None takes value defined upon init of instance, by default None
         return_pars : bool, optional
             to return the hidden states (individual std and dvt) dynamics parameters tau and lim for each block in each batch, by default False
 
@@ -325,35 +378,38 @@ class AuditGenerativeModel:
             rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs(, pars) (im the case of HGM) // contexts, states, obs(, pars) (in the case of N-HGM)
         """
 
-        # Store latent rules and timbres, states and observations from N_batch batches
+        # Store latent rules and timbres, states and observations from N_samples batches
         # TODO: find a better way to store batches
 
-        if N_batch is None:
-            N_batch = self.N_batch
+        if N_samples is None:
+            N_samples = self.N_samples
 
-        batches = []
+        batch = []
 
-        for batch in range(N_batch):
+        for samp in range(N_samples):
             # Generate a batch of N_blocks sequences, sampling parameters and generating the paradigm's observations
             # *res == rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs(, pars) (HGM) // contexts, states, obs(, pars) (NHGM)
-            res = self.generate_run(return_pars=return_pars)
-            batches.append([*res])
+            if self.params_testing:
+                # sample a set of params
+                if self.mu_tau_set is not None:
+                    self.mu_tau = self.mu_tau_set[samp]
+                if self.mu_lim_set is not None:
+                    self.tones_values = [self.mu_lim_set[samp]]
+                if self.si_stat_set is not None:
+                    self.si_stat = self.si_stat_set[samp]
+                res = self.generate_run(return_pars=return_pars) # This will be specified ahead
+            else:
+                res = self.generate_run(return_pars=return_pars)
 
-        # Reorganize data as objects of size (N_batch, {obj_len}, 1) rather than a N_batch-long list of objects of size ({obj_len}, 1)
+            batch.append([*res])
+
+        # Reorganize data as objects of size (N_samples, {obj_len}, 1) rather than a N_samples-long list of objects of size ({obj_len}, 1)
         # ! Except for the dictionary variable like states, that should keep the keys separate
         # res_reshaped = [np.stack([x for x in var_list], axis=0) for var_list in zip(*batches)]
-        res_reshaped = (reshape_batch_variable(var_list) for var_list in zip(*batches))
+        res_reshaped = (reshape_batch_variable(var_list) for var_list in zip(*batch))
 
         return res_reshaped
 
-
-def reshape_batch_variable(var):
-    if isinstance(var[0], dict):
-        # Recursively process each dict key
-        return {key: np.stack([batch[key] for batch in var], axis=0) for key in var[0]}
-    else:
-        # Direct array
-        return np.stack([x for x in var], axis=0)
 
 
 class NonHierachicalAuditGM(AuditGenerativeModel):
@@ -377,7 +433,7 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
         self.si_rho_ctx = params["si_rho_ctx"]
 
     def generate_run(
-        self, N_tones=None, mu_rho_ctx=None, si_rho_ctx=None, return_pars=False
+        self, return_pars=False
     ):
         """Generate data for one run of experiment: contexts, hidden states dynamics, observation
 
@@ -393,15 +449,11 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
             Time constant and sationary value parameters for each state at each block
         """
 
-        if N_tones is None:     N_tones     = self.N_tones
-        if mu_rho_ctx is None:  mu_rho_ctx  = self.mu_rho_ctx
-        if si_rho_ctx is None:  si_rho_ctx  = self.si_rho_ctx
-
         # Get std/dvt contexts
         contexts = self.sample_contexts(
-            N=N_tones, N_ctx=self.N_ctx, mu_rho_ctx=mu_rho_ctx, si_rho_ctx=si_rho_ctx
+            N=self.N_tones, N_ctx=self.N_ctx, mu_rho_ctx=self.mu_rho_ctx, si_rho_ctx=self.si_rho_ctx
         )
-        contexts = contexts.reshape((self.N_blocks, N_tones))
+        contexts = contexts.reshape((self.N_blocks, self.N_tones))
 
         # Sample states and observations
         if return_pars:
@@ -531,18 +583,10 @@ class HierarchicalAuditGM(AuditGenerativeModel):
 
     def generate_run(
         self,
-        N_blocks=None,
-        N_rules=None,
-        N_tones=None,
-        rules_dpos_set=None,
-        mu_rho_rules=None,
-        si_rho_rules=None,
-        mu_rho_timbres=None,
-        si_rho_timbres=None,
         return_pars = False
     ):
         """Generate data for one run of experiment: rules, dvt positions, timbres, contexts (std or dvt),
-        states (hidden states dynamics), observation
+        states (hidden states dynamics), observations
 
         Returns
         -------
@@ -566,27 +610,18 @@ class HierarchicalAuditGM(AuditGenerativeModel):
             Time constant and sationary value parameters for each state at each block
         """
 
-        if N_blocks is None:        N_blocks = self.N_blocks
-        if N_rules is None:         N_rules = self.N_rules
-        if N_tones is None:         N_tones = self.N_tones
-        if rules_dpos_set is None:  rules_dpos_set = self.rules_dpos_set
-        if mu_rho_rules is None:    mu_rho_rules = self.mu_rho_rules
-        if si_rho_rules is None:    si_rho_rules = self.si_rho_rules
-        if mu_rho_timbres is None:  mu_rho_timbres = self.mu_rho_timbres
-        if si_rho_timbres is None:  si_rho_timbres = self.si_rho_timbres
-
         # Sample sequence of rules ids
-        rules = self.sample_rules(N_blocks, N_rules, mu_rho_rules, si_rho_rules)
+        rules = self.sample_rules(self.N_blocks, self.N_rules, self.mu_rho_rules, self.si_rho_rules)
         # Store latent rules in a per-tone array # This is equivalent to matlab's repmat
-        rules_long = np.tile(rules[:, np.newaxis], (1, N_tones))
+        rules_long = np.tile(rules[:, np.newaxis], (1, self.N_tones))
 
         # Sample timbres (here we consider that there are as many different timbres as there are different rules -- self.N_rules)
-        timbres = self.sample_timbres(rules, N_rules, mu_rho_timbres, si_rho_timbres)
+        timbres = self.sample_timbres(rules, self.N_rules, self.mu_rho_timbres, self.si_rho_timbres)
         # Store timbres in a per-tone array # This is equivalent to matlab's repmat
-        timbres_long = np.tile(timbres[:, np.newaxis], (1, N_tones))
+        timbres_long = np.tile(timbres[:, np.newaxis], (1, self.N_tones))
 
         # Sample deviant position
-        dpos = self.sample_dpos(rules, rules_dpos_set)
+        dpos = self.sample_dpos(rules, self.rules_dpos_set)
 
         # Get contexts
         contexts = self.get_contexts(dpos, self.N_blocks, self.N_tones)
@@ -736,14 +771,67 @@ class HierarchicalAuditGM(AuditGenerativeModel):
         plt.show()
 
 
+
+def example_HGM(config_H):
+    gm = HierarchicalAuditGM(config_H)
+
+    rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs = gm.generate_run()
+    rules_, rules_long_, dpos_, timbres_, timbres_long_, contexts_, states_, obs_ = gm.generate_batch(N_samples=2) # calls generate_run N_samples times and concatenates the return obsjects as (N_samples, object_size) size objects
+
+    # States, current blocks' rules, contexts based on rules and sampled deviant positions, and observations sampled from states based on context
+    gm.plot_contexts_rules_states_obs(states[0][0 : gm.N_tones], states[1], obs, contexts, rules, dpos)
+
+    # Deviant position for each rule
+    gm.plot_rules_dpos(rules, dpos)
+
+    # An example of the states and observation sampling for one block
+    gm.plot_contexts_states_obs(contexts[0:gm.N_tones], obs[0:gm.N_tones], states[0][0:gm.N_tones], states[1][0:gm.N_tones], gm.N_tones)
+
+
+
+def example_NHGM(config_NH):
+    gm_NH = NonHierachicalAuditGM(config_NH)
+
+    contexts_NH, states_NH, obs_NH = gm_NH.generate_run()
+
+    # States and observation sampled based on contexts
+    gm_NH.plot_contexts_states_obs(contexts_NH, obs_NH, states_NH[0], states_NH[1], gm_NH.N_tones, figsize=(20, 6))
+
+
+def example_single(config_single):
+
+    tau_values = [1, 1.5, 2, 4, 8, 16, 32, 50]
+
+    fig, axs = plt.subplots(len(tau_values), 1)
+
+    for i, tau in enumerate(tau_values):
+        config_single["mu_tau"]=tau
+        gm = NonHierachicalAuditGM(config_single)
+        _, states, obs, pars = gm.generate_run(return_pars=True)
+
+        # Plot process states
+        axs[i].plot(range(len(states[0])), states[0], label='x_hid', color='orange', linewidth=2)
+            
+        # Plot observation
+        axs[i].plot(range(len(obs)), obs, color='tab:blue', label='y_obs')
+
+        axs[i].set_title(f"mu_tau = {tau}, tau = {pars[0]:.2f}")
+
+    plt.tight_layout()
+    plt.show()
+
+    
+
+
 if __name__ == "__main__":
 
+    # Example hierachical GM (rules, timbres [not implemented], std/dvt)
     config_H = {
-        "N_batch": 1,
+        "N_samples": 1,
         "N_blocks": 20,
         "N_tones": 8,
         "N_rules": 3,
-        "rules_dpos_set": np.array([[2, 3, 4], [3, 4, 5], [4, 5, 6]]),
+        "rules_dpos_set": np.array([[3, 4, 5], [4, 5, 6], [5, 6, 7]]),
         "tones_values": [1455, 1500, 1600],
         "mu_tau": 4,
         "si_tau": 1,
@@ -755,42 +843,41 @@ if __name__ == "__main__":
         "si_q": 2,  # process noise
         "si_r": 2,  # measurement noise
     }
-
-    gm = HierarchicalAuditGM(config_H)
-
-    rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs = gm.generate_run()
-    rules_, rules_long_, dpos_, timbres_, timbres_long_, contexts_, states_, obs_ = gm.generate_batch(N_batch=2) # calls generate_run N_batch times and concatenates the return obsjects as (N_batch, object_size) size objects
-
-    # States, current blocks' rules, contexts based on rules and sampled deviant positions, and observations sampled from states based on context
-    gm.plot_contexts_rules_states_obs(states[0][0 : gm.N_tones], states[1], obs, contexts, rules, dpos)
-
-    # Deviant position for each rule
-    gm.plot_rules_dpos(rules, dpos)
-
-    # An example of the states and observation sampling for one block
-    gm.plot_contexts_states_obs(contexts[0:gm.N_tones], obs[0:gm.N_tones], states[0][0:gm.N_tones], states[1][0:gm.N_tones], gm.N_tones)
-
+    # example_HGM(config_H)
+    
+    # Example non-hierachical GM (no rules, std/dvt)
     config_NH = {
-        "N_batch": 1,
+        "N_samples": 1,
         "N_blocks": 1,
         "N_tones": 160,
         "mu_rho_ctx": 0.9,
         "si_rho_ctx": 0.05,
         "tones_values": [1455, 1500, 1600],
-        "mu_tau": 4,
+        "mu_tau": 4, # tau = 1 / (1 - a) = x_lim / b
         "si_tau": 1,
         "si_lim": 5,
         "si_q": 2,  # process noise
         "si_r": 2,  # measurement noise
     }
+    # example_NHGM(config_NH)
 
-    gm_NH = NonHierachicalAuditGM(config_NH)
 
-    contexts_NH, states_NH, obs_NH = gm_NH.generate_run()
+    # Example 1 single process (1 context)
+    config_single = {
+        "N_samples": 1,
+        "N_blocks": 1,
+        "N_ctx": 1,
+        "N_tones": 160,
+        "mu_rho_ctx": 0.9,
+        "si_rho_ctx": 0.05,
+        "tones_values": [1455, 1500, 1600],
+        "mu_tau": 4, # tau = 1 / (1 - a) = x_lim / b
+        "si_tau": 1,
+        "si_lim": 5,
+        "si_q": 2,  # process noise
+        "si_r": 2,  # measurement noise
+    }
+    example_single(config_single)
 
-    # States and observation sampled based on contexts
-    gm_NH.plot_contexts_states_obs(contexts_NH, obs_NH, states_NH[0], states_NH[1], gm_NH.N_tones, figsize=(20, 6))
 
-    contexts_NH, states_NH, obs_NH = gm_NH.generate_batch(N_batch=2)
-
-    pass
+    

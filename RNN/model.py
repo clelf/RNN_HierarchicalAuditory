@@ -125,10 +125,10 @@ class VAE(nn.Module):
 
     def loss(self, x_target, forward_output, loss_func):
         x_output, mu_latent, logvar_latent = forward_output
-        return self.vae_loss_function(x_target, x_output, mu_latent, logvar_latent, loss_func=loss_func)
+        return self.vae_loss(x_target, x_output, mu_latent, logvar_latent, loss_func=loss_func)
 
 
-    def vae_loss_function(self, x_target, x_output, mu_latent, logvar_latent, loss_func):
+    def vae_loss(self, x_target, x_output, mu_latent, logvar_latent, loss_func):
         # (from pytorch's VAE implementation: https://github.com/pytorch/examples/blob/main/vae/main.py#L85)
         #Reconstruction + KL divergence losses summed over all elements and batch
 
@@ -147,8 +147,7 @@ class VAE(nn.Module):
     
 
 
-class VRNN(VAE): # Or rather, inherit from VAE
-
+class VRNN(VAE): 
     def __init__(self, x_dim, output_dim, latent_dim, phi_x_dim, phi_z_dim, phi_prior_dim, rnn_hidden_states_dim, rnn_n_layers, batch_size, hidden_units_dim=None, device=torch.device('cpu')):
 
         super().__init__(x_dim, output_dim, latent_dim, hidden_units_dim=hidden_units_dim, device=device)
@@ -189,12 +188,10 @@ class VRNN(VAE): # Or rather, inherit from VAE
 
 
     def forward(self, x):
-
-        # TODO: agree on batch_first order!!!!!!
-
+        
         batch_size, seq_len, x_dim = x.size()
         if x_dim!=self.x_dim: raise ValueError("Incorrect dimensions for input x")
-
+        # TODO: set to empty, not zeros?
         h_prev  = torch.zeros(self.rnn_n_layers, batch_size, self.rnn_hidden_states_dim, device=self.device) # self.n_layers, batch_size, self.hidden_dim
         outputs = []
         mus_latent = []
