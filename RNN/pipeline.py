@@ -567,11 +567,11 @@ if __name__=='__main__':
 
     
     # Define training parameters
-    num_epochs      = 2 # 250 # 200 # 150 # MODIF
+    num_epochs      = 250 # 200 # 150
     epoch_res       = 10
     batch_res       = 10    # Store and report loss every batch_res batches
     batch_size      = 1000 # 128   # batch_size = N_samples too # TODO: maximize it
-    n_batches       = 1 # 32 # 20 # MODIF
+    n_batches       = 32 # 20
     # learning_rate   = 5e-4
     weight_decay    = 1e-5 
 
