@@ -8,6 +8,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.nn import functional as F
+from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from paradigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
@@ -110,7 +111,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
     param_names     = model.state_dict().keys()
 
     # Epochs
-    for epoch in range(num_epochs):
+    for epoch in tqdm(range(num_epochs), desc="Epochs"):
 
         ### TRAINING
         train_losses = []
@@ -118,7 +119,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
         model.train()
 
         # Generate N_samples=batch_size per batch in N_batch=n_batches
-        for batch in range(n_batches):
+        for batch in tqdm(range(n_batches), desc="Batches", leave=False):
 
             optimizer.zero_grad()
             
@@ -246,8 +247,10 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
 
             
             # Save valid samples for this epoch
-            if epoch % epoch_res == epoch_res-1:                         
+            if epoch % epoch_res == epoch_res-1:
                 if kalman:
+                    # TODO: START FROM HERE
+                    # TypeError: plot_samples() got an unexpected keyword argument 'params'
                     plot_samples(y, estim_mu, estim_sigma, params=pars, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=kalman_mu, kalman_sigma=kalman_sigma, states=states)
                 else:
                     plot_samples(y, estim_mu, estim_sigma, params=pars, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title)
@@ -443,6 +446,7 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
             for (tau, mu_lim, si_stat), metrics in binned_metrics.items()
         ]
         binned_metrics_df = pd.DataFrame(binned_metrics_list)
+        binned_metrics_df['si_q'] = binned_metrics_df['si_stat'] * ((2 * binned_metrics_df['tau'] - 1) ** 0.5) / binned_metrics_df['tau']
         binned_metrics_df.to_csv(save_path/f'binned_metrics_lr{lr_id}.csv', index=False)
 
 
@@ -502,10 +506,10 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.close()
 
 
-def plot_samples(obs, estim_mu, estim_sigma, save_path, title=None, kalman_mu=None, kalman_sigma=None, states=None):
+def plot_samples(obs, estim_mu, estim_sigma, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, states=None):
     obs = obs.squeeze() # for safety
             
-    # for some 8 samples out of the whole batch of length obs.size(0)
+    # for some 8 randomly sampled sequences out of the whole batch of length obs.size(0)
     N = min(8, obs.size(0))
     for id, i in enumerate(np.random.choice(range(N), size=(N,), replace=False)):
             
@@ -528,6 +532,8 @@ def plot_samples(obs, estim_mu, estim_sigma, save_path, title=None, kalman_mu=No
             plt.fill_between(range(len(kalman_mu[i])), kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
 
         plt.legend()
+        if params is not None:
+            title = f"{title}; tau: {params[i,0]:.2f}, mu_lim: {params[i,1]:.2f}, si_stat: {params[i,2]:.2f}, si_q: {params[i,3]:.2f}"
         plt.title(title)
         plt.savefig(f'{save_path}_s{id}.png')
         plt.close()
@@ -561,11 +567,11 @@ if __name__=='__main__':
 
     
     # Define training parameters
-    num_epochs      = 5 # 250 # 200 # 150
+    num_epochs      = 2 # 250 # 200 # 150 # MODIF
     epoch_res       = 10
     batch_res       = 10    # Store and report loss every batch_res batches
-    batch_size      = 10 # 1000 # 128   # batch_size = N_samples too # TODO: maximize it
-    n_batches       = 2 # 32 # 20
+    batch_size      = 1000 # 128   # batch_size = N_samples too # TODO: maximize it
+    n_batches       = 1 # 32 # 20 # MODIF
     # learning_rate   = 5e-4
     weight_decay    = 1e-5 
 
@@ -582,7 +588,7 @@ if __name__=='__main__':
         "mu_rho_ctx": 0.9,
         "si_rho_ctx": 0.05,
         # "tones_values": [1455, 1500, 1600], # ~ mu_lim
-        "mu_lim_bounds": {'low': 600, 'high': 1800},
+        "mu_lim_bounds": {'low': 500, 'high': 1800},
         "si_lim": 5,
         # "mu_tau": 4,
         "mu_tau_bounds": {'low': 1, 'high': 50},

@@ -1,20 +1,13 @@
 import numpy as np
 import time
-
 import sys
 import os
 import scipy.stats as ss
-
-
 import pickle
 import matplotlib.pyplot as plt
-
 from tqdm import tqdm
-
 from matplotlib.ticker import MaxNLocator
-
 import random
-
 
 
 ##### UTILS
@@ -386,7 +379,7 @@ class AuditGenerativeModel:
 
         batch = []
 
-        for samp in range(N_samples):
+        for samp in tqdm(range(N_samples), desc="Sequences", leave=False):
             # Generate a batch of N_blocks sequences, sampling parameters and generating the paradigm's observations
             # *res == rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs(, pars) (HGM) // contexts, states, obs(, pars) (NHGM)
             if self.params_testing:
@@ -397,7 +390,7 @@ class AuditGenerativeModel:
                     self.tones_values = [self.mu_lim_set[samp]]
                 if self.si_stat_set is not None:
                     self.si_stat = self.si_stat_set[samp]
-                res = self.generate_run(return_pars=return_pars) # This will be specified ahead
+                res = self.generate_run(return_pars=return_pars) # return_pars should be true
             else:
                 res = self.generate_run(return_pars=return_pars)
 
