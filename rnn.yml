@@ -67,4 +67,4 @@ dependencies:
       - triton==3.3.0
       - typing-extensions==4.13.2
       - zipp==3.22.0
-prefix: /home/clevyfidel/anaconda3/envs/rnn
+prefix: /scratch/clevyfidel/conda_env/rnn
