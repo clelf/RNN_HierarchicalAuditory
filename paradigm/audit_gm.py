@@ -62,7 +62,7 @@ class AuditGenerativeModel:
         # NOTE: this only happens in contexts where N_ctx is also == 1
         if "params_testing" in params.keys():
             self.params_testing = True
-            self.mu_tau_set, self.mu_lim_set, self.si_stat_set = None, None, None
+            self.mu_tau_set, self.lim_set, self.si_stat_set = None, None, None
             if "mu_tau_bounds" in params.keys():
                 self.mu_tau_bounds = params["mu_tau_bounds"]
                 self.mu_tau_set = 10 ** np.random.uniform(
@@ -70,9 +70,9 @@ class AuditGenerativeModel:
                     high=np.log10(self.mu_tau_bounds["high"]),
                     size=self.N_samples
                 )
-            if "mu_lim_bounds" in params.keys():
-                self.mu_lim_bounds = params["mu_lim_bounds"]
-                self.mu_lim_set = np.random.uniform(self.mu_lim_bounds["low"], self.mu_lim_bounds["high"], self.N_samples)
+            if "lim_bounds" in params.keys():
+                self.lim_bounds = params["lim_bounds"]
+                self.lim_set = np.random.uniform(self.lim_bounds["low"], self.lim_bounds["high"], self.N_samples)
             if "si_stat_bounds" in params.keys():
                 self.si_stat_bounds = params["si_stat_bounds"]
                 self.si_stat_set = 10 ** np.random.uniform(
@@ -251,10 +251,10 @@ class AuditGenerativeModel:
         # Sample params for each block
         for b in range(self.N_blocks):
             # Sample one pair of std/dvt lim values for each block
-            mu_lim_Cs = self.sample_uniform_set(self.tones_values, N=self.N_ctx) 
+            lim_Cs = self.sample_uniform_set(self.tones_values, N=self.N_ctx) 
             
             for c in range(self.N_ctx):  # 2 contexts: std or dvt
-                if self.params_testing and self.mu_tau_set is not None and self.mu_lim_set is not None :
+                if self.params_testing and self.mu_tau_set is not None and self.lim_set is not None :
                     # In that case, parameters have already been sampled, no need to sample more
                     tau[c, b] = self.mu_tau
                     lim[c, b] = self.tones_values[c]
@@ -262,7 +262,7 @@ class AuditGenerativeModel:
                 else:
                     # Sample dynamics params for each context (std and dvt)
                     tau[c, b]       = self._sample_TN_(1, 50, self.mu_tau, self.si_tau).item()  # A high boundary
-                    lim[c, b]       = self._sample_N_(mu_lim_Cs[c], self.si_lim).item()
+                    lim[c, b]       = self._sample_N_(lim_Cs[c], self.si_lim).item()
                     si_stat[c, b] = self._sample_TN_(0.1, 20, self.si_stat, 1).item() # NOTE: not sure, TODO: check if this is a good idea
 
                 # Compute si_q from them
@@ -379,15 +379,15 @@ class AuditGenerativeModel:
 
         batch = []
 
-        for samp in tqdm(range(N_samples), desc="Sequences", leave=False):
+        for samp in tqdm(range(N_samples), desc="Generating sequences", leave=False):
             # Generate a batch of N_blocks sequences, sampling parameters and generating the paradigm's observations
             # *res == rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs(, pars) (HGM) // contexts, states, obs(, pars) (NHGM)
             if self.params_testing:
                 # sample a set of params
                 if self.mu_tau_set is not None:
                     self.mu_tau = self.mu_tau_set[samp]
-                if self.mu_lim_set is not None:
-                    self.tones_values = [self.mu_lim_set[samp]]
+                if self.lim_set is not None:
+                    self.tones_values = [self.lim_set[samp]]
                 if self.si_stat_set is not None:
                     self.si_stat = self.si_stat_set[samp]
                 res = self.generate_run(return_pars=return_pars) # return_pars should be true

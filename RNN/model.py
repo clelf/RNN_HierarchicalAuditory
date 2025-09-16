@@ -196,7 +196,7 @@ class VRNN(VAE):
         outputs = []
         mus_latent = []
         logvars_latent = []
-        mus_prior = []
+        prior_mus = []
         prior_logvars = []
 
         for t in range(seq_len):            
@@ -216,7 +216,7 @@ class VRNN(VAE):
             z_prior = self.phi_prior(h_prev[-1]) # Eq. 5
             prior_mu = self.prior_mu(z_prior)
             prior_logvar = self.prior_logvar(z_prior)
-            mus_prior.append(prior_mu)
+            prior_mus.append(prior_mu)
             prior_logvars.append(prior_logvar)
 
 
@@ -236,10 +236,10 @@ class VRNN(VAE):
         outputs = torch.stack(outputs, dim=1)             # [B, T, x_dim]
         mus_latent = torch.stack(mus_latent, dim=1)               # [B, T, latent_dim]
         logvars_latent = torch.stack(logvars_latent, dim=1)       # [B, T, latent_dim]
-        mus_prior = torch.stack(mus_prior, dim=1)         # [B, T, latent_dim]
+        prior_mus = torch.stack(prior_mus, dim=1)         # [B, T, latent_dim]
         prior_logvars = torch.stack(prior_logvars, dim=1) # [B, T, latent_dim]      
 
-        return outputs, mus_latent, logvars_latent, mus_prior, prior_logvars
+        return outputs, mus_latent, logvars_latent, prior_mus, prior_logvars
     
     
     def loss(self, x_target, forward_output, loss_func):
@@ -251,7 +251,7 @@ class VRNN(VAE):
         out_estim_mu = F.sigmoid(x_output[:, :, [0]])
         out_estim_var = F.softplus(x_output[:, :, [1]]) + 1e-06
 
-        recon_loss = loss_func(out_estim_mu, x_target, out_estim_var)
+        recon_loss = loss_func(out_estim_mu, x_target, out_estim_var) # From Gemini2.5: recon_loss = 0.5 * torch.sum(decoder_logvar + (x - decoder_mu)**2 / torch.exp(decoder_logvar))
         
         # KL divergence between two Gaussians per timestep & batch
         # KL(q||p) closed form between N(mu_latent, var_latent) and N(mu_prior, logvar_prior)
@@ -265,7 +265,7 @@ class VRNN(VAE):
         # kl_loss = - 0.5 * torch.sum(kl_element) 
         kl_loss = 0.5 * torch.sum(kl_element) 
 
-
+        # TODO: find out if need to average over batch or not
         return recon_loss + kl_loss # Eq. 11 : - KL divergence + log posterior
 
 

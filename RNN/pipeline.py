@@ -67,9 +67,9 @@ class MinMaxScaler():
 
 
 
-def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name, data_config, device=DEVICE, kalman=False):
+def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, device=DEVICE):
     # Set optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=model_config["weight_decay"])
     
     # Pass model to GPU or CPU
     model.to(device)
@@ -85,9 +85,9 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
     # Prepare to save the results
     lr_title = f"Learning rate: {lr:>6.0e}"
     if kalman:
-        save_path = Path(f'/home/clevyfidel/Documents/Workspace/RNN_paradigm/training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/')
+        save_path = Path(os.getcwd()) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/'
     else:
-        save_path = Path(f'/home/clevyfidel/Documents/Workspace/RNN_paradigm/training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/')
+        save_path = Path(os.getcwd()) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/'
     if not os.path.exists(save_path):
         os.makedirs(save_path)
         os.makedirs(save_path / 'samples/')
@@ -111,7 +111,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
     param_names     = model.state_dict().keys()
 
     # Epochs
-    for epoch in tqdm(range(num_epochs), desc="Epochs"):
+    for epoch in tqdm(range(model_config["num_epochs"]), desc="Epochs"):
 
         ### TRAINING
         train_losses = []
@@ -119,15 +119,15 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
         model.train()
 
         # Generate N_samples=batch_size per batch in N_batch=n_batches
-        for batch in tqdm(range(n_batches), desc="Batches", leave=False):
+        for batch in tqdm(range(model_config["n_batches"]), desc="Batches", leave=False):
 
             optimizer.zero_grad()
             
             # Generate data (N_samples samples)
             _, states, y = gm.generate_batch(return_pars=False)
-            y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
+            y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
             if kalman: # and if data_config["N_ctx"] == 1
-                states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
+                states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
 
             # Transform data
             minmax_train = MinMaxScaler()
@@ -156,13 +156,13 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
 
             
             # Logging and reporting
-            if batch % batch_res == batch_res-1:
-                train_steps.append(epoch * n_batches + batch)
+            if batch % model_config["batch_res"] == model_config["batch_res"]-1:
+                train_steps.append(epoch * model_config["n_batches"] + batch)
                 
                 # Store loss
                 train_losses_report.append(float(loss.detach().cpu().item()))
-                loss_report = np.mean(train_losses[-batch_res:])
-                sprint=f'LR: {lr:>6.0e}; epoch: {epoch:0>3}; batch: {batch:>3}; loss: {float(loss.detach().cpu().item()):>7.4f}; batch loss: {loss_report:7.4f}; time: {time.time()-tt:>.2f}; training step: {epoch * n_batches + batch}'
+                loss_report = np.mean(train_losses[-model_config["batch_res"]:])
+                sprint=f'LR: {lr:>6.0e}; epoch: {epoch:0>3}; batch: {batch:>3}; loss: {float(loss.detach().cpu().item()):>7.4f}; batch loss: {loss_report:7.4f}; time: {time.time()-tt:>.2f}; training step: {epoch * model_config["n_batches"] + batch}'
                 logfilename = f'{save_path}/training_loss_lr{lr_id}.txt'
                 with open(logfilename, 'a') as f:
                     f.write(f'{sprint}\n')
@@ -184,12 +184,12 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
 
         model.eval()
         with torch.no_grad():
-            for batch in range(n_batches):
+            for batch in range(model_config["n_batches"]):
                 # Generate data
                 _, states, y, pars = gm.generate_batch(return_pars=True)
-                y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
+                y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
                 if kalman:
-                    states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
+                    states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
 
                 # Transform data
                 # minmax_valid = MinMaxScaler()
@@ -241,13 +241,13 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
                 
                 if kalman:
                     # Compare network's output with Kalman filter's estimation MSE
-                    kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], R=data_config["si_r"], x0s=y[...,0]) 
+                    kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], lims=pars[:,1], C=1, Qs=pars[:,3], R=data_config["si_r"], x0s=y[...,0]) 
                     kalman_mse = ((kalman_mu-states.numpy())**2).mean()
                     kalman_mses.append(kalman_mse)
 
             
             # Save valid samples for this epoch
-            if epoch % epoch_res == epoch_res-1:
+            if epoch % model_config["epoch_res"] == model_config["epoch_res"]-1:
                 if kalman:
                     # TODO: START FROM HERE
                     # TypeError: plot_samples() got an unexpected keyword argument 'params'
@@ -267,7 +267,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
         # Store valid metrics
         valid_mse_report.append(avg_valid_mse)
         valid_losses_report.append(avg_valid_loss) # avg loss for epoch (over batches)
-        valid_steps.append(epoch*n_batches+n_batches)
+        valid_steps.append(epoch*model_config["n_batches"]+model_config["n_batches"])
         epoch_steps.append(epoch)
         valid_sigma_report.append(avg_valid_sigma)
         if kalman:
@@ -276,7 +276,7 @@ def train(model, n_batches, num_epochs, batch_res, epoch_res, lr, lr_id, gm_name
 
         # Print epoch report
         print(f"Model: {model.name:>4}, LR: {lr:>6.0e}, Epoch: {epoch:>3}, Training Loss: {avg_train_loss:>7.2f}, Valid Loss: {avg_valid_loss:>7.2f}")
-        sprint=f'LR: {lr:>6.0e}; epoch: {epoch:>3}; var: {avg_valid_sigma:>7.2f}; MSE: {avg_valid_mse:>7.2f}; time: {time.time()-tt:>.2f}; training step: {epoch * n_batches + n_batches}'
+        sprint=f'LR: {lr:>6.0e}; epoch: {epoch:>3}; var: {avg_valid_sigma:>7.2f}; MSE: {avg_valid_mse:>7.2f}; time: {time.time()-tt:>.2f}; training step: {epoch * model_config["n_batches"] + model_config["n_batches"]}'
         if kalman:
             sprint += f'; Kalman MSE: {avg_kalman_mse:>7.2f}; Model-KF MSE: {avg_valid_mse-avg_kalman_mse:>7.2f}'
         logfilename = save_path / f'training_log_lr{lr_id}.txt'
@@ -321,7 +321,7 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
 
     # Load the saved weights
     model.load_state_dict(torch.load(f'{save_path}/lr{lr_id}_weights.pth'))
-    model.to(DEVICE)
+    model.to(device)
     model.eval()  # Switch to evaluation mode
 
     # As a check:
@@ -337,16 +337,16 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
         # NOTE: same spacing as sampled in audit_gm.py but regularly spaced
         # NOTE: here assuming that all params are being tested
         tau_bins = np.logspace(np.log10(data_config["mu_tau_bounds"]["low"]), np.log10(data_config["mu_tau_bounds"]["high"]), 10)
-        mu_lim_bins = np.linspace(data_config["mu_lim_bounds"]["low"], data_config["mu_lim_bounds"]["high"], 10)
+        lim_bins = np.linspace(data_config["lim_bounds"]["low"], data_config["lim_bounds"]["high"], 10)
         si_stat_bins = np.logspace(np.log10(data_config["si_stat_bounds"]["low"]), np.log10(data_config["si_stat_bounds"]["high"]), 10)
         
         # Create a grid of all parameter combinations
         param_bins = {'tau': tau_bins,
-                        'mu_lim': mu_lim_bins,
+                        'lim': lim_bins,
                         'si_stat': si_stat_bins}
-        param_pairs = np.array(np.meshgrid(tau_bins, mu_lim_bins, si_stat_bins)).T.reshape(-1, 3)
+        param_pairs = np.array(np.meshgrid(tau_bins, lim_bins, si_stat_bins)).T.reshape(-1, 3)
 
-        # Initialize storage array: each row stores tau, mu_lim, si_stat, si_q, and the corresponding mse
+        # Initialize storage array: each row stores tau, lim, si_stat, si_q, and the corresponding mse
         binned_metrics = {tuple(param_combination): {'mse': [], 'count': 0} for param_combination in param_pairs}
 
     valid_sigma = []
@@ -356,9 +356,9 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
 
     # Generate data
     _, states, y, pars = gm.generate_batch(N_samples=batch_size, return_pars=True)
-    y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
+    y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
     if kalman:
-        states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(DEVICE)
+        states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
 
     # Transform data
     y_norm = minmax_train.normalize(y)
@@ -399,7 +399,7 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
         
         if kalman:
             # Compare network's output with Kalman filter's estimation MSE
-            kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], R=data_config["si_r"], x0s=y[...,0]) 
+            kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], lims=pars[:,1], C=1, Qs=pars[:,3], R=data_config["si_r"], x0s=y[...,0]) 
             kalman_mse = ((kalman_mu-states.numpy())**2).mean()
             kalman_mses.append(kalman_mse)
         
@@ -407,12 +407,12 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
         if data_config["params_testing"]:
             # Digitize each of these parameters to find the corresponding bin
             tau_bin = np.digitize(pars[:,0], param_bins['tau']) - 1
-            mu_lim_bin = np.digitize(pars[:,1], param_bins['mu_lim']) - 1
+            lim_bin = np.digitize(pars[:,1], param_bins['lim']) - 1
             si_stat_bin = np.digitize(pars[:,2], param_bins['si_stat']) - 1
             # si_q_bin = np.digitize(si_q, param_bins['si_q']) - 1
 
             # Use the bins found to get the corresponding combination of parameters
-            param_combination = (param_bins['tau'][tau_bin], param_bins['mu_lim'][mu_lim_bin], param_bins['si_stat'][si_stat_bin])
+            param_combination = (param_bins['tau'][tau_bin], param_bins['lim'][lim_bin], param_bins['si_stat'][si_stat_bin])
             
             # Get MSE per sample in batch
             if kalman:
@@ -438,12 +438,12 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
         binned_metrics_list = [
             {
             'tau': tau,
-            'mu_lim': mu_lim,
+            'lim': lim,
             'si_stat': si_stat,
             'mse': metrics['mse'],
             'count': metrics['count']
             }
-            for (tau, mu_lim, si_stat), metrics in binned_metrics.items()
+            for (tau, lim, si_stat), metrics in binned_metrics.items()
         ]
         binned_metrics_df = pd.DataFrame(binned_metrics_list)
         binned_metrics_df['si_q'] = binned_metrics_df['si_stat'] * ((2 * binned_metrics_df['tau'] - 1) ** 0.5) / binned_metrics_df['tau']
@@ -533,89 +533,129 @@ def plot_samples(obs, estim_mu, estim_sigma, save_path, title=None, params=None,
 
         plt.legend()
         if params is not None:
-            title = f"{title}; tau: {params[i,0]:.2f}, mu_lim: {params[i,1]:.2f}, si_stat: {params[i,2]:.2f}, si_q: {params[i,3]:.2f}"
+            title = f"{title}; tau: {params[i,0]:.2f}, lim: {params[i,1]:.2f}, si_stat: {params[i,2]:.2f}, si_q: {params[i,3]:.2f}"
         plt.title(title)
         plt.savefig(f'{save_path}_s{id}.png')
         plt.close()
 
 
 
-def pipeline_single_param():
-    pass
+def pipeline_single_param(model_config, data_config, add_data_params_baseline, gm_name, device=DEVICE):
+    data_config.update({
+        "mu_tau": add_data_params_baseline["mu_tau"], # 4
+        "si_tau": add_data_params_baseline["si_tau"], # 1,
+        # "si_q": 2,  # process noise # Obsolete
+        "si_stat":  add_data_params_baseline["si_tau"] # 2,  # stationary processes variance
+    })
 
-def pipeline_multi_param():
-    pass
+    for nctx in [1]:    # , 2
+        data_config["N_ctx"]=nctx
+        for kalman_on in [True]: # [True, False]
+            for lr_id, learning_rate in enumerate([0.01]): # [0.1, 0.05, 0.01, 0.005] # 0.001, 0.0005, 0.0001, 0.00005, 0.00001]):
+                for model_name in ['vrnn']: # , 'vrnn'
+                    # Define models
+                    if model_name == 'rnn':
+                        model   = SimpleRNN(x_dim=model_config['input_dim'], output_dim=['model_config'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], batch_size=['batch_size'], device=device)
+                    else:
+                        model   = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['dim_out_obs'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], batch_size=model_config['batch_size'], device=device)
+
+
+                    # Train
+                    minmax = train(model, n_batches=model_config['n_batches'], num_epochs=model_config['num_epochs'], batch_res=model_config['batch_res'], epoch_res=model_config['epoch_res'],
+                        lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
+
+
+
+def pipeline_multi_param(model_config, data_config, gm_name, device=DEVICE):
+    
+    data_config.update({
+        "lim_bounds": {'low': 500, 'high': 1800},
+        "mu_tau_bounds": {'low': 1, 'high': 50},
+        "si_stat_bounds": {'low': 1, 'high': 50},
+        "params_testing": True    
+    })
+
+
+    for nctx in [1]:    # , 2
+        data_config["N_ctx"]=nctx
+        for kalman_on in [True]: # [True, False]
+            for lr_id, learning_rate in enumerate([0.01]): # [0.1, 0.05, 0.01, 0.005] # 0.001, 0.0005, 0.0001, 0.00005, 0.00001]):
+                for model_name in ['rnn']: # , 'vrnn'
+                    # Define models
+                    if model_name == 'rnn':
+                        model   = SimpleRNN(x_dim=model_config['input_dim'], output_dim=['model_config'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], batch_size=['batch_size'], device=device)
+                    else:
+                        model   = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['dim_out_obs'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], batch_size=model_config['batch_size'], device=device)
+
+
+                    # Train
+                    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
+                    
+                    # Test
+                    test(model, batch_size=model_config['batch_size'], lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, minmax_train=minmax[0], device=device, kalman=kalman_on, minmax_train_states=minmax[1])
 
 
 
 
 if __name__=='__main__':
 
-    # Define model dimensions
-    # Input and output dimensions
-    input_dim   = 1 # number of features in each observation: 1 --> need to write y_norm = y_norm.unsqueeze(-1)  at one point
-    dim_out_obs = 2 # learn the sufficient statistics mu and var
-    # RNN bit
-    output_dim      = input_dim
-    rnn_hidden_dim  = 8 # Give comparable number of units as number of data parameters # In VRNN paper: 2000
-    rnn_n_layers    = 1 # from goin
-    # VRNN specific
-    latent_dim      = 8 # 16 # needs to be < input_dim --> in a VAE, yes, but in a VRNN, needs to be <input_dim + rnn_hidden_dim
-    phi_x_dim       = rnn_hidden_dim
-    phi_z_dim       = rnn_hidden_dim
-    phi_prior_dim   = rnn_hidden_dim
-
     
-    # Define training parameters
-    num_epochs      = 250 # 200 # 150
-    epoch_res       = 10
-    batch_res       = 10    # Store and report loss every batch_res batches
-    batch_size      = 1000 # 128   # batch_size = N_samples too # TODO: maximize it
-    n_batches       = 32 # 20
-    # learning_rate   = 5e-4
-    weight_decay    = 1e-5 
+    # Define model and training parameters
+    model_config = {
+        # Input and output dimensions
+        "input_dim": 1,  # number of features in each observation: 1 --> need to write y_norm = y_norm.unsqueeze(-1) at one point
+        "dim_out_obs": 2,  # learn the sufficient statistics mu and var
 
-    # Define experiment parameters (non-hierarchical)
-    n_trials    = 1000 # Single tones
+        # RNN configuration
+        "output_dim": 1,  # same as input_dim
+        "rnn_hidden_dim": 8,  # comparable number of units as number of data parameters
+        "rnn_n_layers": 1,  # number of RNN layers
+
+        # VRNN specific configuration
+        "latent_dim": 8,  # needs to be < input_dim + rnn_hidden_dim
+        "phi_x_dim": 8,  # same as rnn_hidden_dim
+        "phi_z_dim": 8,  # same as rnn_hidden_dim
+        "phi_prior_dim": 8,  # same as rnn_hidden_dim
+
+        # Training parameters
+        "num_epochs": 250,  # number of epochs
+        "epoch_res": 10,  # report results every epoch_res epochs
+        "batch_res": 10,  # store and report loss every batch_res batches
+        "batch_size": 1000,  # batch size
+        "n_batches": 32,  # number of batches
+        "weight_decay": 1e-5,  # weight decay for optimizer
+
+        # Experiment parameters (non-hierarchical)
+        "n_trials": 1000,  # single tones
+    }
+    
+    # Define data parameters
     gm_name = 'NonHierarchicalGM'
-
     config_NH = {
         "N_ctx": 1,
         # "N_batch": n_batches,
-        "N_samples": batch_size,
+        "N_samples": model_config['batch_size'],
         "N_blocks": 1,
-        "N_tones": n_trials,
+        "N_tones": model_config['n_trials'],
         "mu_rho_ctx": 0.9,
         "si_rho_ctx": 0.05,
-        # "tones_values": [1455, 1500, 1600], # ~ mu_lim
-        "mu_lim_bounds": {'low': 500, 'high': 1800},
+        # "tones_values": [1455, 1500, 1600], # ~ lim
         "si_lim": 5,
         # "mu_tau": 4,
-        "mu_tau_bounds": {'low': 1, 'high': 50},
         "si_tau": 1,
         # "si_q": 2,  # process noise # Obsolete
         # "si_stat": 2,  # stationary processes variance
-        "si_stat_bounds": {'low': 1, 'high': 50},
         "si_r": 2,  # measurement noise
-        "params_testing": True
     }
 
+    # Test different data paramters
+    # pipeline_multi_param(model_config, config_NH, gm_name)
 
-    for nctx in [1]:    # , 2
-        config_NH["N_ctx"]=nctx
-        for kalman_on in [True]: # [True, False]
-            for lr_id, learning_rate in enumerate([0.01]): # [0.1, 0.05, 0.01, 0.005] # 0.001, 0.0005, 0.0001, 0.00005, 0.00001]):
-                for model_name in ['rnn']: # , 'vrnn'
-                    # Define models
-                    if model_name == 'rnn':
-                        model   = SimpleRNN(x_dim=input_dim, output_dim=dim_out_obs, hidden_dim=rnn_hidden_dim, n_layers=rnn_n_layers, batch_size=batch_size, device=DEVICE)
-                    else:
-                        model   = VRNN(x_dim=input_dim, output_dim=dim_out_obs, latent_dim=latent_dim, phi_x_dim=phi_x_dim, phi_z_dim=phi_z_dim, phi_prior_dim=phi_prior_dim, rnn_hidden_states_dim=rnn_hidden_dim, rnn_n_layers=rnn_n_layers, batch_size=batch_size, device=DEVICE)
-
-
-                    # Train
-                    minmax = train(model, n_batches=n_batches, num_epochs=num_epochs, batch_res=batch_res, epoch_res=epoch_res,
-                        lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=config_NH, device=DEVICE, kalman=kalman_on)
-                    
-                    # Test
-                    test(model, batch_size=batch_size, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=config_NH, minmax_train=minmax[0], device=DEVICE, kalman=kalman_on, minmax_train_states=minmax[1])
+    # Train model on one parameter configuration
+    add_data_params_baseline = {
+        "mu_tau": 4,
+        "si_tau": 1,
+        # "si_q": 2,  # process noise # Obsolete
+        "si_stat": 2  # stationary processes variance
+    }
+    pipeline_single_param(model_config, config_NH, gm_name)
