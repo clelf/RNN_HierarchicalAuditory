@@ -1,4 +1,4 @@
-from model import SimpleRNN, VAE, VRNN
+from model import SimpleRNN, VRNN
 import os
 from pathlib import Path
 import torch
@@ -658,4 +658,5 @@ if __name__=='__main__':
         # "si_q": 2,  # process noise # Obsolete
         "si_stat": 2  # stationary processes variance
     }
-    pipeline_single_param(model_config, config_NH, gm_name)
+    pipeline_single_param(model_config, config_NH, add_data_params_baseline, gm_name)
+
