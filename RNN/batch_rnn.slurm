@@ -13,14 +13,15 @@
 #cd /scratch/clevyfidel/Workspace/goin/opt_coin
 
 # Load modules needed
-module load Python
+# module load Python
+module load Miniforge3
 
 # Create and activate conda env
 conda env create -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml -p /scratch/clevyfidel/conda_env/rnn
 conda activate /scratch/clevyfidel/conda_env/rnn
 
 # Add Python path
-export LD_LIBRARY_PATH=/scratch/clevyfidel/conda_env/coin/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/scratch/clevyfidel/conda_env/coin/rnn:$LD_LIBRARY_PATH
 
 
 # source ~/.bashrcq
