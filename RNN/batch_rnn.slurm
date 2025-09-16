@@ -17,7 +17,7 @@ module load Python
 
 
 # Create and activate conda env
-conda env create -f /scratch/clevyfidel/Workspace/RNN_paradigm/rnn.yml
+conda env create -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml
 conda activate /scratch/clevyfidel/conda_env/coin
 
 # Add Python path
