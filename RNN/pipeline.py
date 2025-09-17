@@ -13,8 +13,19 @@ from tqdm import tqdm
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from paradigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
 
+
+# Check which folder exists and append the correct path
+base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+kalman_folder = None
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from Kalman.kalman import kalman_tau, plot_estim, kalman_batch
+if os.path.exists(os.path.join(base_path, 'Kalman')):
+    from Kalman.kalman import kalman_tau, plot_estim, kalman_batch
+elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
+    from KalmanFilterViz1D.kalman import kalman_tau, plot_estim, kalman_batch
+else:
+    raise ImportError("Neither 'Kalman' nor 'KalmanFilterViz1D' folder found.")
+
+
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -540,13 +551,7 @@ def plot_samples(obs, estim_mu, estim_sigma, save_path, title=None, params=None,
 
 
 
-def pipeline_single_param(model_config, data_config, add_data_params_baseline, gm_name, device=DEVICE):
-    data_config.update({
-        "mu_tau": add_data_params_baseline["mu_tau"], # 4
-        "si_tau": add_data_params_baseline["si_tau"], # 1,
-        # "si_q": 2,  # process noise # Obsolete
-        "si_stat":  add_data_params_baseline["si_tau"] # 2,  # stationary processes variance
-    })
+def pipeline_single_param(model_config, data_config, gm_name, device=DEVICE):
 
     for nctx in [1]:    # , 2
         data_config["N_ctx"]=nctx
@@ -555,14 +560,15 @@ def pipeline_single_param(model_config, data_config, add_data_params_baseline, g
                 for model_name in ['vrnn']: # , 'vrnn'
                     # Define models
                     if model_name == 'rnn':
-                        model   = SimpleRNN(x_dim=model_config['input_dim'], output_dim=['model_config'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], batch_size=['batch_size'], device=device)
+                        model   = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], batch_size=['batch_size'], device=device)
                     else:
-                        model   = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['dim_out_obs'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], batch_size=model_config['batch_size'], device=device)
+                        model   = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], batch_size=model_config['batch_size'], device=device)
 
 
                     # Train
-                    minmax = train(model, n_batches=model_config['n_batches'], num_epochs=model_config['num_epochs'], batch_res=model_config['batch_res'], epoch_res=model_config['epoch_res'],
-                        lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
+                    # train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, device=DEVICE):
+
+                    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
 
 
 
@@ -583,9 +589,9 @@ def pipeline_multi_param(model_config, data_config, gm_name, device=DEVICE):
                 for model_name in ['rnn']: # , 'vrnn'
                     # Define models
                     if model_name == 'rnn':
-                        model   = SimpleRNN(x_dim=model_config['input_dim'], output_dim=['model_config'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], batch_size=['batch_size'], device=device)
+                        model   = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], batch_size=['batch_size'], device=device)
                     else:
-                        model   = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['dim_out_obs'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], batch_size=model_config['batch_size'], device=device)
+                        model   = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], batch_size=model_config['batch_size'], device=device)
 
 
                     # Train
@@ -604,10 +610,9 @@ if __name__=='__main__':
     model_config = {
         # Input and output dimensions
         "input_dim": 1,  # number of features in each observation: 1 --> need to write y_norm = y_norm.unsqueeze(-1) at one point
-        "dim_out_obs": 2,  # learn the sufficient statistics mu and var
+        "output_dim": 2,  # learn the sufficient statistics mu and var
 
         # RNN configuration
-        "output_dim": 1,  # same as input_dim
         "rnn_hidden_dim": 8,  # comparable number of units as number of data parameters
         "rnn_n_layers": 1,  # number of RNN layers
 
@@ -648,15 +653,4 @@ if __name__=='__main__':
         "si_r": 2,  # measurement noise
     }
 
-    # Test different data paramters
-    # pipeline_multi_param(model_config, config_NH, gm_name)
-
-    # Train model on one parameter configuration
-    add_data_params_baseline = {
-        "mu_tau": 4,
-        "si_tau": 1,
-        # "si_q": 2,  # process noise # Obsolete
-        "si_stat": 2  # stationary processes variance
-    }
-    pipeline_single_param(model_config, config_NH, add_data_params_baseline, gm_name)
-
+    # DO NOTHING: run relevant pipeline_single.py or pipeline_multi.py
