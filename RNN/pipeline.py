@@ -324,9 +324,9 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
 
     # Paths 
     if kalman:
-        save_path = Path(f'/home/clevyfidel/Documents/Workspace/RNN_paradigm/training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/')
+        save_path = Path(os.getcwd()) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/'
     else:
-        save_path = Path(f'/home/clevyfidel/Documents/Workspace/RNN_paradigm/training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/')
+        save_path = Path(os.getcwd()) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/'
     if not os.path.exists(save_path):
         raise ValueError("Model has not been trained yet - no folder found")
 
