@@ -54,7 +54,8 @@ class AuditGenerativeModel:
         # self.si_q = params["si_q"] # Obsolete TODO: replace by below si_stat and later define si_q_dev and si_q_std
         if "si_stat" in params.keys():
             self.si_stat = params["si_stat"]
-        self.si_r = params["si_r"]
+        if "si_r" in params.keys():    
+            self.si_r = params["si_r"]
 
         if "N_ctx" not in params.keys(): self.N_ctx = 2 # context refers to being a std / dvt
         else: self.N_ctx = params["N_ctx"]
@@ -62,22 +63,26 @@ class AuditGenerativeModel:
         # NOTE: this only happens in contexts where N_ctx is also == 1
         if "params_testing" in params.keys():
             self.params_testing = True
-            self.mu_tau_set, self.lim_set, self.si_stat_set = None, None, None
+            self.mu_tau_set, self.si_stat_set,self.si_r_set = None, None, None
             if "mu_tau_bounds" in params.keys():
                 self.mu_tau_bounds = params["mu_tau_bounds"]
-                self.mu_tau_set = 10 ** np.random.uniform(
+                self.mu_tau_set = 10 ** np.random.uniform( # TODO: Alex mentioned something about making this one line: it was about if normally pooled parameters are tested by uniform sampling, log-normally distributed parameters should be tested by uniform sampling in log-space
                     low=np.log10(self.mu_tau_bounds["low"]),
                     high=np.log10(self.mu_tau_bounds["high"]),
                     size=self.N_samples
                 )
-            if "lim_bounds" in params.keys():
-                self.lim_bounds = params["lim_bounds"]
-                self.lim_set = np.random.uniform(self.lim_bounds["low"], self.lim_bounds["high"], self.N_samples)
             if "si_stat_bounds" in params.keys():
                 self.si_stat_bounds = params["si_stat_bounds"]
                 self.si_stat_set = 10 ** np.random.uniform(
                     low=np.log10(self.si_stat_bounds["low"]),
                     high=np.log10(self.si_stat_bounds["high"]),
+                    size=self.N_samples
+                )
+            if "si_r_bounds" in params.keys():
+                self.si_r_bounds = params["si_r_bounds"]
+                self.si_r_set = 10 ** np.random.uniform(
+                    low=np.log10(self.si_r_bounds["low"]),
+                    high=np.log10(self.si_r_bounds["high"]),
                     size=self.N_samples
                 )
         else:
@@ -128,6 +133,26 @@ class AuditGenerativeModel:
         """
 
         return np.array(ss.truncnorm.rvs((a - mu) / si, (b - mu) / si, mu, si, size))
+    
+    def _sample_logN_(self, min, mu, si, size=1):
+        """Samples from a log-normal distribution
+        Parameters
+        ----------
+        min : float
+            Minimum value (location parameter of the log-normal distribution)
+        mu : float
+            Mean of the normal distribution before exponentiation
+        si : float
+            Standard deviation of the normal distribution before exponentiation (i.e, size)
+        size  : int or tuple of int (optional)
+            Size of samples
+        Returns
+        -------
+        np.array
+            samples
+        """
+        
+        return np.array(ss.lognorm.rvs(s=si, loc=min, scale=mu, size=size))
 
     def sample_uniform_choice(self, set_values):
         """ Sample a choice of one value from a set of possible values
@@ -254,19 +279,21 @@ class AuditGenerativeModel:
             lim_Cs = self.sample_uniform_set(self.tones_values, N=self.N_ctx) 
             
             for c in range(self.N_ctx):  # 2 contexts: std or dvt
-                if self.params_testing and self.mu_tau_set is not None and self.lim_set is not None :
+                # Parameter that is not necessarily tested
+                lim[c, b]       = self._sample_N_(lim_Cs[c], self.si_lim).item()
+                if self.params_testing:
                     # In that case, parameters have already been sampled, no need to sample more
                     tau[c, b] = self.mu_tau
-                    lim[c, b] = self.tones_values[c]
-                    si_stat[c, b] = self.si_stat
+                    lim[c, b] = lim_Cs[c]
+                    si_stat[b] = self.si_stat
                 else:
                     # Sample dynamics params for each context (std and dvt)
-                    tau[c, b]       = self._sample_TN_(1, 50, self.mu_tau, self.si_tau).item()  # A high boundary
-                    lim[c, b]       = self._sample_N_(lim_Cs[c], self.si_lim).item()
-                    si_stat[c, b] = self._sample_TN_(0.1, 20, self.si_stat, 1).item() # NOTE: not sure, TODO: check if this is a good idea
+                    # tau[c, b]       = self._sample_TN_(1, 50, self.mu_tau, self.si_tau).item()  # A high boundary (actually 50 was not sufficient)
+                    tau[c, b]       = self._sample_logN_(1, self.mu_tau, self.si_tau).item()
+                    si_stat[c, b]   = self._sample_logN_(0, self.si_stat, 0.2).item() # TODO: not sure, check if this is a good idea
 
                 # Compute si_q from them
-                si_q[c, b]  = si_stat * ((2 * tau[c, b] - 1) ** 0.5) / tau[c, b]
+                si_q[c, b]  = si_stat[b] * ((2 * tau[c, b] - 1) ** 0.5) / tau[c, b]
 
         # Initialize states
         states = dict([(int(c), np.zeros(contexts.shape)) for c in range(self.N_ctx)])
@@ -292,7 +319,7 @@ class AuditGenerativeModel:
 
         if return_pars:
             # return states, a, d
-            return states, (tau.squeeze(), lim.squeeze(), si_stat.squeeze(), si_q.squeeze()) # states, (tau, mu_li, si_stat, si_q)
+            return states, (tau.squeeze(), lim.squeeze(), si_stat.squeeze(), si_q.squeeze()) # states, (tau, mu_lim, si_stat, si_q)
         else:
             return states
 
@@ -386,11 +413,15 @@ class AuditGenerativeModel:
                 # sample a set of params
                 if self.mu_tau_set is not None:
                     self.mu_tau = self.mu_tau_set[samp]
-                if self.lim_set is not None:
-                    self.tones_values = [self.lim_set[samp]]
                 if self.si_stat_set is not None:
                     self.si_stat = self.si_stat_set[samp]
-                res = self.generate_run(return_pars=return_pars) # return_pars should be true
+                if self.si_r_set is not None:
+                    self.si_r = self.si_r_set[samp]
+                res = self.generate_run(return_pars=True) # return_pars should be true
+                if return_pars:
+                    # Append self.si_r to the pars element of res (res[-1])
+                    res = (*res[:-1], (*res[-1], self.si_r))
+                # pass
             else:
                 res = self.generate_run(return_pars=return_pars)
 
@@ -401,7 +432,7 @@ class AuditGenerativeModel:
         # res_reshaped = [np.stack([x for x in var_list], axis=0) for var_list in zip(*batches)]
         res_reshaped = (reshape_batch_variable(var_list) for var_list in zip(*batch))
 
-        return res_reshaped
+        return res_reshaped # TODO: should return pars here if params_testing as they're not sampled further down the pipeline
 
 
 
@@ -833,10 +864,11 @@ if __name__ == "__main__":
         "si_rho_rules": 0.05,
         "mu_rho_timbres": 0.8,
         "si_rho_timbres": 0.05,
-        "si_q": 2,  # process noise
-        "si_r": 2,  # measurement noise
+        # "si_q": 2,  # process noise variance
+        "si_stat": 2,  # stationary process variance
+        "si_r": 2,  # measurement noise variance
     }
-    # example_HGM(config_H)
+    example_HGM(config_H)
     
     # Example non-hierachical GM (no rules, std/dvt)
     config_NH = {
@@ -849,10 +881,11 @@ if __name__ == "__main__":
         "mu_tau": 4, # tau = 1 / (1 - a) = x_lim / b
         "si_tau": 1,
         "si_lim": 5,
-        "si_q": 2,  # process noise
+        # "si_q": 2,  # process noise variance
+        "si_stat": 2,  # stationary process variance
         "si_r": 2,  # measurement noise
     }
-    # example_NHGM(config_NH)
+    example_NHGM(config_NH)
 
 
     # Example 1 single process (1 context)

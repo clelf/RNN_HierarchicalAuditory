@@ -1,5 +1,5 @@
 import torch
-from pipeline import pipeline_single_param
+from pipeline_next import pipeline_single_param
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -59,8 +59,7 @@ if __name__=='__main__':
     # Train model on one parameter configuration
     add_data_params_baseline = {
         "tones_values": [1455, 1500, 1600], # ~ lim
-        "mu_tau": 4,
-        "si_tau": 1,
+        "mu_tau": 64, # before used to be 4. Now 64 to describe a representative log-normal distribution
         # "si_q": 2,  # process noise # Obsolete
         "si_stat": 2  # stationary processes variance
     }

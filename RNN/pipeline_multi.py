@@ -1,5 +1,5 @@
 import torch
-from pipeline import pipeline_multi_param
+from pipeline_next import pipeline_multi_param
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -26,10 +26,10 @@ if __name__=='__main__':
         "phi_prior_dim": 8,  # same as rnn_hidden_dim
 
         # Training parameters
-        "num_epochs": 250,  # number of epochs
+        "num_epochs": 2, # TODO: 250,  # number of epochs
         "epoch_res": 10,  # report results every epoch_res epochs
         "batch_res": 10,  # store and report loss every batch_res batches
-        "batch_size": 1000,  # batch size
+        "batch_size": 4, # TODO: 1000,  # batch size
         "n_batches": 32,  # number of batches
         "weight_decay": 1e-5,  # weight decay for optimizer
 
@@ -47,14 +47,28 @@ if __name__=='__main__':
         "N_tones": model_config['n_trials'],
         "mu_rho_ctx": 0.9,
         "si_rho_ctx": 0.05,
-        # "tones_values": [1455, 1500, 1600], # ~ lim
+        "tones_values": [1455, 1500, 1600], # ~ lim
         "si_lim": 5,
         # "mu_tau": 4,
-        "si_tau": 1,
+        "si_tau": 0.5,
         # "si_q": 2,  # process noise # Obsolete
         # "si_stat": 2,  # stationary processes variance
-        "si_r": 2,  # measurement noise
+        # "si_r": 2,  # measurement noise
     }
+
+    add_data_params_baseline = {
+        "si_lim": 5,
+        # "mu_tau": 4,
+        "mu_tau_bounds": {'low': 1, 'high': 256},
+        # "si_q": 2,  # process noise # Obsolete
+        # "si_stat": 2,  # stationary processes variance
+        "si_stat_bounds": {'low': 1, 'high': 50},
+        "si_r_bounds": {'low': 1, 'high': 50},  # measurement noise
+    }
+
+    config_NH.update(add_data_params_baseline)
+
+        
 
     # Test different data paramters
     pipeline_multi_param(model_config, config_NH, gm_name)
