@@ -96,9 +96,9 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
     # Prepare to save the results
     lr_title = f"Learning rate: {lr:>6.0e}"
     if kalman:
-        save_path = Path(os.getcwd()) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/'
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/'
     else:
-        save_path = Path(os.getcwd()) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/'
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/'
     if not os.path.exists(save_path):
         os.makedirs(save_path)
         os.makedirs(save_path / 'samples/')
@@ -135,8 +135,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
             optimizer.zero_grad()
             
             # Generate data (N_samples samples)
-            test = gm.generate_batch(return_pars=False)
-            _, states, y = gm.generate_batch(return_pars=False)
+            _, states, y, pars = gm.generate_batch(return_pars=False)
             y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
 
             # Transform data
@@ -144,9 +143,9 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
             y_norm = minmax_train.fit_normalize(y) #, margin=data_config["si_r"]+data_config["si_q"])
 
             # Prepare to store model output as the same length as the input
-            model_output = (torch.zeros(y_norm.shape, requires_grad=False) * torch.nan).to(device) # TODO: check dimensions of model_output
+            model_output = (torch.zeros(y_norm.shape[0], y_norm.shape[1], model_config["output_dim"], requires_grad=False) * torch.nan).to(device)
             
-            # Compute loss
+            # Get model prediction and compute loss
             if kalman:
                 # If learning the Kalman filter, train to estimate the next timestep
                 # loss_obs = lossfunc(x[:,1:,0], u[:,1:,0], s[:,1:,0]**2)
@@ -157,7 +156,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
                 # u[:, 1:, :], s[:, 1:, :], l[:, 1:, :] = self.call(x[:, :-1, :])
 
                 # Compute loss
-                loss = model.loss(y_norm, model_output, loss_func=loss_function) # TODO: check if NaN of first indice propagates if yes replace by: y_norm[:,1:,:], model_output[:, 1:, :]
+                loss = model.loss(y_norm[:, 1:, :], model_output[:, 1:, :], loss_func=loss_function)
             else:
                 # Or train to estimate the observations
                 loss = model.loss(y_norm, model_output, loss_func=loss_function)
@@ -211,16 +210,16 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
                 y_norm = minmax_train.normalize(y)
 
                 # Prepare to store model output as the same length as the input
-                model_output = (torch.zeros(y_norm.shape, requires_grad=False) * torch.nan).squeeze().to(device)
+                model_output = (torch.zeros(y_norm.shape[0], y_norm.shape[1], model_config["output_dim"], requires_grad=False) * torch.nan).to(device)
 
-                # Compute loss
+                # Get model prediction and compute loss
                 if kalman:
                     # If learning the Kalman filter, train to estimate the next timestep
                     # Call model
                     model_output[:, 1:, :] = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
 
                     # Compute loss
-                    loss = model.loss(y_norm, model_output, loss_func=loss_function) # TODO: same check needed as in training
+                    loss = model.loss(y_norm[:, 1:, :], model_output[:, 1:, :], loss_func=loss_function)
                 else:
                     # Else train to estimate the observations
                     # Call model
@@ -257,7 +256,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
                 
                 if kalman:
                     # Compare network's output with Kalman filter's estimation MSE
-                    kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
+                    kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
                     kalman_mse = ((kalman_mu-states.numpy())**2).mean()
                     kalman_mses.append(kalman_mse)
 
@@ -322,13 +321,13 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
 
 
 
-def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, device=DEVICE, kalman=False):
+def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, device=DEVICE, kalman=False):
 
     # Paths 
     if kalman:
-        save_path = Path(os.getcwd()) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/'
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/'
     else:
-        save_path = Path(os.getcwd()) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/'
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/'
     if not os.path.exists(save_path):
         raise ValueError("Model has not been trained yet - no folder found")
 
@@ -368,7 +367,7 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
     model.eval()
 
     # Generate data
-    _, states, y, pars = gm.generate_batch(N_samples=batch_size, return_pars=True)
+    _, states, y, pars = gm.generate_batch(N_samples=model_config["batch_size"], return_pars=True)
     y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
     if kalman:
         states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
@@ -378,9 +377,21 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
 
 
     with torch.no_grad():
-        # Call model
-        model_output = model(y_norm) # can contain output_dist(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
+        # # Call model
+        # model_output = model(y_norm) # can contain output_dist(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
 
+        # Prepare to store model output as the same length as the input
+        model_output = (torch.zeros(y_norm.shape[0], y_norm.shape[1], model_config["output_dim"], requires_grad=False) * torch.nan).to(device)
+            
+        # Get model prediction
+        if kalman:
+            # If learned the Kalman filter, estimate the next timestep
+            # Call model
+            model_output[:, 1:, :] = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
+        else:
+            # Else if trained to estimate the observations
+            # Call model
+            model_output = model(y_norm) # can contain output_dist(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
 
         # Get estimated distribution
         if model.name=='vrnn': model_output_dist = model_output[0]
@@ -408,7 +419,7 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
         
         if kalman:
             # Compare network's output with Kalman filter's estimation MSE
-            kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
+            kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
             kalman_mse = ((kalman_mu-states.numpy())**2).mean()
             kalman_mses.append(kalman_mse)
         
@@ -416,17 +427,17 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
         if data_config["params_testing"]:
             # Digitize each of these parameters to find the corresponding bin
             tau_bin = np.digitize(pars[:,0], param_bins['tau']) - 1
-            lim_bin = np.digitize(pars[:,1], param_bins['lim']) - 1
             si_stat_bin = np.digitize(pars[:,2], param_bins['si_stat']) - 1
+            si_r_bin = np.digitize(pars[:,4], param_bins['si_r']) - 1
             # si_q_bin = np.digitize(si_q, param_bins['si_q']) - 1
 
             # Use the bins found to get the corresponding combination of parameters
-            param_combination = (param_bins['tau'][tau_bin], param_bins['lim'][lim_bin], param_bins['si_stat'][si_stat_bin])
+            param_combination = (param_bins['tau'][tau_bin], param_bins['si_stat'][si_stat_bin], param_bins['si_r'][si_r_bin])
             
             # Get MSE per sample in batch
             if kalman:
                 # If trying to learn the Kalman filter, compare with hidden states
-                mse_per_sample = ((estim_mu-states)**2).mean(dim=1).cpu().numpy() # shape (N_samples,)
+                mse_per_sample = ((estim_mu[:,1:]-states[:,1:])**2).mean(dim=1).cpu().numpy() # shape (N_samples,)
             else:
                 # If trying to learn the observations, compare with observations
                 mse_per_sample = ((estim_mu-y)**2).mean(dim=1)
@@ -441,6 +452,7 @@ def test(model, batch_size, lr, lr_id, gm_name, data_config, minmax_train, devic
             for param_combination in binned_metrics.keys():
                 binned_metrics[param_combination]['count'] = len(binned_metrics[param_combination]['mse'])
                 binned_metrics[param_combination]['mse'] = np.mean(binned_metrics[param_combination]['mse'])
+
     
     # Save binned metrics
     if data_config["params_testing"]:
@@ -558,9 +570,9 @@ def pipeline_single_param(model_config, data_config, gm_name, device=DEVICE):
                 for model_name in ['vrnn']: # , 'vrnn'
                     # Define models
                     if model_name == 'rnn':
-                        model   = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], batch_size=['batch_size'], device=device)
+                        model = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], device=device)
                     else:
-                        model   = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], batch_size=model_config['batch_size'], device=device)
+                        model = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], device=device)
 
 
                     # Train
@@ -579,7 +591,6 @@ def pipeline_multi_param(model_config, data_config, gm_name, device=DEVICE):
         "params_testing": True    
     })
 
-
     for nctx in [1]:    # , 2
         data_config["N_ctx"]=nctx
         for kalman_on in [True]: # [True, False]
@@ -587,16 +598,16 @@ def pipeline_multi_param(model_config, data_config, gm_name, device=DEVICE):
                 for model_name in ['rnn']: # , 'vrnn'
                     # Define models
                     if model_name == 'rnn':
-                        model   = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], device=device)
+                        model = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], device=device)
                     else:
-                        model   = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], device=device)
+                        model = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], device=device)
 
 
                     # Train
                     minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
                     
                     # Test
-                    test(model, batch_size=model_config['batch_size'], lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, minmax_train=minmax, device=device, kalman=kalman_on)
+                    test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, minmax_train=minmax, device=device, kalman=kalman_on)
 
 
 

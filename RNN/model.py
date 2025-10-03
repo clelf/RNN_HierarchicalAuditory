@@ -4,12 +4,12 @@ from torch.nn import functional as F
 from functools import partial
 import numpy as np
 
-# TODO: handle device switch, autograd...
+# TODO: handle autograd
 # TODO: learn contexts representation as another network (later)
 
 
 class SimpleRNN(nn.Module):
-    def __init__(self, x_dim, output_dim, hidden_dim, n_layers, batch_size=None, device=torch.device('cpu')):
+    def __init__(self, x_dim, output_dim, hidden_dim, n_layers, device=torch.device('cpu')):
         super().__init__()
 
         self.name = 'rnn'
@@ -19,7 +19,7 @@ class SimpleRNN(nn.Module):
         self.n_layers = n_layers
         self.device = device
 
-        self.rnn = nn.GRU(self.x_dim, self.hidden_dim, self.n_layers, batch_first=True, device=device) # expect x of size (N_batch, seq_len, input_dim)
+        self.rnn = nn.GRU(self.x_dim, self.hidden_dim, self.n_layers, batch_first=True, device=device) # expect x of size (batch_size, seq_len, input_dim)
         self.output_layer = nn.Linear(self.hidden_dim, self.output_dim, device=device)
 
 
@@ -34,7 +34,7 @@ class SimpleRNN(nn.Module):
         output_last, _ = self.rnn(x, hx)  # output_last is the sequence of final hidden states after the last layer / h_last is the final hidden state of each layer
         output_seq = self.output_layer(output_last)
 
-        return output_seq # has last dimension = output_dim
+        return output_seq # has last dimension = output_dim # TODO: make sure of the dimensions here
     
     def loss(self, target, x_output, loss_func): # torch.nn.GaussianNLLLoss()
         out_estim_mu    = F.sigmoid(x_output[..., [0]])
@@ -148,7 +148,7 @@ class VAE(nn.Module):
 
 
 class VRNN(VAE): 
-    def __init__(self, x_dim, output_dim, latent_dim, phi_x_dim, phi_z_dim, phi_prior_dim, rnn_hidden_states_dim, rnn_n_layers, batch_size, hidden_units_dim=None, device=torch.device('cpu')):
+    def __init__(self, x_dim, output_dim, latent_dim, phi_x_dim, phi_z_dim, phi_prior_dim, rnn_hidden_states_dim, rnn_n_layers, hidden_units_dim=None, device=torch.device('cpu')):
 
         super().__init__(x_dim, output_dim, latent_dim, hidden_units_dim=hidden_units_dim, device=device)
         
@@ -169,8 +169,8 @@ class VRNN(VAE):
         self.phi_x = self.build_feature_extractor(self.x_dim, self.phi_x_dim)  # shared with standard RNN (S.4 Models)
         self.phi_z = self.build_feature_extractor(self.latent_dim, self.phi_z_dim)
         self.phi_prior = self.build_feature_extractor(self.rnn_hidden_states_dim, self.phi_prior_dim)
-        self.prior_mu = self.build_fc_mu(self.phi_prior_dim, self.latent_dim)
-        self.prior_logvar = self.build_fc_logvar(self.phi_prior_dim, self.latent_dim)
+        self.mu_prior = self.build_fc_mu(self.phi_prior_dim, self.latent_dim)
+        self.logvar_prior = self.build_fc_logvar(self.phi_prior_dim, self.latent_dim)
 
 
         # RNN part
@@ -196,8 +196,8 @@ class VRNN(VAE):
         outputs = []
         mus_latent = []
         logvars_latent = []
-        prior_mus = []
-        prior_logvars = []
+        mus_prior = []
+        logvars_prior = []
 
         for t in range(seq_len):            
             x_t = x[:, t, :] # x_t has shape (batch_size, 1, x_dim) # TODO make sure here!!!!!!!
@@ -214,10 +214,10 @@ class VRNN(VAE):
 
             # Prior
             z_prior = self.phi_prior(h_prev[-1]) # Eq. 5
-            prior_mu = self.prior_mu(z_prior)
-            prior_logvar = self.prior_logvar(z_prior)
-            prior_mus.append(prior_mu)
-            prior_logvars.append(prior_logvar)
+            mu_prior = self.mu_prior(z_prior)
+            logvar_prior = self.logvar_prior(z_prior)
+            mus_prior.append(mu_prior)
+            logvars_prior.append(logvar_prior)
 
 
             # Decode
@@ -236,10 +236,10 @@ class VRNN(VAE):
         outputs = torch.stack(outputs, dim=1)             # [B, T, x_dim]
         mus_latent = torch.stack(mus_latent, dim=1)               # [B, T, latent_dim]
         logvars_latent = torch.stack(logvars_latent, dim=1)       # [B, T, latent_dim]
-        prior_mus = torch.stack(prior_mus, dim=1)         # [B, T, latent_dim]
-        prior_logvars = torch.stack(prior_logvars, dim=1) # [B, T, latent_dim]      
+        mus_prior = torch.stack(mus_prior, dim=1)         # [B, T, latent_dim]
+        logvars_prior = torch.stack(logvars_prior, dim=1) # [B, T, latent_dim]      
 
-        return outputs, mus_latent, logvars_latent, prior_mus, prior_logvars
+        return outputs, mus_latent, logvars_latent, mus_prior, logvars_prior
     
     
     def loss(self, x_target, forward_output, loss_func):

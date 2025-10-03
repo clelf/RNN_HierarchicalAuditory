@@ -430,7 +430,7 @@ class AuditGenerativeModel:
         # Reorganize data as objects of size (N_samples, {obj_len}, 1) rather than a N_samples-long list of objects of size ({obj_len}, 1)
         # ! Except for the dictionary variable like states, that should keep the keys separate
         # res_reshaped = [np.stack([x for x in var_list], axis=0) for var_list in zip(*batches)]
-        res_reshaped = (reshape_batch_variable(var_list) for var_list in zip(*batch))
+        res_reshaped = tuple(reshape_batch_variable(var_list) for var_list in zip(*batch))
 
         return res_reshaped # TODO: should return pars here if params_testing as they're not sampled further down the pipeline
 

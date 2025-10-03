@@ -26,10 +26,10 @@ if __name__=='__main__':
         "phi_prior_dim": 8,  # same as rnn_hidden_dim
 
         # Training parameters
-        "num_epochs": 2, # TODO: 250,  # number of epochs
+        "num_epochs": 250, # TODO: 250,  # number of epochs
         "epoch_res": 10,  # report results every epoch_res epochs
         "batch_res": 10,  # store and report loss every batch_res batches
-        "batch_size": 4, # TODO: 1000,  # batch size
+        "batch_size": 1000, # TODO: 1000,  # batch size
         "n_batches": 32,  # number of batches
         "weight_decay": 1e-5,  # weight decay for optimizer
 
