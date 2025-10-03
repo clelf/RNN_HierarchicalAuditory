@@ -271,13 +271,19 @@ class AuditGenerativeModel:
         """
 
         # Initialize arrays of params
-        tau, lim, si_stat, si_q = np.zeros((self.N_ctx, self.N_blocks)), np.zeros((self.N_ctx, self.N_blocks)), np.zeros((1, self.N_blocks)), np.zeros((self.N_ctx, self.N_blocks))  # self.N_ctx normally = 2 as for len({std, dvt})
+        tau, lim, si_stat, si_q = np.zeros((self.N_ctx, self.N_blocks)), np.zeros((self.N_ctx, self.N_blocks)), np.zeros((self.N_blocks,)), np.zeros((self.N_ctx, self.N_blocks))  # self.N_ctx normally = 2 as for len({std, dvt})
 
         # Sample params for each block
         for b in range(self.N_blocks):
             # Sample one pair of std/dvt lim values for each block
             lim_Cs = self.sample_uniform_set(self.tones_values, N=self.N_ctx) 
             
+            # Sample stationary variance for all (both) processes
+            if self.params_testing:
+                si_stat[b] = self.si_stat
+            else:
+                si_stat[b]   = self._sample_logN_(0, self.si_stat, 0.2).item() # TODO: not sure, check if this is a good idea
+
             for c in range(self.N_ctx):  # 2 contexts: std or dvt
                 # Parameter that is not necessarily tested
                 lim[c, b]       = self._sample_N_(lim_Cs[c], self.si_lim).item()
@@ -285,12 +291,10 @@ class AuditGenerativeModel:
                     # In that case, parameters have already been sampled, no need to sample more
                     tau[c, b] = self.mu_tau
                     lim[c, b] = lim_Cs[c]
-                    si_stat[b] = self.si_stat
                 else:
                     # Sample dynamics params for each context (std and dvt)
                     # tau[c, b]       = self._sample_TN_(1, 50, self.mu_tau, self.si_tau).item()  # A high boundary (actually 50 was not sufficient)
                     tau[c, b]       = self._sample_logN_(1, self.mu_tau, self.si_tau).item()
-                    si_stat[c, b]   = self._sample_logN_(0, self.si_stat, 0.2).item() # TODO: not sure, check if this is a good idea
 
                 # Compute si_q from them
                 si_q[c, b]  = si_stat[b] * ((2 * tau[c, b] - 1) ** 0.5) / tau[c, b]
@@ -417,14 +421,7 @@ class AuditGenerativeModel:
                     self.si_stat = self.si_stat_set[samp]
                 if self.si_r_set is not None:
                     self.si_r = self.si_r_set[samp]
-                res = self.generate_run(return_pars=True) # return_pars should be true
-                if return_pars:
-                    # Append self.si_r to the pars element of res (res[-1])
-                    res = (*res[:-1], (*res[-1], self.si_r))
-                # pass
-            else:
-                res = self.generate_run(return_pars=return_pars)
-
+            res = self.generate_run(return_pars=return_pars)
             batch.append([*res])
 
         # Reorganize data as objects of size (N_samples, {obj_len}, 1) rather than a N_samples-long list of objects of size ({obj_len}, 1)
@@ -493,7 +490,9 @@ class NonHierachicalAuditGM(AuditGenerativeModel):
         obs = obs.flatten()
 
         if return_pars:
-                    return contexts, states, obs, pars
+            # Append self.si_r to the pars element of res (res[-1])
+            pars = tuple((*pars, self.si_r))
+            return contexts, states, obs, pars
         else:
             return contexts, states, obs
 

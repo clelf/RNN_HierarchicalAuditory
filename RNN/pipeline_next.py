@@ -9,6 +9,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.nn import functional as F
 from tqdm import tqdm
+import warnings
+warnings.filterwarnings('error')
+
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from paradigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
@@ -125,6 +128,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
     for epoch in tqdm(range(model_config["num_epochs"]), desc="Epochs"):
 
         ### TRAINING
+        print("TRAINING \n")
         train_losses = []
         tt = time.time()
         model.train()
@@ -135,35 +139,36 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
             optimizer.zero_grad()
             
             # Generate data (N_samples samples)
-            _, states, y, pars = gm.generate_batch(return_pars=False)
+            _, states, y = gm.generate_batch(return_pars=False)
             y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
 
             # Transform data
             minmax_train = MinMaxScaler()
             y_norm = minmax_train.fit_normalize(y) #, margin=data_config["si_r"]+data_config["si_q"])
-
-            # Prepare to store model output as the same length as the input
-            model_output = (torch.zeros(y_norm.shape[0], y_norm.shape[1], model_config["output_dim"], requires_grad=False) * torch.nan).to(device)
-            
+ 
             # Get model prediction and compute loss
             if kalman:
                 # If learning the Kalman filter, train to estimate the next timestep
                 # loss_obs = lossfunc(x[:,1:,0], u[:,1:,0], s[:,1:,0]**2)
                 # dim: batch_size, seq_len, input_dim
 
-                # Call model
-                model_output[:, 1:, :] = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
-                # u[:, 1:, :], s[:, 1:, :], l[:, 1:, :] = self.call(x[:, :-1, :])
-
+                # Call model #  # u[:, 1:, :], s[:, 1:, :], l[:, 1:, :] = self.call(x[:, :-1, :])
+                model_output = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
+                
+                    
                 # Compute loss
-                loss = model.loss(y_norm[:, 1:, :], model_output[:, 1:, :], loss_func=loss_function)
+                loss = model.loss(y_norm[:, 1:, :], model_output, loss_func=loss_function)
+                
             else:
-                # Or train to estimate the observations
+                # Or train to estimate the observations:
+                # Call model #  # u[:, 1:, :], s[:, 1:, :], l[:, 1:, :] = self.call(x[:, :-1, :])
+                model_output = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
+                # Compute loss
                 loss = model.loss(y_norm, model_output, loss_func=loss_function)
 
             # Learning model weigths
             weights_before = [w.detach().clone() for w in model.parameters()]
-            loss.backward()
+            loss.backward()     
             optimizer.step()
             train_losses.append(float(loss.detach().cpu().item()))
             weights_after = [w.detach().clone() for w in model.parameters()]
@@ -190,6 +195,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
 
 
         ### VALIDATION
+        print("VALIDATION \n")
         valid_losses = []
         valid_mse = []
         valid_sigma = []
@@ -209,17 +215,15 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
                 # minmax_valid = MinMaxScaler()
                 y_norm = minmax_train.normalize(y)
 
-                # Prepare to store model output as the same length as the input
-                model_output = (torch.zeros(y_norm.shape[0], y_norm.shape[1], model_config["output_dim"], requires_grad=False) * torch.nan).to(device)
-
                 # Get model prediction and compute loss
                 if kalman:
                     # If learning the Kalman filter, train to estimate the next timestep
                     # Call model
-                    model_output[:, 1:, :] = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
+                    model_output = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
 
                     # Compute loss
-                    loss = model.loss(y_norm[:, 1:, :], model_output[:, 1:, :], loss_func=loss_function)
+                    loss = model.loss(y_norm[:, 1:, :], model_output, loss_func=loss_function)
+
                 else:
                     # Else train to estimate the observations
                     # Call model
@@ -247,8 +251,8 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
 
                 # Evaluate MSE to true value that the model was trained on (observations or hidden process states)
                 if kalman:
-                    # If trying to learn the Kalman filter, compare with hidden states
-                    mse = ((estim_mu-states)**2).mean()
+                    # If trying to learn the Kalman filter, compare prediction of next observation with next observation
+                    mse = ((estim_mu-y[:, 1:])**2).mean()
                 else:
                     # If trying to learn the observations, compare with observations
                     mse = ((estim_mu-y)**2).mean()
@@ -380,14 +384,11 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
         # # Call model
         # model_output = model(y_norm) # can contain output_dist(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
 
-        # Prepare to store model output as the same length as the input
-        model_output = (torch.zeros(y_norm.shape[0], y_norm.shape[1], model_config["output_dim"], requires_grad=False) * torch.nan).to(device)
-            
         # Get model prediction
         if kalman:
             # If learned the Kalman filter, estimate the next timestep
             # Call model
-            model_output[:, 1:, :] = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
+            model_output = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
         else:
             # Else if trained to estimate the observations
             # Call model
@@ -411,7 +412,7 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
         # Evaluate MSE to true value that the model was trained on (observations or hidden process states)
         if kalman:
             # If trying to learn the Kalman filter, compare with hidden states
-            mse = ((estim_mu-states)**2).mean()
+            mse = ((estim_mu-y[:, 1:])**2).mean()
         else:
             # If trying to learn the observations, compare with observations
             mse = ((estim_mu-y)**2).mean()
@@ -437,7 +438,7 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
             # Get MSE per sample in batch
             if kalman:
                 # If trying to learn the Kalman filter, compare with hidden states
-                mse_per_sample = ((estim_mu[:,1:]-states[:,1:])**2).mean(dim=1).cpu().numpy() # shape (N_samples,)
+                mse_per_sample = ((estim_mu-y[:, 1:])**2).mean(dim=1).cpu().numpy() # shape (N_samples,)
             else:
                 # If trying to learn the observations, compare with observations
                 mse_per_sample = ((estim_mu-y)**2).mean(dim=1)
@@ -451,7 +452,10 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
         if data_config["params_testing"]:
             for param_combination in binned_metrics.keys():
                 binned_metrics[param_combination]['count'] = len(binned_metrics[param_combination]['mse'])
-                binned_metrics[param_combination]['mse'] = np.mean(binned_metrics[param_combination]['mse'])
+                if binned_metrics[param_combination]['count'] > 0:
+                    binned_metrics[param_combination]['mse'] = np.mean(binned_metrics[param_combination]['mse'])
+                else:
+                    binned_metrics[param_combination]['mse'] = np.nan
 
     
     # Save binned metrics
