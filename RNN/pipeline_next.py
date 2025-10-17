@@ -22,7 +22,7 @@ base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 kalman_folder = None
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 if os.path.exists(os.path.join(base_path, 'Kalman')):
-    from Kalman.kalman import kalman_tau, plot_estim, kalman_batch
+    from Kalman.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
     from KalmanFilterViz1D.kalman import kalman_tau, plot_estim, kalman_batch
 else:
@@ -139,7 +139,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
             optimizer.zero_grad()
             
             # Generate data (N_samples samples)
-            _, states, y = gm.generate_batch(return_pars=False)
+            _, _, y = gm.generate_batch(return_pars=False)
             y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
 
             # Transform data
@@ -170,7 +170,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
             weights_before = [w.detach().clone() for w in model.parameters()]
             loss.backward()     
             optimizer.step()
-            train_losses.append(float(loss.detach().cpu().item()))
+            train_losses.append(float(loss.detach().cpu().numpy().item()))
             weights_after = [w.detach().clone() for w in model.parameters()]
 
             
@@ -179,9 +179,9 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
                 train_steps.append(epoch * model_config["n_batches"] + batch)
                 
                 # Store loss
-                train_losses_report.append(float(loss.detach().cpu().item()))
+                train_losses_report.append(float(loss.detach().cpu().numpy().item()))
                 loss_report = np.mean(train_losses[-model_config["batch_res"]:])
-                sprint=f'LR: {lr:>6.0e}; epoch: {epoch:0>3}; batch: {batch:>3}; loss: {float(loss.detach().cpu().item()):>7.4f}; batch loss: {loss_report:7.4f}; time: {time.time()-tt:>.2f}; training step: {epoch * model_config["n_batches"] + batch}'
+                sprint=f'LR: {lr:>6.0e}; epoch: {epoch:0>3}; batch: {batch:>3}; loss: {float(loss.detach().cpu().numpy().item()):>7.4f}; batch loss: {loss_report:7.4f}; time: {time.time()-tt:>.2f}; training step: {epoch * model_config["n_batches"] + batch}'
                 logfilename = f'{save_path}/training_loss_lr{lr_id}.txt'
                 with open(logfilename, 'a') as f:
                     f.write(f'{sprint}\n')
@@ -206,11 +206,9 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
         with torch.no_grad():
             for batch in range(model_config["n_batches"]):
                 # Generate data
-                _, states, y, pars = gm.generate_batch(return_pars=True)
+                _, _, y, pars = gm.generate_batch(return_pars=True)
                 y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
-                if kalman:
-                    states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
-
+                
                 # Transform data
                 # minmax_valid = MinMaxScaler()
                 y_norm = minmax_train.normalize(y)
@@ -239,17 +237,16 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
                 else: model_output_dist = model_output
                 
                 # Rescale data according to observation scale
-                estim_mu    = minmax_train.denormalize_mean(F.sigmoid(model_output_dist[...,0]))
-                estim_var   = minmax_train.denormalize_var(F.softplus(model_output_dist[..., 1]) + 1e-6)                    
-                estim_sigma = torch.sqrt(estim_var)
+                estim_mu    = minmax_train.denormalize_mean(F.sigmoid(model_output_dist[...,0])).detach().cpu().numpy()
+                estim_var   = minmax_train.denormalize_var(F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()                    
+                estim_sigma = np.sqrt(estim_var)
                 valid_sigma.append(estim_sigma)
 
                 # Reshape variables
-                y = y.squeeze()
-                if kalman:
-                    states = states.squeeze()
+                y = y.detach().cpu().numpy().squeeze()
 
-                # Evaluate MSE to true value that the model was trained on (observations or hidden process states)
+
+                # Evaluate MSE to true value that the model was trained on (observations or Kalman)
                 if kalman:
                     # If trying to learn the Kalman filter, compare prediction of next observation with next observation
                     mse = ((estim_mu-y[:, 1:])**2).mean()
@@ -260,17 +257,17 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
                 
                 if kalman:
                     # Compare network's output with Kalman filter's estimation MSE
-                    kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
-                    kalman_mse = ((kalman_mu-states.numpy())**2).mean()
+                    # kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
+                    kalman_mu, kalman_sigma = kalman_fit_batch(y, n_iter=5)
+                    # Compare Kalman filter's predicted observations to true observations
+                    kalman_mse = ((kalman_mu - y) ** 2).mean()
                     kalman_mses.append(kalman_mse)
 
             
             # Save valid samples for this epoch
             if epoch % model_config["epoch_res"] == model_config["epoch_res"]-1:
                 if kalman:
-                    # TODO: START FROM HERE
-                    # TypeError: plot_samples() got an unexpected keyword argument 'params'
-                    plot_samples(y, estim_mu, estim_sigma, params=pars, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=kalman_mu, kalman_sigma=kalman_sigma, states=states)
+                    plot_samples(y, estim_mu, estim_sigma, params=pars, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=kalman_mu, kalman_sigma=kalman_sigma)
                 else:
                     plot_samples(y, estim_mu, estim_sigma, params=pars, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title)
 
@@ -365,17 +362,19 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
         # Initialize storage array: each row stores tau, lim, si_stat, si_q, and the corresponding mse
         binned_metrics = {tuple(param_combination): {'mse': [], 'count': 0} for param_combination in param_pairs}
 
+    
+    ### TESTING
+    print("TESTING \n")
+
     valid_sigma = []
     valid_mse = []
     kalman_mses = []
     model.eval()
 
     # Generate data
-    _, states, y, pars = gm.generate_batch(N_samples=model_config["batch_size"], return_pars=True)
+    _, _, y, pars = gm.generate_batch(N_samples=model_config["batch_size"], return_pars=True)
     y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
-    if kalman:
-        states = torch.tensor(states[0], dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
-
+   
     # Transform data
     y_norm = minmax_train.normalize(y)
 
@@ -399,19 +398,17 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
         else: model_output_dist = model_output
         
         # Rescale data according to observation scale
-        estim_mu    = minmax_train.denormalize_mean(F.sigmoid(model_output_dist[...,0]))
-        estim_var   = minmax_train.denormalize_var(F.softplus(model_output_dist[..., 1]) + 1e-6)                    
-        estim_sigma = torch.sqrt(estim_var)
+        estim_mu    = minmax_train.denormalize_mean(F.sigmoid(model_output_dist[...,0])).detach().cpu().numpy()
+        estim_var   = minmax_train.denormalize_var(F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()          
+        estim_sigma = np.sqrt(estim_var)
         valid_sigma.append(estim_sigma)
 
         # Reshape variables
-        y = y.squeeze()
-        if kalman:
-            states = states.squeeze()
+        y = y.detach().cpu().numpy().squeeze()
 
-        # Evaluate MSE to true value that the model was trained on (observations or hidden process states)
+        # Evaluate MSE to true value that the model was trained on (observations or next observation)
         if kalman:
-            # If trying to learn the Kalman filter, compare with hidden states
+            # If trying to learn the Kalman filter, compare prediction of next observation with next observation
             mse = ((estim_mu-y[:, 1:])**2).mean()
         else:
             # If trying to learn the observations, compare with observations
@@ -420,8 +417,9 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
         
         if kalman:
             # Compare network's output with Kalman filter's estimation MSE
-            kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
-            kalman_mse = ((kalman_mu-states.numpy())**2).mean()
+            kalman_mu, kalman_sigma = kalman_fit_batch(y, n_iter=5) 
+            # Compare Kalman filter's predicted observations to true observations
+            kalman_mse = ((kalman_mu-y)**2).mean()
             kalman_mses.append(kalman_mse)
         
         # Track performance along data parameters
@@ -437,7 +435,7 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
             
             # Get MSE per sample in batch
             if kalman:
-                # If trying to learn the Kalman filter, compare with hidden states
+                # If trying to learn the Kalman filter, compare with hidden prediction of next observation
                 mse_per_sample = ((estim_mu-y[:, 1:])**2).mean(dim=1).cpu().numpy() # shape (N_samples,)
             else:
                 # If trying to learn the observations, compare with observations
@@ -581,8 +579,7 @@ def pipeline_single_param(model_config, data_config, gm_name, device=DEVICE):
 
                     # Train
                     # train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, device=DEVICE):
-
-                    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
+                    train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
 
 
 

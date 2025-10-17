@@ -26,10 +26,10 @@ if __name__=='__main__':
         "phi_prior_dim": 8,  # same as rnn_hidden_dim
 
         # Training parameters
-        "num_epochs": 250, # TODO: 250,  # number of epochs
+        "num_epochs": 2, # TODO: 250,  # number of epochs
         "epoch_res": 10,  # report results every epoch_res epochs
         "batch_res": 10,  # store and report loss every batch_res batches
-        "batch_size": 1000, # TODO: 1000,  # batch size
+        "batch_size": 500, # TODO: 1000,  # batch size
         "n_batches": 32,  # number of batches
         "weight_decay": 1e-5,  # weight decay for optimizer
 
@@ -59,11 +59,12 @@ if __name__=='__main__':
     add_data_params_baseline = {
         "si_lim": 5,
         # "mu_tau": 4,
-        "mu_tau_bounds": {'low': 1, 'high': 256},
         # "si_q": 2,  # process noise # Obsolete
         # "si_stat": 2,  # stationary processes variance
         "si_stat_bounds": {'low': 1, 'high': 50},
         "si_r_bounds": {'low': 1, 'high': 50},  # measurement noise
+        "mu_d": 1.5,
+        "si_d": True # No need to define bounds as it depends on si_stat
     }
 
     config_NH.update(add_data_params_baseline)
