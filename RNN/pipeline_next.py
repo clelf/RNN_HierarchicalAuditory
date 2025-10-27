@@ -9,12 +9,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.nn import functional as F
 from tqdm import tqdm
+import pickle
 import warnings
 warnings.filterwarnings('error')
 
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from paradigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from PreProParadigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
 
 
 # Check which folder exists and append the correct path
@@ -79,6 +80,62 @@ class MinMaxScaler():
 
 
 
+def compute_benchmarks(gm, N_samples, param_bins=None, n_iter=5, benchmarkpath='kalman_benchmark.pkl', save=True):
+    """
+    Benchmarks the Kalman filter on a batch of data, tracking MSE along parameter configurations.
+
+    Args:
+        y_batch (np.ndarray): Batch of observations, shape (N_samples, seq_len).
+        pars_batch (np.ndarray): Batch of parameters, shape (N_samples, n_params).
+        param_bins (dict, optional): Dictionary with bin edges for each parameter.
+        n_iter (int): Number of iterations for kalman_fit_batch.
+
+    Returns:
+        dict: Mapping from parameter bin tuples to {'mse': avg_mse, 'count': count}.
+    """
+    # Generate a batch of data
+    _, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
+
+    # Fit Kalman filter to each sample in the batch
+    kalman_mu, _ = kalman_fit_batch(y_batch, n_iter=n_iter)  # shape: (N_samples, seq_len)
+    mses = ((kalman_mu - y_batch) ** 2).mean(axis=1)  # shape: (N_samples,)
+
+    # If no param_bins provided, just return average MSE
+    if param_bins is None:
+        return {'avg_mse': mses.mean(), 'mses': mses}
+
+    # Otherwise, bin by parameter configuration
+    binned_metrics = {}
+
+    # Digitize each parameter for each sample
+    param_indices = []
+    for param_name, bins in param_bins.items():
+        idx = np.digitize(pars_batch[:, param_name], bins) - 1
+        param_indices.append(idx)
+    param_indices = np.stack(param_indices, axis=1)  # shape: (N_samples, n_params)
+
+    for i in range(N_samples):
+        bin_tuple = tuple(param_indices[i])
+        if bin_tuple not in binned_metrics:
+            binned_metrics[bin_tuple] = {'mse': [], 'count': 0}
+        binned_metrics[bin_tuple]['mse'].append(mses[i])
+        binned_metrics[bin_tuple]['count'] += 1
+
+    # Average MSE per bin
+    for bin_tuple in binned_metrics:
+        binned_metrics[bin_tuple]['mse'] = np.mean(binned_metrics[bin_tuple]['mse'])
+
+    benchmark_kit = {'y': y_batch, 'pars': pars_batch, 'perf': binned_metrics}
+
+    if not os.path.exists(os.path.split(benchmarkpath)[0]):
+        os.mkdir(os.path.split(benchmarkpath)[0])
+
+    if save:
+        with open(benchmarkpath, 'wb') as f:
+            pickle.dump(benchmark_kit, f)
+
+    return benchmark_kit
+
 
 
 def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, device=DEVICE):
@@ -95,6 +152,11 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
     if gm_name == 'NonHierarchicalGM': gm = NonHierachicalAuditGM(data_config)
     elif gm_name == 'HierarchicalGM': gm = HierarchicalAuditGM(data_config)
     else: raise ValueError("Invalid GM name")
+
+    # Load validation batch and computed benchmarks
+    if kalman:
+        with open('kf_benchmark.pkl', 'rb') as f:
+            kf_benchmark = pickle.load(f) # dict with fields: 'y', 'pars', 'perf'
 
     # Prepare to save the results
     lr_title = f"Learning rate: {lr:>6.0e}"
@@ -154,7 +216,6 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
 
                 # Call model #  # u[:, 1:, :], s[:, 1:, :], l[:, 1:, :] = self.call(x[:, :-1, :])
                 model_output = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
-                
                     
                 # Compute loss
                 loss = model.loss(y_norm[:, 1:, :], model_output, loss_func=loss_function)
@@ -204,64 +265,68 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
 
         model.eval()
         with torch.no_grad():
-            for batch in range(model_config["n_batches"]):
-                # Generate data
+            # If kalman, use benchmark batch, else, generate new batch
+            if kalman:
+                y = kf_benchmark['y']
+                pars = kf_benchmark['pars']
+            else:
                 _, _, y, pars = gm.generate_batch(return_pars=True)
-                y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
-                
-                # Transform data
-                # minmax_valid = MinMaxScaler()
-                y_norm = minmax_train.normalize(y)
+            y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
+            
+            # Transform data
+            # minmax_valid = MinMaxScaler()
+            y_norm = minmax_train.normalize(y)
 
-                # Get model prediction and compute loss
-                if kalman:
-                    # If learning the Kalman filter, train to estimate the next timestep
-                    # Call model
-                    model_output = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
+            # Get model prediction and compute loss
+            if kalman:
+                # If learning the Kalman filter, train to estimate the next timestep
+                # Call model
+                model_output = model(y_norm[:, :-1, :]) # can contain output(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
 
-                    # Compute loss
-                    loss = model.loss(y_norm[:, 1:, :], model_output, loss_func=loss_function)
+                # Compute loss
+                loss = model.loss(y_norm[:, 1:, :], model_output, loss_func=loss_function)
 
-                else:
-                    # Else train to estimate the observations
-                    # Call model
-                    model_output = model(y_norm) # can contain output_dist(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
-                    # Compute loss
-                    loss = model.loss(y_norm, model_output, loss_func=loss_function)                
-                
-                # Store valid loss
-                valid_losses.append(float(loss.detach().item()))
+            else:
+                # Else train to estimate the observations
+                # Call model
+                model_output = model(y_norm) # can contain output_dist(, mu_latent, logvar_latent(, mu_prior, logvar_prior))
+                # Compute loss
+                loss = model.loss(y_norm, model_output, loss_func=loss_function)                
+            
+            # Store valid loss
+            valid_losses.append(float(loss.detach().item()))
 
-                # Get estimated distribution
-                if model.name=='vrnn': model_output_dist = model_output[0]
-                else: model_output_dist = model_output
-                
-                # Rescale data according to observation scale
-                estim_mu    = minmax_train.denormalize_mean(F.sigmoid(model_output_dist[...,0])).detach().cpu().numpy()
-                estim_var   = minmax_train.denormalize_var(F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()                    
-                estim_sigma = np.sqrt(estim_var)
-                valid_sigma.append(estim_sigma)
+            # Get estimated distribution
+            if model.name=='vrnn': model_output_dist = model_output[0]
+            else: model_output_dist = model_output
+            
+            # Rescale data according to observation scale
+            estim_mu    = minmax_train.denormalize_mean(F.sigmoid(model_output_dist[...,0])).detach().cpu().numpy()
+            estim_var   = minmax_train.denormalize_var(F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()                    
+            estim_sigma = np.sqrt(estim_var)
+            valid_sigma.append(estim_sigma)
 
-                # Reshape variables
-                y = y.detach().cpu().numpy().squeeze()
+            # Reshape variables
+            y = y.detach().cpu().numpy().squeeze()
 
 
-                # Evaluate MSE to true value that the model was trained on (observations or Kalman)
-                if kalman:
-                    # If trying to learn the Kalman filter, compare prediction of next observation with next observation
-                    mse = ((estim_mu-y[:, 1:])**2).mean()
-                else:
-                    # If trying to learn the observations, compare with observations
-                    mse = ((estim_mu-y)**2).mean()
-                valid_mse.append(mse)
-                
-                if kalman:
-                    # Compare network's output with Kalman filter's estimation MSE
-                    # kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
-                    kalman_mu, kalman_sigma = kalman_fit_batch(y, n_iter=5)
-                    # Compare Kalman filter's predicted observations to true observations
-                    kalman_mse = ((kalman_mu - y) ** 2).mean()
-                    kalman_mses.append(kalman_mse)
+            # Evaluate MSE to true value that the model was trained on (observations or Kalman)
+            if kalman:
+                # If trying to learn the Kalman filter, compare prediction of next observation with next observation
+                mse = ((estim_mu-y[:, 1:])**2).mean()
+            else:
+                # If trying to learn the observations, compare with observations
+                mse = ((estim_mu-y)**2).mean()
+            valid_mse.append(mse)
+            
+            if kalman:
+                # TODO: USE BENCHMARK HERE INSTEAD
+                # Compare network's output with Kalman filter's estimation MSE
+                # kalman_mu, kalman_sigma = kalman_batch(y, taus=pars[:,0], mu_lims=pars[:,1], C=1, Qs=pars[:,3], Rs=pars[:,4], x0s=y[...,0]) 
+                kalman_mu, kalman_sigma = kalman_fit_batch(y, n_iter=5)
+                # Compare Kalman filter's predicted observations to true observations
+                kalman_mse = ((kalman_mu - y) ** 2).mean()
+                kalman_mses.append(kalman_mse)
 
             
             # Save valid samples for this epoch
@@ -416,6 +481,7 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
         valid_mse.append(mse)
         
         if kalman:
+            # TODO: USE BENCHMARK HERE
             # Compare network's output with Kalman filter's estimation MSE
             kalman_mu, kalman_sigma = kalman_fit_batch(y, n_iter=5) 
             # Compare Kalman filter's predicted observations to true observations
