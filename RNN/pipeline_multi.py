@@ -11,6 +11,8 @@ if __name__=='__main__':
 
     # Define model and training parameters
     model_config = {
+        "use_minmax": False,  # whether to use min-max normalization
+
         # Input and output dimensions
         "input_dim": 1,  # number of features in each observation: 1 --> need to write y_norm = y_norm.unsqueeze(-1) at one point
         "output_dim": 2,  # learn the sufficient statistics mu and var
