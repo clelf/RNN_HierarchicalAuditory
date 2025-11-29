@@ -28,15 +28,18 @@ if __name__=='__main__':
         "phi_prior_dim": 8,  # same as rnn_hidden_dim
 
         # Training parameters
-        "num_epochs": 2, # TODO: 250,  # number of epochs
+        "num_epochs": 250, # TODO: 250,  # number of epochs (TEST: 2)
         "epoch_res": 10,  # report results every epoch_res epochs
         "batch_res": 10,  # store and report loss every batch_res batches
-        "batch_size": 500, # TODO: 1000,  # batch size
+        "batch_size": 1000, # TODO: 1000,  # batch size (TEST: 5)
         "n_batches": 32,  # number of batches
         "weight_decay": 1e-5,  # weight decay for optimizer
 
         # Experiment parameters (non-hierarchical)
         "n_trials": 1000,  # single tones
+
+        # Testing parameters
+        "batch_size_test": 1000 # batch size during testing # TODO: 1000 (TEST: 10)
     }
     
     # Define data parameters
@@ -59,21 +62,55 @@ if __name__=='__main__':
     }
 
     add_data_params_baseline = {
+        "params_testing": True,
         "si_lim": 5,
+        "mu_tau_bounds": {'low': 1, 'high': 250},
         # "mu_tau": 4,
         # "si_q": 2,  # process noise # Obsolete
         # "si_stat": 2,  # stationary processes variance
-        "si_stat_bounds": {'low': 1, 'high': 50},
-        "si_r_bounds": {'low': 1, 'high': 50},  # measurement noise
-        "mu_d": 1.5,
-        "si_d": True # No need to define bounds as it depends on si_stat
+        "si_stat_bounds": {'low': 0.1, 'high': 2},
+        "si_r_bounds": {'low': 0.1, 'high': 2},  # measurement noise
     }
+
 
     config_NH.update(add_data_params_baseline)
 
-        
-
-    # Test different data paramters
-    pipeline_multi_param(model_config, config_NH, gm_name)
+    
+    # ========================================
+    # STEP-BY-STEP WORKFLOW
+    # ========================================
+    
+    # STEP 1: Pre-compute benchmarks and visualize parameter distributions
+    # This computes Kalman filter estimates on training and test data, and saves:
+    #   - benchmarks/benchmarks_<N>_<GM>_train.pkl
+    #   - benchmarks/benchmarks_<N>_<GM>_test.pkl
+    #   - benchmarks/visualizations/param_distribution_*.png
+    #   - benchmarks/visualizations/binned_metrics_kalman.csv
+    
+    print("\n" + "="*60)
+    print("STEP 1: Computing benchmarks (Kalman filter baseline)")
+    print("="*60)
+    pipeline_multi_param(model_config, config_NH, gm_name, benchmark_only=True)
+    
+    
+    # STEP 2: Train the RNN model with different learning rates
+    # This will train the model using the pre-computed benchmarks for validation
+    # Uncomment the following line to run training:
+    
+    print("\n" + "="*60)
+    print("STEP 2: Training RNN models")
+    print("="*60)
+    pipeline_multi_param(model_config, config_NH, gm_name, benchmark_only=False)
+    
+    
+    # STEP 3: Review results
+    # After training completes, check:
+    #   - training_results/N_ctx_1/kalman/<model_name>/
+    #       - training_loss_lr*.txt
+    #       - training_log_lr*.txt
+    #       - loss_trainvalid_lr*.png
+    #       - mse_valid_lr*.png
+    #       - samples/ (validation samples at different epochs)
+    #       - test/binned_metrics_lr*.csv (test performance)
 
 

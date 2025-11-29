@@ -6,6 +6,8 @@ import sys
 import pandas as pd
 import time
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend for plotting
 import matplotlib.pyplot as plt
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -76,43 +78,191 @@ class MinMaxScaler():
         return var_norm * (self.freq_max - self.freq_min)**2
 
 
+def bin_params(data_config):
+    tau_bins = np.logspace(np.log10(data_config["mu_tau_bounds"]["low"]), np.log10(data_config["mu_tau_bounds"]["high"]), 10)
+    si_stat_bins = np.linspace(data_config["si_stat_bounds"]["low"], data_config["si_stat_bounds"]["high"], 10)
+    si_r_bins = np.linspace(data_config["si_r_bounds"]["low"], data_config["si_r_bounds"]["high"], 10)
 
-def compute_benchmarks(gm, N_samples, param_bins=None, n_iter=5, benchmarkpath='kalman_benchmark.pkl', save=True):
+    # Create a grid of all parameter combinations
+    param_bins = {'tau': tau_bins,
+                    'si_stat': si_stat_bins,
+                    'si_r': si_r_bins}
+
+    return param_bins
+
+def map_binned_params_2_metrics(param_bins, y, mu_estim, pars):
+    # Initialize storage array: each row stores tau, lim, si_stat, si_q, and the corresponding mse
+    param_combinations = np.array(np.meshgrid(param_bins['tau'], param_bins['si_stat'], param_bins['si_r'])).T.reshape(-1, 3)
+    binned_metrics = {tuple(param_combination): {'mse': [], 'count': 0} for param_combination in param_combinations}
+
+    # Digitize each of these parameters to find the corresponding bin
+    tau_bin_id = np.digitize(pars[:,0], param_bins['tau']) - 1
+    si_stat_bin_id = np.digitize(pars[:,2], param_bins['si_stat']) - 1
+    si_r_bin_id = np.digitize(pars[:,4], param_bins['si_r']) - 1
+    # si_q_bin = np.digitize(si_q, param_bins['si_q']) - 1
+
+    # Use the bins found to get the corresponding combination of parameters
+    param_combination = (param_bins['tau'][tau_bin_id], param_bins['si_stat'][si_stat_bin_id], param_bins['si_r'][si_r_bin_id])
+    
+    # Get MSE per sample in batch
+    
+    mse_per_sample = ((mu_estim-y)**2).mean(axis=1)
+
+    # Then, zip batch's param_combination array and MSE array and store MSE
+    for *pc, m in zip(*param_combination, mse_per_sample):
+        binned_metrics[tuple(pc)]['mse'].append(m)
+
+
+    # If tracking performance along data parameters, average stored MSEs for each parameter combination
+    for param_combination in binned_metrics.keys():
+        binned_metrics[param_combination]['count'] = len(binned_metrics[param_combination]['mse'])
+        if binned_metrics[param_combination]['count'] > 0:
+            binned_metrics[param_combination]['mse'] = np.mean(binned_metrics[param_combination]['mse'])
+        else:
+            binned_metrics[param_combination]['mse'] = np.nan
+
+
+    # Save binned metrics
+    binned_metrics_list = [
+        {
+        'tau': tau,
+        'si_stat': si_stat,
+        'si_r': si_r,
+        'mse': metrics['mse'],
+        'count': metrics['count']
+        }
+        for (tau, si_stat, si_r), metrics in binned_metrics.items()
+    ]
+    binned_metrics_df = pd.DataFrame(binned_metrics_list)
+    binned_metrics_df['si_q'] = binned_metrics_df['si_stat'] * ((2 * binned_metrics_df['tau'] - 1) ** 0.5) / binned_metrics_df['tau']
+    # if save_path is None and lr_id is not None:
+    #     if kalman:
+    #         save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_1/kalman/'
+    #     else:
+    #         save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_1/observ/'
+    # if save_path is not None and lr_id is not None:
+        # binned_metrics_df.to_csv((save_path/f'binned_metrics_lr{lr_id}.csv'), index=False)
+
+    return binned_metrics_df
+
+
+def benchmark_filename(benchmarkpath, gm_name, data_config, suffix=''):
+    if suffix != '':
+        suffix = '_' + suffix
+    return benchmarkpath / f'benchmarks_{data_config["N_samples"]}_{gm_name}{suffix}.pkl'
+
+
+def compute_benchmarks(gm_name, data_config, N_samples=None, n_iter=5, benchmarkpath=None, save=False, suffix=''):
     """
     Benchmarks the Kalman filter on a batch of data, tracking MSE along parameter configurations.
 
     Args:
-        y_batch (np.ndarray): Batch of observations, shape (N_samples, seq_len).
-        pars_batch (np.ndarray): Batch of parameters, shape (N_samples, n_params).
-        param_bins (dict, optional): Dictionary with bin edges for each parameter.
+        gm_name (str): Name of the generative model ('NonHierarchicalGM' or 'HierarchicalGM').
+        data_config (dict): Configuration parameters for the data generative model.
         n_iter (int): Number of iterations for kalman_fit_batch.
+        benchmarkpath (Path or None): Path to save the benchmark file. If None, benchmarks are not saved.
+        save (bool): Whether to save the benchmark data.
 
     Returns:
-        dict: Mapping from parameter bin tuples to {'mse': avg_mse, 'count': count}.
+        dict: A dictionary containing observations, Kalman estimates, parameters, and performance metrics.
     """
+    
+    # Define data generative model
+    if gm_name == 'NonHierarchicalGM': gm = NonHierachicalAuditGM(data_config)
+    elif gm_name == 'HierarchicalGM': gm = HierarchicalAuditGM(data_config)
+    else: raise ValueError("Invalid GM name")
+    
     # Generate a batch of data
+    if N_samples is None:
+        N_samples = data_config["N_samples"]
+    else:
+        N_samples = N_samples
     _, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
 
     # Fit Kalman filter to each sample in the batch
     kalman_mu, kalman_sigma = kalman_fit_batch(y_batch, n_iter=n_iter)  # shape: (N_samples, seq_len)
     mses = ((kalman_mu - y_batch) ** 2).mean(axis=1)  # shape: (N_samples,)
+    
+    # TODO: bin mses according to data parameters if needed?
 
-    # Return observations, Kalman estimates, parameters, and binned performance metrics
+
+    # Return observations, Kalman estimates, parameters, and performance
     benchmark_kit = {'y': y_batch, 'mu_kal': kalman_mu, 'sigma_kal': kalman_sigma, 'pars': pars_batch, 'perf': mses}
 
-    if not os.path.exists(os.path.split(benchmarkpath)[0]):
-        os.mkdir(os.path.split(benchmarkpath)[0])
-
     if save:
-        with open(benchmarkpath, 'wb') as f:
+        if benchmarkpath is not None and not benchmarkpath.exists():
+            os.makedirs(benchmarkpath)
+        with open(benchmark_filename(benchmarkpath, gm_name, data_config, suffix=suffix), 'wb') as f:
             pickle.dump(benchmark_kit, f)
 
     return benchmark_kit
 
 
+def benchmarks_pars_viz(benchmarks, data_config, kalman, save_path=None, suffix=''):
+    """
+    Visualize parameter distributions from benchmark data.
+    
+    Args:
+        benchmarks: Dictionary with 'y', 'mu_kal', 'sigma_kal', 'perf', 'pars'
+        data_config: Data configuration dictionary
+        kalman: Whether this is for Kalman filter benchmarks
+        save_path: Optional path to save visualizations (defaults to benchmarks/ folder)
+        suffix: Optional suffix to add to filenames (e.g., 'train', 'test')
+    """
+    param_bins = bin_params(data_config)
+    y = benchmarks['y']
+    mu_kal = benchmarks['mu_kal']
+    sigma_kal = benchmarks['sigma_kal']
+    mse_kal = benchmarks['perf']
+    pars_kal = benchmarks['pars']
+    
+    # Compute binned metrics
+    binned_metrics_df = map_binned_params_2_metrics(param_bins, y, mu_kal, pars_kal)
+    
+    # Set up save path
+    if save_path is None:
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks' / 'visualizations'
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Add suffix to filename if provided
+    suffix_str = f'_{suffix}' if suffix else ''
+    label_str = f' ({suffix})' if suffix else ''
+    
+    # Compute si_q from parameters (tau, lim, si_stat, si_q, si_r)
+    # Formula: si_q = si_stat * sqrt(2*tau - 1) / tau
+    tau_vals = pars_kal[:, 0]
+    si_stat_vals = pars_kal[:, 2]
+    si_q_vals = si_stat_vals * np.sqrt(2 * tau_vals - 1) / tau_vals
+    
+    # Visualize parameter distributions
+    print(f"  Saving parameter distribution plots to {save_path}")
+    
+    # Plot tau, si_stat, si_r from param_bins
+    for param_name in param_bins.keys():
+        plt.figure(figsize=(10, 5))
+        param_idx = list(param_bins.keys()).index(param_name)
+        plt.hist(pars_kal[:, param_idx], bins=30, alpha=0.7, color='blue', edgecolor='black')
+        plt.title(f'Distribution of {param_name}{label_str}')
+        plt.xlabel(param_name)
+        plt.ylabel('Frequency')
+        plt.savefig(save_path / f'param_distribution_{param_name}{suffix_str}.png')
+        plt.close()
+    
+    # Plot si_q (computed parameter)
+    plt.figure(figsize=(10, 5))
+    plt.hist(si_q_vals, bins=30, alpha=0.7, color='green', edgecolor='black')
+    plt.title(f'Distribution of si_q{label_str}')
+    plt.xlabel('si_q')
+    plt.ylabel('Frequency')
+    plt.savefig(save_path / f'param_distribution_si_q{suffix_str}.png')
+    plt.close()
+    
+    # Save binned metrics
+    binned_metrics_df.to_csv(save_path / f'binned_metrics_kalman{suffix_str}.csv', index=False)
+    print(f"  Saved binned metrics to {save_path / f'binned_metrics_kalman{suffix_str}.csv'}")
 
 
-def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, device=DEVICE):
+def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalman=False, benchmarks=None, device=DEVICE):
     # Set optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=model_config["weight_decay"])
     
@@ -126,21 +276,11 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
     if gm_name == 'NonHierarchicalGM': gm = NonHierachicalAuditGM(data_config)
     elif gm_name == 'HierarchicalGM': gm = HierarchicalAuditGM(data_config)
     else: raise ValueError("Invalid GM name")
-
-    # Load validation batch and computed benchmarks
-    if kalman:
-        with open('kf_benchmark.pkl', 'rb') as f:
-            kf_benchmark = pickle.load(f) # dict with fields: 'y' (observation), 'mu_kal' (mean of the estimation distribution of hidden state by KF), 'sigma_kal' (variance of the estimation distribution of hidden state by KF), 'pars' (KF parameters fit), 'perf' (MSE of predicted next observation with true next observation)
+    
 
     # Prepare to save the results
     lr_title = f"Learning rate: {lr:>6.0e}"
-    if kalman:
-        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/'
-    else:
-        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/'
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-        os.makedirs(save_path / 'samples/')
+    os.makedirs(save_path / 'samples/', exist_ok=True)
 
     epoch_steps         = []
     train_losses_report = []
@@ -150,7 +290,6 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
     valid_mse_report    = []
     valid_sigma_report  = []
     if kalman:
-        mse_kal_report   = []
         model_kf_mse_report = []
 
     # Define loss instance
@@ -238,17 +377,18 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
         with torch.no_grad():    
             # If kalman, use benchmark batch, else, generate new batch
             if kalman:
-                y = kf_benchmark['y'] # TODO: sanity check that they are the same sizes
-                mu_kal = kf_benchmark['mu_kal']
-                sigma_kal = kf_benchmark['sigma_kal']
-                mse_kal = kf_benchmark['perf'] # TODO: not sure if interesting here
-                pars = kf_benchmark['pars']
+                y = benchmarks['y'] # TODO: sanity check that they are the same sizes
+                y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(-1).to(device)
+                mu_kal = benchmarks['mu_kal']
+                sigma_kal = benchmarks['sigma_kal']
+                mse_kal = benchmarks['perf']
+                pars_kal = benchmarks['pars']
+
             else:
                 _, _, y, pars = gm.generate_batch(return_pars=True)
                 y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
             
             # Transform data
-            # minmax_valid = MinMaxScaler()
             if model_config["use_minmax"]:
                 y_norm = minmax_train.normalize(y)
             else:
@@ -305,7 +445,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
             # Save valid samples for this epoch
             if epoch % model_config["epoch_res"] == model_config["epoch_res"]-1:
                 if kalman:
-                    plot_samples(y, mu_estim, sigma_estim, params=pars, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=kalman_mu, kalman_sigma=kalman_sigma)
+                    plot_samples(y, mu_estim, sigma_estim, params=pars_kal, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=mu_kal, kalman_sigma=sigma_kal)
                 else:
                     plot_samples(y, mu_estim, sigma_estim, params=pars, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title)
 
@@ -315,13 +455,14 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
             valid_losses_report.append(valid_loss) # avg loss for epoch (over batches)
             valid_steps.append(epoch*model_config["n_batches"]+model_config["n_batches"])
             epoch_steps.append(epoch)
-            valid_sigma_report.append(sigma_estim)
+            sigma_estim_avg = sigma_estim.mean()
+            valid_sigma_report.append(sigma_estim_avg)
             if kalman:
                 model_kf_mse_report.append(mse_model2kal) # TODO: now not reporting KF (bc was a bit useless), but MSE of model to KF
 
             # Print epoch report
             print(f"Model: {model.name:>4}, LR: {lr:>6.0e}, Epoch: {epoch:>3}, Training Loss: {avg_train_loss:>7.2f}, Valid Loss: {valid_loss:>7.2f}")
-            sprint=f'LR: {lr:>6.0e}; epoch: {epoch:>3}; var: {sigma_estim:>7.2f}; MSE: {mse_model:>7.2f}; time: {time.time()-tt:>.2f}; training step: {epoch * model_config["n_batches"] + model_config["n_batches"]}'
+            sprint=f'LR: {lr:>6.0e}; epoch: {epoch:>3}; mean var: {sigma_estim_avg:>7.2f}; mean MSE: {mse_model:>7.2f}; time: {time.time()-tt:>.2f}; training step: {epoch * model_config["n_batches"] + model_config["n_batches"]}'
             if kalman:
                 sprint += f'; Model-KF MSE: {mse_model2kal:>7.2f}'
             logfilename = save_path / f'training_log_lr{lr_id}.txt'
@@ -334,7 +475,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
     # plot_losses(train_steps, valid_steps, epoch_steps, train_losses_report, valid_losses_report, x_label='Training steps', y_label='Loss', title=lr_title, save_path=lossplotfile)
     plot_variance(epoch_steps, valid_sigma_report, title=lr_title, save_path=save_path/f'variance_valid_lr{lr_id}.png')
     if kalman:
-        plot_mse(epoch_steps, valid_mse_report, title=lr_title, save_path=save_path/f'mse_valid_lr{lr_id}.png', mse_kal=mse_kal_report, model_mse_kal=model_kf_mse_report)
+        plot_mse(epoch_steps, valid_mse_report, title=lr_title, save_path=save_path/f'mse_valid_lr{lr_id}.png', mse_kal=mse_kal, model_mse_kal=model_kf_mse_report)
     else:
         plot_mse(epoch_steps, valid_mse_report, title=lr_title, save_path=save_path/f'mse_valid_lr{lr_id}.png')
     
@@ -354,16 +495,12 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, kalman=False, de
 
 
 
-def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, device=DEVICE, kalman=False):
+def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax_train, device=DEVICE, kalman=False, benchmarks=None):
 
     ### TESTING
     print("TESTING \n")
 
     # Paths 
-    if kalman:
-        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model.name}/'
-    else:
-        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model.name}/'
     if not os.path.exists(save_path):
         raise ValueError("Model has not been trained yet - no folder found")
 
@@ -384,28 +521,27 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
     if data_config["params_testing"]:
         # NOTE: same spacing as sampled in audit_gm.py "if param_testing" but regularly spaced
         # NOTE: here assuming that all 3 params are being tested
-        tau_bins = np.logspace(np.log10(data_config["mu_tau_bounds"]["low"]), np.log10(data_config["mu_tau_bounds"]["high"]), 10)
-        si_stat_bins = np.logspace(np.log10(data_config["si_stat_bounds"]["low"]), np.log10(data_config["si_stat_bounds"]["high"]), 10)
-        si_r_bins = np.logspace(np.log10(data_config["si_r_bounds"]["low"]), np.log10(data_config["si_r_bounds"]["high"]), 10)
+        param_bins = bin_params(data_config)
 
-        # Create a grid of all parameter combinations
-        param_bins = {'tau': tau_bins,
-                      'si_stat': si_stat_bins,
-                      'si_r': si_r_bins}
-        param_pairs = np.array(np.meshgrid(tau_bins, si_stat_bins, si_r_bins)).T.reshape(-1, 3)
-
-        # Initialize storage array: each row stores tau, lim, si_stat, si_q, and the corresponding mse
-        binned_metrics = {tuple(param_combination): {'mse': [], 'count': 0} for param_combination in param_pairs}
-
-
-    valid_sigma = []
-    valid_mse = []
-    mse_kals = []
+    test_sigma = []
+    test_mse = []
+    if kalman:
+        test_mse_model2kal = []
     model.eval()
 
     # Generate data
-    _, _, y, pars = gm.generate_batch(N_samples=model_config["batch_size"], return_pars=True)
+    _, _, y, pars = gm.generate_batch(N_samples=model_config["batch_size_test"], return_pars=True)
     y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
+
+    # Load benchmarks if kalman
+    if kalman:
+        if benchmarks is None:
+            raise ValueError("Benchmarks must be provided for Kalman testing")
+        mu_kal = benchmarks['mu_kal']
+        sigma_kal = benchmarks['sigma_kal']
+        pars_kal = benchmarks['pars']
+        mse_kal = benchmarks['perf']
+
    
     # Transform data
     if model_config["use_minmax"]:
@@ -443,79 +579,39 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, minmax_train, dev
 
         # Compute standard deviation                    
         sigma_estim = np.sqrt(var_estim)
-        valid_sigma.append(sigma_estim)
+        test_sigma.append(sigma_estim)
 
         # Reshape variables
         y = y.detach().cpu().numpy().squeeze()
 
         # Evaluate MSE to true value that the model was trained on (observations or next observation)
         if kalman:
-            # If trying to learn the Kalman filter, compare prediction of next observation with next observation
-            mse = ((mu_estim-y[:, 1:])**2).mean()
+            # If trying to learn the Kalman filter, compare the prediction of the next observation with the next observation
+            mse_model = ((mu_estim - y[:, 1:])**2).mean()
+
+            # Compare network's output with Kalman filter's estimation
+            mse_model2kal = ((mu_estim - mu_kal[:, 1:])**2).mean()  # TODO: check shape of Kalman estimate // model 2 true, kf 2 true, but interested in model 2 kf? If yes, at kf - model
+
         else:
             # If trying to learn the observations, compare with observations
-            mse = ((mu_estim-y)**2).mean()
-        valid_mse.append(mse)
-        
+            mse_model = ((mu_estim-y)**2).mean()
+        test_mse.append(mse_model)
+       
         if kalman:
-            # TODO: USE BENCHMARK HERE
-            
-
-            # Compare network's output with Kalman filter's estimation MSE
-            kalman_mu, kalman_sigma = kalman_fit_batch(y, n_iter=5) 
-            # Compare Kalman filter's predicted observations to true observations
-            mse_kal = ((kalman_mu-y)**2).mean()
-            mse_kals.append(mse_kal)
+            test_mse_model2kal.append(mse_model2kal)
         
-        # Track performance along data parameters
-        if data_config["params_testing"]:
-            # Digitize each of these parameters to find the corresponding bin
-            tau_bin = np.digitize(pars[:,0], param_bins['tau']) - 1
-            si_stat_bin = np.digitize(pars[:,2], param_bins['si_stat']) - 1
-            si_r_bin = np.digitize(pars[:,4], param_bins['si_r']) - 1
-            # si_q_bin = np.digitize(si_q, param_bins['si_q']) - 1
-
-            # Use the bins found to get the corresponding combination of parameters
-            param_combination = (param_bins['tau'][tau_bin], param_bins['si_stat'][si_stat_bin], param_bins['si_r'][si_r_bin])
-            
-            # Get MSE per sample in batch
-            if kalman:
-                # If trying to learn the Kalman filter, compare with hidden prediction of next observation
-                mse_per_sample = ((mu_estim-y[:, 1:])**2).mean(dim=1).cpu().numpy() # shape (N_samples,)
-            else:
-                # If trying to learn the observations, compare with observations
-                mse_per_sample = ((mu_estim-y)**2).mean(dim=1)
-
-            # Then, zip batch's param_combination array and MSE array and store MSE
-            for *pc, m in zip(*param_combination, mse_per_sample):
-                binned_metrics[tuple(pc)]['mse'].append(m)
-
-
-    # If tracking performance along data parameters, average stored MSEs for each parameter combination
-        if data_config["params_testing"]:
-            for param_combination in binned_metrics.keys():
-                binned_metrics[param_combination]['count'] = len(binned_metrics[param_combination]['mse'])
-                if binned_metrics[param_combination]['count'] > 0:
-                    binned_metrics[param_combination]['mse'] = np.mean(binned_metrics[param_combination]['mse'])
-                else:
-                    binned_metrics[param_combination]['mse'] = np.nan
-
-    
-    # Save binned metrics
+    # Track performance along data parameters
     if data_config["params_testing"]:
-        binned_metrics_list = [
-            {
-            'tau': tau,
-            'si_stat': si_stat,
-            'si_r': si_r,
-            'mse': metrics['mse'],
-            'count': metrics['count']
-            }
-            for (tau, si_stat, si_r), metrics in binned_metrics.items()
-        ]
-        binned_metrics_df = pd.DataFrame(binned_metrics_list)
-        binned_metrics_df['si_q'] = binned_metrics_df['si_stat'] * ((2 * binned_metrics_df['tau'] - 1) ** 0.5) / binned_metrics_df['tau']
-        binned_metrics_df.to_csv(save_path/f'binned_metrics_lr{lr_id}.csv', index=False)
+        if kalman:
+            binned_metrics_df = map_binned_params_2_metrics(param_bins, y[:, 1:], mu_estim, pars)
+        else:
+            binned_metrics_df = map_binned_params_2_metrics(param_bins, y, mu_estim, pars)
+        binned_metrics_df.to_csv((save_path/f'test_binned_metrics_lr{lr_id}.csv'), index=False)
+
+    if kalman:
+        return test_sigma, test_mse, test_mse_model2kal
+    else:
+        return test_sigma, test_mse
 
 
 
@@ -525,6 +621,8 @@ def plot_weights(train_steps, weights_updates, names, title, save_path):
     for param in range(weights_updates.shape[0]):
         plt.plot(train_steps, weights_updates[param], label=names[param])
     plt.yscale('log')
+    plt.xlabel("Training steps")
+    plt.ylabel("Weights updates (MSE between steps)")
     plt.legend()
     plt.title(title)
     plt.savefig(save_path)
@@ -535,7 +633,7 @@ def plot_mse(valid_steps, valid_diff, title, save_path, mse_kal=None, model_mse_
     plt.figure(figsize=(10, 5))
     plt.plot(valid_steps, valid_diff, label='model')
     if mse_kal is not None:
-        plt.plot(valid_steps, mse_kal, label='kalman')
+        plt.axhline(y=np.mean(mse_kal), color='tab:orange', linestyle='--', label='kalman (mean)')
     if model_mse_kal is not None:
         plt.plot(valid_steps, model_mse_kal, label='model-kalman')
     plt.xlabel("Epoch steps")
@@ -613,7 +711,7 @@ def pipeline_single_param(model_config, data_config, gm_name, device=DEVICE):
     for nctx in [1]:    # , 2
         data_config["N_ctx"]=nctx
         for kalman_on in [True]: # [True, False]
-            for lr_id, learning_rate in enumerate([0.01]): # [0.1, 0.05, 0.01, 0.005] # 0.001, 0.0005, 0.0001, 0.00005, 0.00001]):
+            for lr_id, learning_rate in enumerate([0.01, 0.005]): # 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001
                 for model_name in ['vrnn']: # , 'vrnn'
                     # Define models
                     if model_name == 'rnn':
@@ -624,34 +722,66 @@ def pipeline_single_param(model_config, data_config, gm_name, device=DEVICE):
                     # Train
                     train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
 
-
-
-def pipeline_multi_param(model_config, data_config, gm_name, device=DEVICE):
     
-    data_config.update({
-        "lim_bounds": {'low': 500, 'high': 1800},
-        "mu_tau_bounds": {'low': 1, 'high': 50},
-        "si_stat_bounds": {'low': 1, 'high': 50},
-        "params_testing": True    
-    })
+
+
+def pipeline_multi_param(model_config, data_config, gm_name, benchmark_only=False, device=DEVICE):
 
     for nctx in [1]:    # , 2
         data_config["N_ctx"]=nctx
         for kalman_on in [True]: # [True, False]
-            for lr_id, learning_rate in enumerate([0.01]): # [0.1, 0.05, 0.01, 0.005] # 0.001, 0.0005, 0.0001, 0.00005, 0.00001]):
+            # Step 1: Define paths for benchmarks
+            benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
+            benchmarkfile_train = benchmark_filename(benchmarkpath, gm_name, data_config, suffix='train')
+            benchmarkfile_test = benchmark_filename(benchmarkpath, gm_name, data_config, suffix='test')
+
+            # Step 2: Compute or load benchmarks
+            if benchmark_only or not (benchmarkfile_train.exists() and benchmarkfile_test.exists()):
+                # Pre compute benchmarks if not existing
+                print("Computing benchmarks...")
+                benchmarks_train = compute_benchmarks(gm_name, data_config, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train')
+                benchmarks_test  = compute_benchmarks(gm_name, data_config, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test')
+                
+                # Step 3: Visualize parameter distributions
+                print("Visualizing parameter distributions...")
+                benchmarks_pars_viz(benchmarks_train, data_config, kalman=kalman_on, suffix='train')
+                benchmarks_pars_viz(benchmarks_test, data_config, kalman=kalman_on, suffix='test')
+                
+                if benchmark_only:
+                    print("Benchmark computation complete. Exiting (benchmark_only=True).")
+                    return
+
+            else:
+                # If benchmarks already computed, load them
+                print("Loading precomputed benchmarks...")
+                with open(benchmarkfile_train, 'rb') as f:
+                    benchmarks_train = pickle.load(f)
+                with open(benchmarkfile_test, 'rb') as f:
+                    benchmarks_test = pickle.load(f)
+                print("Benchmarks loaded successfully.")
+
+            # Step 4: Train and test models with different learning rates
+            for lr_id, learning_rate in enumerate([0.01, 0.005]): # 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001
                 for model_name in ['rnn']: # , 'vrnn'
+                    # Define save path
+                    if kalman_on:
+                        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model_name}/'
+                    else:
+                        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model_name}/'
+                    
                     # Define models
                     if model_name == 'rnn':
                         model = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], device=device)
                     else:
                         model = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], device=device)
 
-
-                    # Train
-                    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
+                    # Step 5: Train
+                    print(f"\nTraining {model_name} with lr={learning_rate}...")
+                    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, device=device, kalman=kalman_on, benchmarks=benchmarks_train)
                     
-                    # Test
-                    test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, minmax_train=minmax, device=device, kalman=kalman_on)
+                    # Step 6: Test
+                    print(f"\nTesting {model_name} with lr={learning_rate}...")
+                    test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, minmax_train=minmax, device=device, kalman=kalman_on, benchmarks=benchmarks_test)
 
 
 
