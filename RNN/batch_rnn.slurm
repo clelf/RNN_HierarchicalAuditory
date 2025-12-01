@@ -17,6 +17,9 @@ module load Miniforge3
 
 # Create and activate conda env
 # conda env create -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml -p /scratch/clevyfidel/conda_env/rnn
+
+# To update existing env with new packages from yml:
+conda env update -p /scratch/clevyfidel/conda_env/rnn -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml --prune
 conda activate /scratch/clevyfidel/conda_env/rnn
 
 # source ~/.bashrcq

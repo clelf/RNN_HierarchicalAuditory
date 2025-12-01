@@ -35,6 +35,7 @@ if __name__=='__main__':
         "batch_size": 1000, # TODO: 1000,  # batch size (TEST: 5)
         "n_batches": 32,  # number of batches # TODO: 32
         "weight_decay": 1e-5,  # weight decay for optimizer
+        "early_stop_patience": 20,  # stop if no improvement for N epochs
 
         # Experiment parameters (non-hierarchical)
         "n_trials": 1000,  # single tones

@@ -299,6 +299,11 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
     weights_updates   = []
     param_names     = model.state_dict().keys()
 
+    # Early stopping: track best loss and patience counter
+    best_valid_loss = float('inf')
+    patience_counter = 0
+    patience = model_config.get("early_stop_patience", 20)
+
     # Epochs
     for epoch in tqdm(range(model_config["num_epochs"]), desc="Epochs"):
 
@@ -474,6 +479,16 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
             logfilename = save_path / f'training_log_lr{lr_id}.txt'
             with open(logfilename, 'a') as f:
                 f.write(f'{sprint}\n')
+
+        # Early stopping: check if validation loss improved
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"\n[Early Stopping] No improvement for {patience} epochs. Stopping.")
+                break
 
     # Save training logs at the end of epochs loop
     lossplotfile = save_path/f'loss_trainvalid_lr{lr_id}.png'
@@ -770,7 +785,7 @@ def pipeline_multi_param(model_config, data_config, gm_name, benchmark_only=Fals
                 print("Benchmarks loaded successfully.")
 
             # Step 4: Train and test models with different learning rates
-            for lr_id, learning_rate in enumerate([0.01, 0.005]): # 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001
+            for lr_id, learning_rate in enumerate([ 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001]): # 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001
                 for model_name in ['rnn']: # , 'vrnn'
                     # Define save path
                     if kalman_on:
