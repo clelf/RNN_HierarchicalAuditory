@@ -1,4 +1,5 @@
 import torch
+import os
 from pipeline_next import pipeline_multi_param
 
 
@@ -32,7 +33,7 @@ if __name__=='__main__':
         "epoch_res": 10,  # report results every epoch_res epochs
         "batch_res": 10,  # store and report loss every batch_res batches
         "batch_size": 1000, # TODO: 1000,  # batch size (TEST: 5)
-        "n_batches": 32,  # number of batches
+        "n_batches": 32,  # number of batches # TODO: 32
         "weight_decay": 1e-5,  # weight decay for optimizer
 
         # Experiment parameters (non-hierarchical)
@@ -44,6 +45,18 @@ if __name__=='__main__':
     
     # Define data parameters
     gm_name = 'NonHierarchicalGM'
+    
+    # Parallel processing configuration:
+    # - SLURM: automatically uses allocated CPUs (SLURM_CPUS_PER_TASK)
+    # - Local: uses half of available cores to keep machine responsive
+    # - Set to 1 to disable parallelization
+    slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
+    if slurm_cpus:
+        max_cores = int(slurm_cpus)  # Use all allocated SLURM CPUs
+    else:
+        from multiprocessing import cpu_count
+        max_cores = max(1, cpu_count() // 2)  # Use half of local CPUs
+    
     config_NH = {
         "N_ctx": 1,
         # "N_batch": n_batches,
@@ -59,6 +72,7 @@ if __name__=='__main__':
         # "si_q": 2,  # process noise # Obsolete
         # "si_stat": 2,  # stationary processes variance
         # "si_r": 2,  # measurement noise
+        "max_cores": max_cores,  # Parallel data generation
     }
 
     add_data_params_baseline = {

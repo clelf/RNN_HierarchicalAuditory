@@ -54,7 +54,9 @@ dependencies:
       - nvidia-nvtx-cu12==12.6.77
       - packaging==25.0
       - pandas==2.3.1
+      - pathos
       - pillow==11.2.1
+      - pykalman
       - pyparsing==3.2.3
       - python-dateutil==2.9.0.post0
       - pytz==2025.2

@@ -27,7 +27,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 if os.path.exists(os.path.join(base_path, 'Kalman')):
     from Kalman.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
-    from KalmanFilterViz1D.kalman import kalman_tau, plot_estim, kalman_batch
+    from KalmanFilterViz1D.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch
 else:
     raise ImportError("Neither 'Kalman' nor 'KalmanFilterViz1D' folder found.")
 
@@ -344,13 +344,19 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
                 loss = model.loss(y_norm, model_output, loss_func=loss_function)
 
             # Learning model weigths
-            weights_before = [w.detach().clone() for w in model.parameters()]
+            # Only compute weight changes when you're going to log them
+            if batch % model_config["batch_res"] == model_config["batch_res"]-1:
+                weights_before = [w.detach().clone() for w in model.parameters()]
+            
             loss.backward()     
             optimizer.step()
-            train_losses.append(float(loss.detach().cpu().numpy().item()))
-            weights_after = [w.detach().clone() for w in model.parameters()]
 
+            if batch % model_config["batch_res"] == model_config["batch_res"]-1:
+                weights_after = [w.detach().clone() for w in model.parameters()]
+
+            train_losses.append(float(loss.detach().cpu().numpy().item()))
             
+
             # Logging and reporting
             if batch % model_config["batch_res"] == model_config["batch_res"]-1:
                 train_steps.append(epoch * model_config["n_batches"] + batch)
@@ -673,10 +679,13 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
 
 
 def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, states=None):
+    # Convert to numpy if it's a tensor
+    if isinstance(obs, torch.Tensor):
+        obs = obs.detach().cpu().numpy()
     obs = obs.squeeze() # for safety
             
-    # for some 8 randomly sampled sequences out of the whole batch of length obs.size(0)
-    N = min(8, obs.size(0))
+    # for some 8 randomly sampled sequences out of the whole batch of length obs.shape[0]
+    N = min(8, obs.shape[0])
     for id, i in enumerate(np.random.choice(range(N), size=(N,), replace=False)):
             
         plt.figure(figsize=(20, 6))
