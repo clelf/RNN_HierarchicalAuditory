@@ -37,7 +37,7 @@ class SimpleRNN(nn.Module):
         return output_seq # has last dimension = output_dim # TODO: make sure of the dimensions here
     
     def loss(self, target, x_output, loss_func): # torch.nn.GaussianNLLLoss()
-        out_estim_mu    = F.sigmoid(x_output[..., [0]])
+        out_estim_mu    = x_output[..., [0]]
         out_estim_var   = F.softplus(x_output[..., [1]]) + 1e-6 # Ensure the variance is positive
         
         return loss_func(out_estim_mu, target, out_estim_var)
@@ -66,41 +66,35 @@ class VAE(nn.Module):
         self.x_dim = x_dim
         self.output_dim = output_dim
         self.latent_dim = latent_dim
-        self.hidden_units_dim = hidden_units_dim
+        self.hidden_units_dim = hidden_units_dim if hidden_units_dim is not None else latent_dim
         self.device = device
 
-        # Encoder and decoder
-        self.encoder = self.build_encoder(self.x_dim, self.latent_dim, self.hidden_units_dim)
-        self.decoder = self.build_decoder(self.latent_dim, self.output_dim, self.hidden_units_dim)
+        # Encoder: x_dim -> hidden_units_dim (intermediate representation)
+        self.encoder = self.build_encoder(self.x_dim, self.hidden_units_dim)
+        # Decoder: latent_dim -> output_dim
+        self.decoder = self.build_decoder(self.latent_dim, self.output_dim)
 
-        # Reparametrization functions
-        self.fc_mu_latent = self.build_fc_mu(self.latent_dim, self.latent_dim)
-        self.fc_logvar_latent = self.build_fc_logvar(self.latent_dim, self.latent_dim)
+        # Reparametrization: hidden_units_dim -> latent_dim
+        self.fc_mu_latent = self.build_fc_mu(self.hidden_units_dim, self.latent_dim)
+        self.fc_logvar_latent = self.build_fc_logvar(self.hidden_units_dim, self.latent_dim)
 
-    def build_decoder(self, in_dim, out_dim, hidden_units_dim=None):
+    def build_decoder(self, in_dim, out_dim):
         return nn.Sequential(
             nn.Linear(in_dim, out_dim),
             nn.ReLU()
         )
 
-    def build_encoder(self, in_dim, out_dim, hidden_units_dim=None):
-        # if self.variational: in_dim = in_dim * 2 # Because needs to expand the reparemtrization # UNSURE, CHECK; IF UNCOMMENT, DIVIDE mu and var's output dim by 2
+    def build_encoder(self, in_dim, out_dim):
         return nn.Sequential(
             nn.Linear(in_dim, out_dim),
             nn.ReLU()
         )
     
     def build_fc_mu(self, in_dim, out_dim):
-        return nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.Sigmoid()
-        )
+        return nn.Linear(in_dim, out_dim)
     
     def build_fc_logvar(self, in_dim, out_dim):
-        return nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.Softplus()
-        )
+        return nn.Linear(in_dim, out_dim)
     
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -109,16 +103,16 @@ class VAE(nn.Module):
     
 
     def forward(self, x):
-        # Encode (infer)
-        z = self.encoder(x, self.x_dim, self.hidden_units_dim)
+        # Encode (infer): x -> hidden representation
+        h = self.encoder(x)
 
-        # Reparametrize the latent variable
-        mu_latent = self.fc_mu_latent(z)
-        logvar_latent = self.fc_logvar_latent(z)
+        # Reparametrize the latent variable: hidden -> latent
+        mu_latent = self.fc_mu_latent(h)
+        logvar_latent = self.fc_logvar_latent(h)
         z = self.reparameterize(mu_latent, logvar_latent)
 
-        # Decode (reconstruct / generate)
-        x_ = self.decoder(z, self.hidden_units_dim, self.x_dim)
+        # Decode (reconstruct / generate): latent -> output
+        x_ = self.decoder(z)
 
         return x_, mu_latent, logvar_latent
 
@@ -133,7 +127,7 @@ class VAE(nn.Module):
         #Reconstruction + KL divergence losses summed over all elements and batch
 
         # TODO: get rid of sigmoid and softplus if taken care of in decoder and encoder
-        out_estim_mu    = F.sigmoid(x_output[:, :, [0]])
+        out_estim_mu    = x_output[:, :, [0]]
         out_estim_var   = F.softplus(x_output[:, :, [1]]) + 1e-6 # Ensure the variance is stricly positive
         recon_loss = loss_func(out_estim_mu, x_target, out_estim_var)
         
@@ -162,7 +156,8 @@ class VRNN(VAE):
         # NOTE: in VRNN paper all phi functions have 4 layers combined with ReLU
 
         # Encoder and decoder
-        self.encoder = self.build_encoder(self.phi_x_dim + self.rnn_hidden_states_dim, self.latent_dim) 
+        # Encoder maps to hidden_units_dim, then fc_mu/fc_logvar map to latent_dim
+        self.encoder = self.build_encoder(self.phi_x_dim + self.rnn_hidden_states_dim, self.hidden_units_dim) 
         self.decoder = self.build_decoder(self.phi_z_dim + self.rnn_hidden_states_dim, self.output_dim) # shared with standard RNN (S.4 Models)
 
         # Feature extractors 
@@ -200,10 +195,13 @@ class VRNN(VAE):
         logvars_prior = []
 
         for t in range(seq_len):            
-            x_t = x[:, t, :] # x_t has shape (batch_size, 1, x_dim) # TODO make sure here!!!!!!!
+            x_t = x[:, t, :] # x_t has shape (batch_size, x_dim)
+            
+            # Feature extraction (compute once, use twice)
+            phi_x_t = self.phi_x(x_t)
             
             # Encode 
-            z_t = self.encoder(torch.cat([self.phi_x(x_t), h_prev[-1]], dim=-1)) # Eq. 9 # TODO: dim=-1 or 1?
+            z_t = self.encoder(torch.cat([phi_x_t, h_prev[-1]], dim=-1)) # Eq. 9
 
             # Reparametrize the latent variable
             mu_latent = self.fc_mu_latent(z_t)
@@ -219,15 +217,15 @@ class VRNN(VAE):
             mus_prior.append(mu_prior)
             logvars_prior.append(logvar_prior)
 
+            # Feature extraction for z
+            phi_z_t = self.phi_z(z_t)
 
             # Decode
-            x_t_out = self.decoder(torch.cat([self.phi_z(z_t), h_prev[-1]], dim=-1)) # Eq. 6
+            x_t_out = self.decoder(torch.cat([phi_z_t, h_prev[-1]], dim=-1)) # Eq. 6
             outputs.append(x_t_out)
             
             # Recurrence
-            # rnn_output = self.recurrence(torch.cat([self.phi_x(x_t), self.phi_z(z_t)], dim=-1), h_prev) # Eq. 7
-            # h_prev = self.recurrence.hidden_states
-            _, h = self.rnn(torch.cat([self.phi_x(x_t), self.phi_z(z_t)], dim=-1).unsqueeze(1), h_prev) # Eq. 7 # since we're considering (B, T, feature_dim) with T=1, unsqueeze extra dimension at dim=1 to make up for T=1
+            _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], dim=-1).unsqueeze(1), h_prev) # Eq. 7 # since we're considering (B, T, feature_dim) with T=1, unsqueeze extra dimension at dim=1 to make up for T=1
             h_prev = h
 
         # self.rnn_hidden_states = self.recurrence.hidden_states
@@ -248,8 +246,8 @@ class VRNN(VAE):
     
 
     def vrnn_loss(self, x_target, x_output, mu_latent, logvar_latent, mu_prior, logvar_prior, loss_func): # KL divergence
-        out_estim_mu = F.sigmoid(x_output[:, :, [0]])
-        out_estim_var = F.softplus(x_output[:, :, [1]]) + 1e-06
+        out_estim_mu = x_output[:, :, [0]]
+        out_estim_var = F.softplus(x_output[:, :, [1]]) + 1e-6
 
         recon_loss = loss_func(out_estim_mu, x_target, out_estim_var) # From Gemini2.5: recon_loss = 0.5 * torch.sum(decoder_logvar + (x - decoder_mu)**2 / torch.exp(decoder_logvar))
         
@@ -292,10 +290,11 @@ if __name__ == '__main__':
         
     # Define model
     rnn     = SimpleRNN(x_dim=input_dim, output_dim=dim_out_obs, hidden_dim=rnn_hidden_dim, n_layers=rnn_n_layers)
-    vrnn    = VRNN(x_dim=input_dim, latent_dim=latent_dim, phi_x_dim=phi_x_dim, phi_z_dim=phi_z_dim, phi_prior_dim=phi_prior_dim, rnn_hidden_states_dim=rnn_hidden_dim, rnn_n_layers=rnn_n_layers)
+    vrnn    = VRNN(x_dim=input_dim, output_dim=dim_out_obs, latent_dim=latent_dim, phi_x_dim=phi_x_dim, phi_z_dim=phi_z_dim, phi_prior_dim=phi_prior_dim, rnn_hidden_states_dim=rnn_hidden_dim, rnn_n_layers=rnn_n_layers)
     
     y = [1., 2., 1., 2.]
-    data = torch.tensor(y).view(len(y), batch_size, input_dim)
+    # Shape should be (batch_size, seq_len, input_dim) since batch_first=True
+    data = torch.tensor(y).view(batch_size, len(y), input_dim)
     rnn(data)
     vrnn(data)
     pass

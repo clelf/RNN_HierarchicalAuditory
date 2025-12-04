@@ -262,7 +262,7 @@ def benchmarks_pars_viz(benchmarks, data_config, kalman, save_path=None, suffix=
     print(f"  Saved binned metrics to {save_path / f'binned_metrics_kalman{suffix_str}.csv'}")
 
 
-def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalman=False, benchmarks=None, device=DEVICE):
+def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_config, save_path, kalman=False, benchmarks=None, device=DEVICE):
     # Set optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=model_config["weight_decay"])
     
@@ -279,7 +279,7 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
     
 
     # Prepare to save the results
-    lr_title = f"Learning rate: {lr:>6.0e}"
+    lr_title = f"Model: {model_name} | Learning rate: {lr:>6.0e} | #units: {h_dim}"
     os.makedirs(save_path / 'samples/', exist_ok=True)
 
     epoch_steps         = []
@@ -293,28 +293,23 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
         model_kf_mse_report = []
 
     # Define loss instance
-    loss_function   = torch.nn.GaussianNLLLoss(reduction='sum') # GaussianNLL
+    loss_function   = torch.nn.GaussianNLLLoss(reduction='mean') # GaussianNLL
 
     # Track learning of model parameters 
     weights_updates   = []
     param_names     = model.state_dict().keys()
 
-    # Early stopping: track best loss and patience counter
-    best_valid_loss = float('inf')
-    patience_counter = 0
-    patience = model_config.get("early_stop_patience", 20)
+     ### TRAINING
+    print("TRAINING \n")
 
     # Epochs
     for epoch in tqdm(range(model_config["num_epochs"]), desc="Epochs"):
-
-        ### TRAINING
-        print("TRAINING \n")
         train_losses = []
         tt = time.time()
         model.train()
 
         # Generate N_samples=batch_size per batch in N_batch=n_batches
-        for batch in tqdm(range(model_config["n_batches"]), desc="Batches", leave=False):
+        for batch in range(model_config["n_batches"]):
 
             optimizer.zero_grad()
             
@@ -383,8 +378,8 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
 
 
         ### VALIDATION
-        print("VALIDATION \n")
         model.eval()
+
         with torch.no_grad():    
             # If kalman, use benchmark batch, else, generate new batch
             if kalman:
@@ -427,8 +422,8 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
             else: model_output_dist = model_output
 
             # Extract model's output
-            mu_estim = F.sigmoid(model_output_dist[...,0]).detach().cpu().numpy()
-            var_estim = F.softplus(model_output_dist[..., 1] + 1e-6).detach().cpu().numpy()
+            mu_estim = model_output_dist[...,0].detach().cpu().numpy()
+            var_estim = (F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()
             
             # Rescale data according to observation scale
             if model_config["use_minmax"]:
@@ -460,7 +455,6 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
                 else:
                     plot_samples(y, mu_estim, sigma_estim, params=pars, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title)
 
-
             # Store valid metrics for this epoch
             valid_mse_report.append(mse_model)
             valid_losses_report.append(valid_loss) # avg loss for epoch (over batches)
@@ -470,9 +464,8 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
             valid_sigma_report.append(sigma_estim_avg)
             if kalman:
                 model_kf_mse_report.append(mse_model2kal) # TODO: now not reporting KF (bc was a bit useless), but MSE of model to KF
-
-            # Print epoch report
-            print(f"Model: {model.name:>4}, LR: {lr:>6.0e}, Epoch: {epoch:>3}, Training Loss: {avg_train_loss:>7.2f}, Valid Loss: {valid_loss:>7.2f}")
+            
+            # Save epoch log
             sprint=f'LR: {lr:>6.0e}; epoch: {epoch:>3}; mean var: {sigma_estim_avg:>7.2f}; mean MSE: {mse_model:>7.2f}; time: {time.time()-tt:>.2f}; training step: {epoch * model_config["n_batches"] + model_config["n_batches"]}'
             if kalman:
                 sprint += f'; Model-KF MSE: {mse_model2kal:>7.2f}'
@@ -480,15 +473,9 @@ def train(model, model_config, lr, lr_id, gm_name, data_config, save_path, kalma
             with open(logfilename, 'a') as f:
                 f.write(f'{sprint}\n')
 
-        # Early stopping: check if validation loss improved
-        if valid_loss < best_valid_loss:
-            best_valid_loss = valid_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\n[Early Stopping] No improvement for {patience} epochs. Stopping.")
-                break
+    # Print last epoch report
+    print(f"Model: {model.name:>4}, LR: {lr:>6.0e}, Epoch: {epoch:>3}, Training Loss: {avg_train_loss:>7.2f}, Valid Loss: {valid_loss:>7.2f}")
+            
 
     # Save training logs at the end of epochs loop
     lossplotfile = save_path/f'loss_trainvalid_lr{lr_id}.png'
@@ -590,8 +577,8 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
         else: model_output_dist = model_output
         
         # Extract model's output
-        mu_estim = F.sigmoid(model_output_dist[...,0]).detach().cpu().numpy()
-        var_estim = F.softplus(model_output_dist[..., 1] + 1e-6).detach().cpu().numpy()
+        mu_estim = model_output_dist[...,0].detach().cpu().numpy()
+        var_estim = (F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()
         
         # Rescale data according to observation scale
         if model_config["use_minmax"]:
@@ -640,7 +627,7 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
 def plot_weights(train_steps, weights_updates, names, title, save_path):
     plt.figure(figsize=(10, 5))
     for param in range(weights_updates.shape[0]):
-        plt.plot(train_steps, weights_updates[param], label=names[param])
+        plt.plot(train_steps, weights_updates[param], label=names[param], alpha=0.8)
     plt.yscale('log')
     plt.xlabel("Training steps")
     plt.ylabel("Weights updates (MSE between steps)")
@@ -707,10 +694,10 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
 
         # Plot hidden process states if provided (NOTE - caution: can only work if states is 1D, i.e. only 1 context)
         if states is not None:
-            plt.plot(range(len(states[i])), states[i], label='x_hid', color='orange', linewidth=2)
+            plt.plot(range(len(states[i])), states[i], label='x_hid', color='orange')
         
         # Plot observation
-        plt.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs')
+        plt.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
 
         # Plot estimation as a distribution (with uncertainty)
         plt.plot(range(len(mu_estim[i])), mu_estim[i], color='k', label='y_hat')
@@ -718,13 +705,14 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
         
         # Plot Kalman estimation if provided
         if kalman_mu is not None and kalman_sigma is not None:
-            plt.plot(range(len(kalman_mu[i])), kalman_mu[i], label='y_kal', color='green', linewidth=2)
+            plt.plot(range(len(kalman_mu[i])), kalman_mu[i], label='y_kal', color='green', alpha=0.8)
             plt.fill_between(range(len(kalman_mu[i])), kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
 
         plt.legend()
+        plot_title = title
         if params is not None:
-            title = f"{title}; tau: {params[i,0]:.2f}, lim: {params[i,1]:.2f}, si_stat: {params[i,2]:.2f}, si_q: {params[i,3]:.2f}"
-        plt.title(title)
+            plot_title = f"{title}\ntau: {params[i,0]:.2f}, lim: {params[i,1]:.2f}, si_stat: {params[i,2]:.2f}, si_q: {params[i,3]:.2f}, si_r: {params[i,4]:.2f}"
+        plt.title(plot_title)
         plt.savefig(f'{save_path}_s{id}.png')
         plt.close()
 
@@ -732,79 +720,88 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
 
 def pipeline_single_param(model_config, data_config, gm_name, device=DEVICE):
 
-    for nctx in [1]:    # , 2
-        data_config["N_ctx"]=nctx
-        for kalman_on in [True]: # [True, False]
-            for lr_id, learning_rate in enumerate([0.01, 0.005]): # 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001
-                for model_name in ['vrnn']: # , 'vrnn'
-                    # Define models
+    for kalman_on in model_config["kalman_on"]:
+        # Support both single value and list for rnn_hidden_dim
+        hidden_dims = model_config["rnn_hidden_dim"]
+        if not isinstance(hidden_dims, list):
+            hidden_dims = [hidden_dims]
+        
+        for h_dim in hidden_dims:
+            for lr_id, learning_rate in enumerate(model_config["learning_rates"]): 
+                for model_name in model_config["model"]: # , 'vrnn'
+                    # Define models with current hidden dimension
                     if model_name == 'rnn':
-                        model = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], device=device)
+                        model = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=h_dim, n_layers=model_config['rnn_n_layers'], device=device)
                     else:
-                        model = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], device=device)
-                    
+                        model = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], device=device)                    
                     # Train
-                    train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
+                    print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}...")
+                    train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, model_name=model_name, gm_name=gm_name, data_config=data_config, device=device, kalman=kalman_on)
 
     
 
 
 def pipeline_multi_param(model_config, data_config, gm_name, benchmark_only=False, device=DEVICE):
 
-    for nctx in [1]:    # , 2
-        data_config["N_ctx"]=nctx
-        for kalman_on in [True]: # [True, False]
-            # Step 1: Define paths for benchmarks
-            benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
-            benchmarkfile_train = benchmark_filename(benchmarkpath, gm_name, data_config, suffix='train')
-            benchmarkfile_test = benchmark_filename(benchmarkpath, gm_name, data_config, suffix='test')
+    for kalman_on in model_config["kalman_on"]:
+        # Step 1: Define paths for benchmarks
+        benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
+        benchmarkfile_train = benchmark_filename(benchmarkpath, gm_name, data_config, suffix='train')
+        benchmarkfile_test = benchmark_filename(benchmarkpath, gm_name, data_config, suffix='test')
 
-            # Step 2: Compute or load benchmarks
-            if benchmark_only or not (benchmarkfile_train.exists() and benchmarkfile_test.exists()):
-                # Pre compute benchmarks if not existing
-                print("Computing benchmarks...")
-                benchmarks_train = compute_benchmarks(gm_name, data_config, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train')
-                benchmarks_test  = compute_benchmarks(gm_name, data_config, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test')
-                
-                # Step 3: Visualize parameter distributions
-                print("Visualizing parameter distributions...")
-                benchmarks_pars_viz(benchmarks_train, data_config, kalman=kalman_on, suffix='train')
-                benchmarks_pars_viz(benchmarks_test, data_config, kalman=kalman_on, suffix='test')
-                
-                if benchmark_only:
-                    print("Benchmark computation complete. Exiting (benchmark_only=True).")
-                    return
+        # Step 2: Compute or load benchmarks
+        benchmarks_exist = benchmarkfile_train.exists() and benchmarkfile_test.exists()
+        
+        if not benchmarks_exist:
+            # Compute benchmarks if not existing
+            print("Computing benchmarks...")
+            benchmarks_train = compute_benchmarks(gm_name, data_config, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train')
+            benchmarks_test  = compute_benchmarks(gm_name, data_config, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test')
+            
+            # Visualize parameter distributions
+            print("Visualizing parameter distributions...")
+            benchmarks_pars_viz(benchmarks_train, data_config, kalman=kalman_on, suffix='train')
+            benchmarks_pars_viz(benchmarks_test, data_config, kalman=kalman_on, suffix='test')
+        else:
+            # Load precomputed benchmarks
+            print("Loading precomputed benchmarks...")
+            with open(benchmarkfile_train, 'rb') as f:
+                benchmarks_train = pickle.load(f)
+            with open(benchmarkfile_test, 'rb') as f:
+                benchmarks_test = pickle.load(f)
+            print("Benchmarks loaded successfully.")
+        
+        # Exit early if only benchmarking
+        if benchmark_only:
+            print("Benchmark step complete. Exiting (benchmark_only=True).")
+            return
 
-            else:
-                # If benchmarks already computed, load them
-                print("Loading precomputed benchmarks...")
-                with open(benchmarkfile_train, 'rb') as f:
-                    benchmarks_train = pickle.load(f)
-                with open(benchmarkfile_test, 'rb') as f:
-                    benchmarks_test = pickle.load(f)
-                print("Benchmarks loaded successfully.")
-
-            # Step 4: Train and test models with different learning rates
-            for lr_id, learning_rate in enumerate([ 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001]): # 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001
-                for model_name in ['rnn']: # , 'vrnn'
-                    # Define save path
+        # Step 4: Train and test models with different hidden units and learning rates
+        # Support both single value and list for rnn_hidden_dim
+        hidden_dims = model_config["rnn_hidden_dim"]
+        if not isinstance(hidden_dims, list):
+            hidden_dims = [hidden_dims]
+        
+        for h_dim in hidden_dims:
+            for lr_id, learning_rate in enumerate(model_config["learning_rates"]): 
+                for model_name in model_config['model']: # , 'vrnn'
+                    # Define save path (include hidden dim in path)
                     if kalman_on:
-                        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model_name}/'
+                        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/kalman/{model_name}_h{h_dim}/'
                     else:
-                        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model_name}/'
+                        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_{data_config["N_ctx"]}/observ/{model_name}_h{h_dim}/'
                     
-                    # Define models
+                    # Define models with current hidden dimension
                     if model_name == 'rnn':
-                        model = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=model_config['rnn_hidden_dim'], n_layers=model_config['rnn_n_layers'], device=device)
+                        model = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=h_dim, n_layers=model_config['rnn_n_layers'], device=device)
                     else:
                         model = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=model_config['latent_dim'], phi_x_dim=model_config['phi_x_dim'], phi_z_dim=model_config['phi_z_dim'], phi_prior_dim=model_config['phi_prior_dim'], rnn_hidden_states_dim=model_config['rnn_hidden_dim'], rnn_n_layers=model_config['rnn_n_layers'], device=device)
-
                     # Step 5: Train
-                    print(f"\nTraining {model_name} with lr={learning_rate}...")
-                    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, device=device, kalman=kalman_on, benchmarks=benchmarks_train)
+                    print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}...")
+                    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, model_name=model_name, gm_name=gm_name, data_config=data_config, save_path=save_path, device=device, kalman=kalman_on, benchmarks=benchmarks_train)
                     
                     # Step 6: Test
-                    print(f"\nTesting {model_name} with lr={learning_rate}...")
+                    print(f"\nTesting {model_name} with h_dim={h_dim}, lr={learning_rate}...")
                     test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, minmax_train=minmax, device=device, kalman=kalman_on, benchmarks=benchmarks_test)
 
 

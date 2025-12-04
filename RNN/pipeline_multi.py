@@ -9,40 +9,52 @@ FREQ_MAX = 1650
 
 if __name__=='__main__':
 
+    unit_test = False
 
     # Define model and training parameters
     model_config = {
         "use_minmax": False,  # whether to use min-max normalization
+
+        # Define model's objectives to test
+        "kalman_on": [True], # [True, False], depends on number of contexts
+        
+        # Define models to train
+        "model": ['rnn'],  #: 'rnn', 'vrnn'
+
+        # Learning rates to test
+        "learning_rates": [0.05, 0.01, 0.005, 0.001, 0.0005] if not unit_test else [0.01, 0.005],  # list of learning rates to try
 
         # Input and output dimensions
         "input_dim": 1,  # number of features in each observation: 1 --> need to write y_norm = y_norm.unsqueeze(-1) at one point
         "output_dim": 2,  # learn the sufficient statistics mu and var
 
         # RNN configuration
-        "rnn_hidden_dim": 8,  # comparable number of units as number of data parameters
+        "rnn_hidden_dim": [8, 16, 32, 64] if not unit_test else [8, 16],  # prev: 8
         "rnn_n_layers": 1,  # number of RNN layers
 
-        # VRNN specific configuration
-        "latent_dim": 8,  # needs to be < input_dim + rnn_hidden_dim
-        "phi_x_dim": 8,  # same as rnn_hidden_dim
-        "phi_z_dim": 8,  # same as rnn_hidden_dim
-        "phi_prior_dim": 8,  # same as rnn_hidden_dim
-
         # Training parameters
-        "num_epochs": 250, # TODO: 250,  # number of epochs (TEST: 2)
+        "num_epochs": 250 if not unit_test else 10, # TODO: 250,  # number of epochs (TEST: 2)
         "epoch_res": 10,  # report results every epoch_res epochs
         "batch_res": 10,  # store and report loss every batch_res batches
-        "batch_size": 1000, # TODO: 1000,  # batch size (TEST: 5)
-        "n_batches": 32,  # number of batches # TODO: 32
+        "batch_size": 1000 if not unit_test else 5, # TODO: 1000,  # batch size (TEST: 5)
+        "n_batches": 32 if not unit_test else 2,  # number of batches # TODO: 32
         "weight_decay": 1e-5,  # weight decay for optimizer
-        "early_stop_patience": 20,  # stop if no improvement for N epochs
 
         # Experiment parameters (non-hierarchical)
         "n_trials": 1000,  # single tones
 
         # Testing parameters
-        "batch_size_test": 1000 # batch size during testing # TODO: 1000 (TEST: 10)
+        "batch_size_test": 1000 if not unit_test else 5 # batch size during testing # TODO: 1000 (TEST: 10)
     }
+
+    vrnn_specific ={
+        # VRNN specific configuration
+        "latent_dim": model_config["rnn_hidden_dim"],  # needs to be < input_dim + rnn_hidden_dim
+        "phi_x_dim": model_config["rnn_hidden_dim"],  # same as rnn_hidden_dim
+        "phi_z_dim": model_config["rnn_hidden_dim"],  # same as rnn_hidden_dim
+        "phi_prior_dim": model_config["rnn_hidden_dim"],  # same as rnn_hidden_dim
+    }
+    model_config.update(vrnn_specific)
     
     # Define data parameters
     gm_name = 'NonHierarchicalGM'
@@ -80,9 +92,6 @@ if __name__=='__main__':
         "params_testing": True,
         "si_lim": 5,
         "mu_tau_bounds": {'low': 1, 'high': 250},
-        # "mu_tau": 4,
-        # "si_q": 2,  # process noise # Obsolete
-        # "si_stat": 2,  # stationary processes variance
         "si_stat_bounds": {'low': 0.1, 'high': 2},
         "si_r_bounds": {'low': 0.1, 'high': 2},  # measurement noise
     }
@@ -108,7 +117,7 @@ if __name__=='__main__':
     pipeline_multi_param(model_config, config_NH, gm_name, benchmark_only=True)
     
     
-    # STEP 2: Train the RNN model with different learning rates
+    # STEP 2: Train the RNN model with different learning rates and number of hidden units
     # This will train the model using the pre-computed benchmarks for validation
     # Uncomment the following line to run training:
     
@@ -116,16 +125,6 @@ if __name__=='__main__':
     print("STEP 2: Training RNN models")
     print("="*60)
     pipeline_multi_param(model_config, config_NH, gm_name, benchmark_only=False)
-    
-    
-    # STEP 3: Review results
-    # After training completes, check:
-    #   - training_results/N_ctx_1/kalman/<model_name>/
-    #       - training_loss_lr*.txt
-    #       - training_log_lr*.txt
-    #       - loss_trainvalid_lr*.png
-    #       - mse_valid_lr*.png
-    #       - samples/ (validation samples at different epochs)
-    #       - test/binned_metrics_lr*.csv (test performance)
+
 
 
