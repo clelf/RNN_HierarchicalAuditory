@@ -79,10 +79,9 @@ class VAE(nn.Module):
         self.fc_logvar_latent = self.build_fc_logvar(self.hidden_units_dim, self.latent_dim)
 
     def build_decoder(self, in_dim, out_dim):
-        return nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.ReLU()
-        )
+        # No activation on output layer - mean can be any real value,
+        # variance is handled by softplus in loss function
+        return nn.Linear(in_dim, out_dim)
 
     def build_encoder(self, in_dim, out_dim):
         return nn.Sequential(
@@ -143,8 +142,8 @@ class VAE(nn.Module):
 
 class VRNN(VAE): 
     def __init__(self, x_dim, output_dim, latent_dim, phi_x_dim, phi_z_dim, phi_prior_dim, rnn_hidden_states_dim, rnn_n_layers, hidden_units_dim=None, device=torch.device('cpu')):
-
-        super().__init__(x_dim, output_dim, latent_dim, hidden_units_dim=hidden_units_dim, device=device)
+        # x_dim, output_dim, latent_dim, hidden_units_dim=None
+        super().__init__(x_dim=x_dim, output_dim=output_dim, latent_dim=latent_dim, hidden_units_dim=hidden_units_dim, device=device)
         
         self.name = 'vrnn'
         self.rnn_hidden_states_dim = rnn_hidden_states_dim
@@ -259,11 +258,9 @@ class VRNN(VAE):
             - 1
         )
 
-        # KL loss
-        # kl_loss = - 0.5 * torch.sum(kl_element) 
-        kl_loss = 0.5 * torch.sum(kl_element) 
+        # KL loss - use mean to match the scale of recon_loss (which uses reduction='mean')
+        kl_loss = 0.5 * torch.mean(kl_element)
 
-        # TODO: find out if need to average over batch or not
         return recon_loss + kl_loss # Eq. 11 : - KL divergence + log posterior
 
 

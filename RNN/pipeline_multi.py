@@ -1,6 +1,7 @@
 import torch
 import os
-from pipeline_next import pipeline_multi_param
+import numpy as np
+from pipeline_next import pipeline_multi_config
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -9,17 +10,14 @@ FREQ_MAX = 1650
 
 if __name__=='__main__':
 
-    unit_test = False
+    unit_test = True
 
-    # Define model and training parameters
+    # DEFINE MODEL AND TRAINING PARAMETERS
     model_config = {
         "use_minmax": False,  # whether to use min-max normalization
-
-        # Define model's objectives to test
-        "kalman_on": [True], # [True, False], depends on number of contexts
         
         # Define models to train
-        "model": ['rnn'],  #: 'rnn', 'vrnn'
+        "model": ['rnn', 'vrnn'],  #: 'rnn', 'vrnn'
 
         # Learning rates to test
         "learning_rates": [0.05, 0.01, 0.005, 0.001, 0.0005] if not unit_test else [0.01, 0.005],  # list of learning rates to try
@@ -29,7 +27,7 @@ if __name__=='__main__':
         "output_dim": 2,  # learn the sufficient statistics mu and var
 
         # RNN configuration
-        "rnn_hidden_dim": [8, 16, 32, 64] if not unit_test else [8, 16],  # prev: 8
+        "rnn_hidden_dim": [16, 32, 64] if not unit_test else [8, 16],  # prev: 8
         "rnn_n_layers": 1,  # number of RNN layers
 
         # Training parameters
@@ -46,18 +44,8 @@ if __name__=='__main__':
         # Testing parameters
         "batch_size_test": 1000 if not unit_test else 5 # batch size during testing # TODO: 1000 (TEST: 10)
     }
-
-    vrnn_specific ={
-        # VRNN specific configuration
-        "latent_dim": model_config["rnn_hidden_dim"],  # needs to be < input_dim + rnn_hidden_dim
-        "phi_x_dim": model_config["rnn_hidden_dim"],  # same as rnn_hidden_dim
-        "phi_z_dim": model_config["rnn_hidden_dim"],  # same as rnn_hidden_dim
-        "phi_prior_dim": model_config["rnn_hidden_dim"],  # same as rnn_hidden_dim
-    }
-    model_config.update(vrnn_specific)
     
-    # Define data parameters
-    gm_name = 'NonHierarchicalGM'
+    # DEFINE GENERATIVE MODEL PARAMETERS
     
     # Parallel processing configuration:
     # - SLURM: automatically uses allocated CPUs (SLURM_CPUS_PER_TASK)
@@ -68,10 +56,11 @@ if __name__=='__main__':
         max_cores = int(slurm_cpus)  # Use all allocated SLURM CPUs
     else:
         from multiprocessing import cpu_count
-        max_cores = max(1, cpu_count() // 2)  # Use half of local CPUs
+        max_cores = max(1, cpu_count() // 2) if not unit_test else 1 # Use half of local CPUs
     
-    config_NH = {
-        "N_ctx": 1,
+    data_config = {
+        "gm_name": "HierarchicalGM",
+        "N_ctx": 2,
         # "N_batch": n_batches,
         "N_samples": model_config['batch_size'],
         "N_blocks": 1,
@@ -86,23 +75,42 @@ if __name__=='__main__':
         # "si_stat": 2,  # stationary processes variance
         # "si_r": 2,  # measurement noise
         "max_cores": max_cores,  # Parallel data generation
+
+        # TESTING PARAMETERS
+        "params_testing": True,
     }
 
+    # MULTIPLE CONEXTS
+    add_multi_context_params = {
+        "si_d_coef": 0.05,
+        "d_bounds": {"high": 4, "low": 0.1},
+        "mu_d": 2
+    }
+    if data_config["N_ctx"] > 1:
+        data_config.update(add_multi_context_params)
+
+    # HIERARCHICAL PARAMETERS
+    add_hierarchical_params = {
+        "N_blocks": 125,
+        "N_tones": 8,
+        "rules_dpos_set": np.array([[3, 4, 5], [5, 6, 7]]),
+        "mu_rho_rules": 0.9,
+        "si_rho_rules": 0.05,
+    }
+    if data_config["gm_name"] == "HierarchicalGM":
+        data_config.update(add_hierarchical_params)
+
+    
+    # PARAMETERS TESTING
     add_data_params_baseline = {
-        "params_testing": True,
         "si_lim": 5,
         "mu_tau_bounds": {'low': 1, 'high': 250},
         "si_stat_bounds": {'low': 0.1, 'high': 2},
         "si_r_bounds": {'low': 0.1, 'high': 2},  # measurement noise
     }
+    if data_config["params_testing"]:
+        data_config.update(add_data_params_baseline)
 
-
-    config_NH.update(add_data_params_baseline)
-
-    
-    # ========================================
-    # STEP-BY-STEP WORKFLOW
-    # ========================================
     
     # STEP 1: Pre-compute benchmarks and visualize parameter distributions
     # This computes Kalman filter estimates on training and test data, and saves:
@@ -114,7 +122,7 @@ if __name__=='__main__':
     print("\n" + "="*60)
     print("STEP 1: Computing benchmarks (Kalman filter baseline)")
     print("="*60)
-    pipeline_multi_param(model_config, config_NH, gm_name, benchmark_only=True)
+    pipeline_multi_config(model_config, data_config, benchmark_only=True)
     
     
     # STEP 2: Train the RNN model with different learning rates and number of hidden units
@@ -124,7 +132,7 @@ if __name__=='__main__':
     print("\n" + "="*60)
     print("STEP 2: Training RNN models")
     print("="*60)
-    pipeline_multi_param(model_config, config_NH, gm_name, benchmark_only=False)
+    pipeline_multi_config(model_config, data_config, benchmark_only=False)
 
 
 
