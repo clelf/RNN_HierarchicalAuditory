@@ -843,8 +843,8 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
                     plot_title = f"{title}\n{title_line1}\n{title_line2}"
                 else:
                     # Single-context case
-                    title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat ratio: {si_ratio:.2f}"
-                    plot_title = f"{title}\n{title_line1}\n{title_line2}"
+                    title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat: {si_ratio:.2f}"
+                    plot_title = f"{title}\n{title_line1}"
             else:
                 # Legacy array format (for backward compatibility)
                 si_ratio = params[i,4] / params[i,2] if params[i,2] != 0 else np.nan
