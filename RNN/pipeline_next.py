@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import torch
 import sys
+import gc
 import pandas as pd
 import time
 import numpy as np
@@ -953,9 +954,36 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
         for lr_id, learning_rate in enumerate(model_config["learning_rates"]): 
             for model_name in model_config["model"]:
                 pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device)
+                
+                # Explicit garbage collection to free memory between configurations
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
 
 
+def pipeline_model(model_config, data_config):
+    # STEP 1: Pre-compute benchmarks and visualize parameter distributions
+    # This computes Kalman filter estimates on training and test data, and saves:
+    #   - benchmarks/benchmarks_<N>_<GM>_train.pkl
+    #   - benchmarks/benchmarks_<N>_<GM>_test.pkl
+    #   - benchmarks/visualizations/param_distribution_*.png
+    #   - benchmarks/visualizations/binned_metrics_kalman.csv
+    
+    print("\n" + "="*60)
+    print("STEP 1: Computing benchmarks (Kalman filter baseline)")
+    print("="*60)
+    pipeline_multi_config(model_config, data_config, benchmark_only=True)
+    
+    
+    # STEP 2: Train the RNN model with different learning rates and number of hidden units
+    # This will train the model using the pre-computed benchmarks for validation
+    # Uncomment the following line to run training:
+    
+    print("\n" + "="*60)
+    print("STEP 2: Training RNN models")
+    print("="*60)
+    pipeline_multi_config(model_config, data_config, benchmark_only=False)
 
 
 if __name__=='__main__':

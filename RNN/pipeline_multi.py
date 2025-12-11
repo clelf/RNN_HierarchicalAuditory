@@ -1,7 +1,7 @@
 import torch
 import os
 import numpy as np
-from pipeline_next import pipeline_multi_config
+from pipeline_next import pipeline_model
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -10,7 +10,7 @@ FREQ_MAX = 1650
 
 if __name__=='__main__':
 
-    unit_test = True
+    unit_test = False
 
     # DEFINE MODEL AND TRAINING PARAMETERS
     model_config = {
@@ -31,9 +31,9 @@ if __name__=='__main__':
         "rnn_n_layers": 1,  # number of RNN layers
 
         # Training parameters
-        "num_epochs": 250 if not unit_test else 10, # TODO: 250,  # number of epochs (TEST: 2)
-        "epoch_res": 10,  # report results every epoch_res epochs
-        "batch_res": 10,  # store and report loss every batch_res batches
+        "num_epochs": 100 if not unit_test else 10, # TODO: 250 / 100,  # number of epochs (TEST: 2)
+        "epoch_res": 20 if not unit_test else 10,  # report results every epoch_res epochs
+        "batch_res": 16 if not unit_test else 2,  # store and report loss every batch_res batches
         "batch_size": 1000 if not unit_test else 5, # TODO: 1000,  # batch size (TEST: 5)
         "n_batches": 32 if not unit_test else 2,  # number of batches # TODO: 32
         "weight_decay": 1e-5,  # weight decay for optimizer
@@ -60,7 +60,7 @@ if __name__=='__main__':
     
     data_config = {
         "gm_name": "HierarchicalGM",
-        "N_ctx": 2,
+        "N_ctx": 1,
         # "N_batch": n_batches,
         "N_samples": model_config['batch_size'],
         "N_blocks": 1,
@@ -86,8 +86,7 @@ if __name__=='__main__':
         "d_bounds": {"high": 4, "low": 0.1},
         "mu_d": 2
     }
-    if data_config["N_ctx"] > 1:
-        data_config.update(add_multi_context_params)
+    
 
     # HIERARCHICAL PARAMETERS
     add_hierarchical_params = {
@@ -97,8 +96,7 @@ if __name__=='__main__':
         "mu_rho_rules": 0.9,
         "si_rho_rules": 0.05,
     }
-    if data_config["gm_name"] == "HierarchicalGM":
-        data_config.update(add_hierarchical_params)
+    
 
     
     # PARAMETERS TESTING
@@ -111,28 +109,25 @@ if __name__=='__main__':
     if data_config["params_testing"]:
         data_config.update(add_data_params_baseline)
 
-    
-    # STEP 1: Pre-compute benchmarks and visualize parameter distributions
-    # This computes Kalman filter estimates on training and test data, and saves:
-    #   - benchmarks/benchmarks_<N>_<GM>_train.pkl
-    #   - benchmarks/benchmarks_<N>_<GM>_test.pkl
-    #   - benchmarks/visualizations/param_distribution_*.png
-    #   - benchmarks/visualizations/binned_metrics_kalman.csv
-    
-    print("\n" + "="*60)
-    print("STEP 1: Computing benchmarks (Kalman filter baseline)")
-    print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=True)
-    
-    
-    # STEP 2: Train the RNN model with different learning rates and number of hidden units
-    # This will train the model using the pre-computed benchmarks for validation
-    # Uncomment the following line to run training:
-    
-    print("\n" + "="*60)
-    print("STEP 2: Training RNN models")
-    print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=False)
+
+    #### RUNNING DIFFERENT GM
+
+    for N_ctx in [1, 2]:
+        print("Running N_ctx =", N_ctx)
+        if data_config["N_ctx"] > 1:
+            data_config.update(add_multi_context_params)
+
+        for gm_name in ['NonHierarchicalGM', 'HierarchicalGM']:
+            if gm_name == 'HierarchicalGM' and N_ctx == 1:
+                continue
+            
+            print("Running GM = ", gm_name)
+            data_config['gm_name'] = gm_name
+            
+            if data_config["gm_name"] == "HierarchicalGM":
+                data_config.update(add_hierarchical_params)
+            
+            pipeline_model(model_config, data_config)
 
 
 
