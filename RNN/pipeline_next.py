@@ -291,7 +291,7 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     
     # Set up save path - include gm_name only when N_ctx > 1 to distinguish different GMs
     if save_path is None:
-        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks' / get_ctx_gm_subpath(N_ctx, gm_name) / 'visualizations'
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks' / get_ctx_gm_subpath(N_ctx, gm_name) / f'visualizations{N_ctx}'
     os.makedirs(save_path, exist_ok=True)
     
     # Add suffix to filename if provided
@@ -968,8 +968,8 @@ def pipeline_model(model_config, data_config):
     # This computes Kalman filter estimates on training and test data, and saves:
     #   - benchmarks/benchmarks_<N>_<GM>_train.pkl
     #   - benchmarks/benchmarks_<N>_<GM>_test.pkl
-    #   - benchmarks/visualizations/param_distribution_*.png
-    #   - benchmarks/visualizations/binned_metrics_kalman.csv
+    #   - benchmarks/visualizations_<N>/param_distribution_*.png
+    #   - benchmarks/visualizations_<N>/binned_metrics_kalman.csv
     
     print("\n" + "="*60)
     print("STEP 1: Computing benchmarks (Kalman filter baseline)")

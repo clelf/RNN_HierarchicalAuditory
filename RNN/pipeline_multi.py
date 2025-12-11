@@ -117,6 +117,7 @@ if __name__=='__main__':
 
     for N_ctx in [1, 2]:
         print("Running N_ctx =", N_ctx)
+        data_config["N_ctx"] = N_ctx  # Update N_ctx in data_config
         if data_config["N_ctx"] > 1:
             data_config.update(add_multi_context_params)
 
