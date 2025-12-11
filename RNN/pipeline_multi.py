@@ -10,7 +10,7 @@ FREQ_MAX = 1650
 
 if __name__=='__main__':
 
-    unit_test = False
+    unit_test = True
 
     # DEFINE MODEL AND TRAINING PARAMETERS
     model_config = {
@@ -27,14 +27,14 @@ if __name__=='__main__':
         "output_dim": 2,  # learn the sufficient statistics mu and var
 
         # RNN configuration
-        "rnn_hidden_dim": [16, 32, 64] if not unit_test else [8, 16],  # prev: 8
+        "rnn_hidden_dim": [8, 16, 32, 64] if not unit_test else [8, 16],  # prev: 8
         "rnn_n_layers": 1,  # number of RNN layers
 
         # Training parameters
         "num_epochs": 100 if not unit_test else 10, # TODO: 250 / 100,  # number of epochs (TEST: 2)
         "epoch_res": 20 if not unit_test else 10,  # report results every epoch_res epochs
         "batch_res": 16 if not unit_test else 2,  # store and report loss every batch_res batches
-        "batch_size": 1000 if not unit_test else 5, # TODO: 1000,  # batch size (TEST: 5)
+        "batch_size": 1000 if not unit_test else 5, # 5, # TODO: 1000,  # batch size (TEST: 5)
         "n_batches": 32 if not unit_test else 2,  # number of batches # TODO: 32
         "weight_decay": 1e-5,  # weight decay for optimizer
 
@@ -42,7 +42,10 @@ if __name__=='__main__':
         "n_trials": 1000,  # single tones
 
         # Testing parameters
-        "batch_size_test": 1000 if not unit_test else 5 # batch size during testing # TODO: 1000 (TEST: 10)
+        "batch_size_test": 1000 if not unit_test else 5, # 5 # batch size during testing # TODO: 1000 (TEST: 10)
+
+        # Visualization parameters
+        "seq_len_viz": 125,  # or None
     }
     
     # DEFINE GENERATIVE MODEL PARAMETERS

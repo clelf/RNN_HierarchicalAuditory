@@ -226,16 +226,16 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
         # rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs, pars
         _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
 
-    # Fit Kalman filters - get BOTH filtered estimates (for visualization) and predictions (for MSE)
+    # Fit Kalman filters - get predictions (for MSE and visualization)
     if data_config["N_ctx"] == 1:
         # Standard Kalman filter for single context
-        kalman_mu_filt, kalman_sigma_filt = kalman_fit_batch(y_batch, n_iter=n_iter)
+        # kalman_mu_filt, kalman_sigma_filt = kalman_fit_batch(y_batch, n_iter=n_iter)  # Filtered estimates - not used
         kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_batch(y_batch, n_iter=n_iter)
     else:
         # Context-aware Kalman filter for multiple contexts
-        kalman_mu_filt, kalman_sigma_filt = kalman_fit_context_aware_batch(
-            y_batch, contexts_batch, n_iter=n_iter
-        )
+        # kalman_mu_filt, kalman_sigma_filt = kalman_fit_context_aware_batch(  # Filtered estimates - not used
+        #     y_batch, contexts_batch, n_iter=n_iter
+        # )
         kalman_mu_pred, kalman_sigma_pred = kalman_fit_context_aware_predict_batch(
             y_batch, contexts_batch, n_iter=n_iter
         )
@@ -245,12 +245,11 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
     mses = ((kalman_mu_pred[:, :-1] - y_batch[:, 1:]) ** 2).mean(axis=1)  # shape: (N_samples,)
 
     # Return observations, Kalman estimates, parameters, and performance
-    # Store both filtered (for visualization) and predictions (for MSE comparison with model)
     benchmark_kit = {
         'y': y_batch, 
         'contexts': contexts_batch,
-        'mu_kal_filt': kalman_mu_filt,      # Filtered estimates - align with y[t]
-        'sigma_kal_filt': kalman_sigma_filt,
+        # 'mu_kal_filt': kalman_mu_filt,      # Filtered estimates - not used
+        # 'sigma_kal_filt': kalman_sigma_filt,
         'mu_kal_pred': kalman_mu_pred,       # Predictions - predict y[t+1]
         'sigma_kal_pred': kalman_sigma_pred,
         'pars': pars_batch, 
@@ -273,7 +272,7 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     Visualize parameter distributions from benchmark data.
     
     Args:
-        benchmarks: Dictionary with 'y', 'mu_kal_filt', 'mu_kal_pred', 'sigma_kal_filt', 'sigma_kal_pred', 'perf', 'pars'
+        benchmarks: Dictionary with 'y', 'mu_kal_pred', 'sigma_kal_pred', 'perf', 'pars'
                    where 'pars' is a dictionary with keys: 'tau', 'lim', 'si_stat', 'si_q', 'si_r'
         data_config: Data configuration dictionary
         save_path: Optional path to save visualizations (defaults to benchmarks/ folder)
@@ -341,7 +340,7 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     print(f"  Saved binned metrics to {save_path / f'binned_metrics_kalman{suffix_str}.csv'}")
 
 
-def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_config, save_path, benchmarks=None, device=DEVICE):
+def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_config, save_path, benchmarks=None, device=DEVICE, seq_len_viz=None):
     """
     Train the model to predict the next observation.
     
@@ -473,10 +472,9 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
             if use_benchmarks:
                 y = benchmarks['y']
                 y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(-1).to(device)
-                # Use filtered estimates for visualization (align with y[t])
-                mu_kal_filt = benchmarks['mu_kal_filt']
-                sigma_kal_filt = benchmarks['sigma_kal_filt']
-                # Use predictions for MSE comparison with model
+                # Use predictions for MSE comparison with model and visualization
+                # mu_kal_filt = benchmarks['mu_kal_filt']  # Filtered estimates - not used
+                # sigma_kal_filt = benchmarks['sigma_kal_filt']
                 mu_kal_pred = benchmarks['mu_kal_pred']
                 sigma_kal_pred = benchmarks['sigma_kal_pred']
                 mse_kal = benchmarks['perf']
@@ -525,14 +523,14 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
                 mse_model2kal = ((mu_estim - mu_kal_pred[:, :-1])**2).mean()
             
             # Save valid samples for this epoch
-            # Use FILTERED estimates for visualization (they align with observations at same index)
+            # Use PREDICTION estimates for visualization (both model and KF predict y[t+1])
             if epoch % model_config["epoch_res"] == model_config["epoch_res"]-1:
-                seq_len=100 # TODO: remove in the future
                 if use_benchmarks:
-                    # Pass filtered estimates for visualization - they align directly with y
-                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=mu_kal_filt, kalman_sigma=sigma_kal_filt, data_config=data_config, seq_len=seq_len) 
+                    # Pass KF predictions for visualization - both model and KF predict y[t+1]
+                    # Slice mu_kal_pred to match mu_estim length (exclude last prediction which has no target)
+                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=mu_kal_pred[:, :-1], kalman_sigma=sigma_kal_pred[:, :-1], data_config=data_config, seq_len=seq_len_viz) 
                 else:
-                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, data_config=data_config, seq_len=seq_len)
+                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, data_config=data_config, seq_len=seq_len_viz)
 
             # Store valid metrics for this epoch
             valid_mse_report.append(mse_model)
@@ -755,6 +753,15 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
 
 
 def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_len=None, data_config=None):
+    """
+    Plot observation sequences with model and optional Kalman filter predictions.
+    
+    Note on alignment:
+    - obs has length T (full sequence)
+    - mu_estim has length T-1 (predictions for y[1:T])
+    - kalman_mu has length T-1 (predictions for y[1:T], pre-sliced by caller)
+    - All predictions at index t predict observation at index t+1
+    """
     # Convert to numpy if it's a tensor
     if isinstance(obs, torch.Tensor):
         obs = obs.detach().cpu().numpy()
@@ -765,24 +772,19 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
         N_tones = data_config.get("N_tones", 8)
         last_8_blocks_len = 8 * N_tones
         if obs.shape[1] > last_8_blocks_len:
-            # Take only the last 8 blocks
-            obs = obs[:, -last_8_blocks_len:]
-            mu_estim = mu_estim[:, -last_8_blocks_len:]
-            sigma_estim = sigma_estim[:, -last_8_blocks_len:]
-            if kalman_mu is not None:
-                kalman_mu = kalman_mu[:, -last_8_blocks_len:]
-            if kalman_sigma is not None:
-                kalman_sigma = kalman_sigma[:, -last_8_blocks_len:]
+            seq_len = last_8_blocks_len
     
     # Truncate sequences if seq_len is provided
     if seq_len is not None:
-        obs = obs[:, :seq_len]
-        mu_estim = mu_estim[:, -seq_len:]
-        sigma_estim = sigma_estim[:, -seq_len:]
+        # Take last seq_len observations: obs indices [T-seq_len, ..., T-1]
+        obs = obs[:, -seq_len:]
+        # Take last seq_len-1 predictions that predict obs[1:seq_len] (the last seq_len-1 obs)
+        mu_estim = mu_estim[:, -(seq_len-1):]
+        sigma_estim = sigma_estim[:, -(seq_len-1):]
         if kalman_mu is not None:
-            kalman_mu = kalman_mu[:, -seq_len:]
+            kalman_mu = kalman_mu[:, -(seq_len-1):]
         if kalman_sigma is not None:
-            kalman_sigma = kalman_sigma[:, -seq_len:]
+            kalman_sigma = kalman_sigma[:, -(seq_len-1):]
             
     # for some 8 randomly sampled sequences out of the whole batch of length obs.shape[0]
     N = min(8, obs.shape[0])
@@ -790,22 +792,21 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
             
         plt.figure(figsize=(20, 6))
         
-        # Plot observation
+        # Plot observation (full length of truncated sequence)
         plt.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
 
-        # Plot estimation as a distribution (with uncertainty)
-        # NOTE: mu_estim[t] is a prediction for y[t+1], so we plot it at position t+1
-        # This shifts the predictions by 1 to align with the observations they predict
-        estim_x = range(1, len(mu_estim[i]) + 1)
-        plt.plot(estim_x, mu_estim[i], color='k', label='y_hat')
+        # Plot model prediction as a distribution (with uncertainty)
+        # After truncation: mu_estim has seq_len-1 elements predicting obs[1:seq_len]
+        # So mu_estim[0] predicts obs[1], mu_estim[k] predicts obs[k+1]
+        # Plot at positions [1, 2, ..., seq_len-1] to align with the observations they predict
+        estim_x = range(1, len(obs[i]))  # [1, ..., len(obs)-1]
+        plt.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
         plt.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2)
         
-        # Plot Kalman estimation if provided
-        # NOTE: kalman_mu is now the FILTERED estimate (full length T), which aligns directly with obs
-        # kalman_mu[t] is the filtered estimate at time t, which should be plotted at position t
+        # Plot Kalman PREDICTION if provided (same alignment as model)
         if kalman_mu is not None and kalman_sigma is not None:
-            kal_x = range(len(kalman_mu[i]))
-            plt.plot(kal_x, kalman_mu[i], label='y_kal_filt', color='green', alpha=0.8)
+            kal_x = range(1, len(obs[i]))  # Same alignment as model predictions
+            plt.plot(kal_x, kalman_mu[i], label='y_kal_pred', color='green', alpha=0.8)
             plt.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
 
         plt.legend()
@@ -916,7 +917,7 @@ def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_na
     
     # Train
     print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}...")
-    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, gm_name=gm_name, model_name=model_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_train)
+    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, gm_name=gm_name, model_name=model_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_train, seq_len_viz=model_config["seq_len_viz"])
     
     # Test
     print(f"\nTesting {model_name} with h_dim={h_dim}, lr={learning_rate}...")
