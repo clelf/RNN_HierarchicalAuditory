@@ -26,9 +26,9 @@ base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 kalman_folder = None
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 if os.path.exists(os.path.join(base_path, 'Kalman')):
-    from Kalman.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch, kalman_fit_predict_batch, kalman_fit_context_aware_batch, kalman_fit_context_aware_predict_batch
+    from Kalman.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch, kalman_fit_predict_batch, kalman_fit_context_aware_batch, kalman_fit_context_aware_predict_batch, MIN_OBS_FOR_EM
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
-    from KalmanFilterViz1D.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch, kalman_fit_predict_batch, kalman_fit_context_aware_batch, kalman_fit_context_aware_predict_batch
+    from KalmanFilterViz1D.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch, kalman_fit_predict_batch, kalman_fit_context_aware_batch, kalman_fit_context_aware_predict_batch, MIN_OBS_FOR_EM
 else:
     raise ImportError("Neither 'Kalman' nor 'KalmanFilterViz1D' folder found.")
 
@@ -47,7 +47,6 @@ FREQ_MAX = 1650
 # - dropout?
 # - assess need to change activation function or not (hand in hand with changing the models' inner layers' architecture)
 # - set requires_grad / autograd
-# y_norm training + validation in eval mode
 
 
 # TODO:
@@ -91,7 +90,7 @@ def bin_params(data_config):
 
     return param_bins
 
-def map_binned_params_2_metrics(param_bins, y, mu_estim, pars):
+def map_binned_params_2_metrics(param_bins, y, mu_estim, pars, mu_kal=None):
     """
     Map parameters to bins and compute metrics for each parameter combination.
     
@@ -102,13 +101,24 @@ def map_binned_params_2_metrics(param_bins, y, mu_estim, pars):
         pars: Dictionary with parameter arrays. For multi-context scenarios (N_ctx > 1),
               'tau' and 'lim' may be 2D arrays with shape (N_samples, N_ctx). In this case,
               we use the first context's values for binning (typically std).
+        mu_kal: Optional Kalman filter estimates, shape (N_samples, seq_len). If provided,
+                computes KF MSE and model-vs-KF MSE per bin.
     
     Returns:
-        DataFrame with binned metrics
+        DataFrame with binned metrics including:
+        - mse: Model MSE wrt target
+        - mse_kal: KF MSE wrt target (if mu_kal provided)
+        - mse_model2kal: Model MSE wrt KF predictions (if mu_kal provided)
+        - count: Number of samples in this bin
     """
     # Initialize storage array: each row stores tau, lim, si_stat, si_q, and the corresponding mse
     param_combinations = np.array(np.meshgrid(param_bins['tau'], param_bins['si_stat'], param_bins['si_r'])).T.reshape(-1, 3)
-    binned_metrics = {tuple(param_combination): {'mse': [], 'count': 0} for param_combination in param_combinations}
+    
+    # Initialize metrics dict with optional KF fields
+    if mu_kal is not None:
+        binned_metrics = {tuple(param_combination): {'mse': [], 'mse_kal': [], 'mse_model2kal': [], 'count': 0} for param_combination in param_combinations}
+    else:
+        binned_metrics = {tuple(param_combination): {'mse': [], 'count': 0} for param_combination in param_combinations}
 
     # Extract parameters from dictionary, handling multi-context case
     # For tau: if 2D (multi-context), take first context (std); otherwise use as-is
@@ -127,13 +137,23 @@ def map_binned_params_2_metrics(param_bins, y, mu_estim, pars):
     # Use the bins found to get the corresponding combination of parameters
     param_combination = (param_bins['tau'][tau_bin_id], param_bins['si_stat'][si_stat_bin_id], param_bins['si_r'][si_r_bin_id])
     
-    # Get MSE per sample in batch
-    
+    # Get MSE per sample in batch (model vs target)
     mse_per_sample = ((mu_estim-y)**2).mean(axis=1)
+    
+    # Compute KF metrics if KF predictions provided
+    if mu_kal is not None:
+        mse_kal_per_sample = ((mu_kal-y)**2).mean(axis=1)  # KF vs target
+        mse_model2kal_per_sample = ((mu_estim-mu_kal)**2).mean(axis=1)  # Model vs KF
 
-    # Then, zip batch's param_combination array and MSE array and store MSE
-    for *pc, m in zip(*param_combination, mse_per_sample):
-        binned_metrics[tuple(pc)]['mse'].append(m)
+    # Then, zip batch's param_combination array and MSE arrays and store
+    if mu_kal is not None:
+        for *pc, m, m_kal, m_m2k in zip(*param_combination, mse_per_sample, mse_kal_per_sample, mse_model2kal_per_sample):
+            binned_metrics[tuple(pc)]['mse'].append(m)
+            binned_metrics[tuple(pc)]['mse_kal'].append(m_kal)
+            binned_metrics[tuple(pc)]['mse_model2kal'].append(m_m2k)
+    else:
+        for *pc, m in zip(*param_combination, mse_per_sample):
+            binned_metrics[tuple(pc)]['mse'].append(m)
 
 
     # If tracking performance along data parameters, average stored MSEs for each parameter combination
@@ -141,30 +161,43 @@ def map_binned_params_2_metrics(param_bins, y, mu_estim, pars):
         binned_metrics[param_combination]['count'] = len(binned_metrics[param_combination]['mse'])
         if binned_metrics[param_combination]['count'] > 0:
             binned_metrics[param_combination]['mse'] = np.mean(binned_metrics[param_combination]['mse'])
+            if mu_kal is not None:
+                binned_metrics[param_combination]['mse_kal'] = np.mean(binned_metrics[param_combination]['mse_kal'])
+                binned_metrics[param_combination]['mse_model2kal'] = np.mean(binned_metrics[param_combination]['mse_model2kal'])
         else:
             binned_metrics[param_combination]['mse'] = np.nan
+            if mu_kal is not None:
+                binned_metrics[param_combination]['mse_kal'] = np.nan
+                binned_metrics[param_combination]['mse_model2kal'] = np.nan
 
 
     # Save binned metrics
-    binned_metrics_list = [
-        {
-        'tau': tau,
-        'si_stat': si_stat,
-        'si_r': si_r,
-        'mse': metrics['mse'],
-        'count': metrics['count']
-        }
-        for (tau, si_stat, si_r), metrics in binned_metrics.items()
-    ]
+    if mu_kal is not None:
+        binned_metrics_list = [
+            {
+            'tau': tau,
+            'si_stat': si_stat,
+            'si_r': si_r,
+            'mse': metrics['mse'],
+            'mse_kal': metrics['mse_kal'],
+            'mse_model2kal': metrics['mse_model2kal'],
+            'count': metrics['count']
+            }
+            for (tau, si_stat, si_r), metrics in binned_metrics.items()
+        ]
+    else:
+        binned_metrics_list = [
+            {
+            'tau': tau,
+            'si_stat': si_stat,
+            'si_r': si_r,
+            'mse': metrics['mse'],
+            'count': metrics['count']
+            }
+            for (tau, si_stat, si_r), metrics in binned_metrics.items()
+        ]
     binned_metrics_df = pd.DataFrame(binned_metrics_list)
     binned_metrics_df['si_q'] = binned_metrics_df['si_stat'] * ((2 * binned_metrics_df['tau'] - 1) ** 0.5) / binned_metrics_df['tau']
-    # if save_path is None and lr_id is not None:
-    #     if kalman:
-    #         save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_1/kalman/'
-    #     else:
-    #         save_path = Path(os.path.abspath(os.path.dirname(__file__))) / f'training_results/N_ctx_1/observ/'
-    # if save_path is not None and lr_id is not None:
-        # binned_metrics_df.to_csv((save_path/f'binned_metrics_lr{lr_id}.csv'), index=False)
 
     return binned_metrics_df
 
@@ -227,34 +260,31 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
         _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
 
     # Fit Kalman filters - get predictions (for MSE and visualization)
+    # Note: kalman_fit_predict functions return T-MIN_OBS_FOR_EM predictions (EM needs min 3 observations)
+    #   y_hat[t] predicts y[t+MIN_OBS_FOR_EM] based on parameters fit on y[0:t+MIN_OBS_FOR_EM]
     if data_config["N_ctx"] == 1:
         # Standard Kalman filter for single context
-        # kalman_mu_filt, kalman_sigma_filt = kalman_fit_batch(y_batch, n_iter=n_iter)  # Filtered estimates - not used
         kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_batch(y_batch, n_iter=n_iter)
     else:
         # Context-aware Kalman filter for multiple contexts
-        # kalman_mu_filt, kalman_sigma_filt = kalman_fit_context_aware_batch(  # Filtered estimates - not used
-        #     y_batch, contexts_batch, n_iter=n_iter
-        # )
         kalman_mu_pred, kalman_sigma_pred = kalman_fit_context_aware_predict_batch(
             y_batch, contexts_batch, n_iter=n_iter
         )
     
-    # Compute MSE using PREDICTIONS: compare KF prediction at t with observation at t+1
-    # Note: kalman_mu_pred[t] is the prediction for y[t+1] made after seeing y[0:t]
-    mses = ((kalman_mu_pred[:, :-1] - y_batch[:, 1:]) ** 2).mean(axis=1)  # shape: (N_samples,)
+    # Compute MSE using PREDICTIONS: compare KF prediction at t with observation at t+MIN_OBS_FOR_EM
+    # kalman_mu_pred has shape (N_samples, T-MIN_OBS_FOR_EM) where kalman_mu_pred[:, t] predicts y[:, t+MIN_OBS_FOR_EM]
+    mses = ((kalman_mu_pred - y_batch[:, MIN_OBS_FOR_EM:]) ** 2).mean(axis=1)  # shape: (N_samples,)
 
     # Return observations, Kalman estimates, parameters, and performance
     benchmark_kit = {
-        'y': y_batch, 
+        'y': y_batch,                        # shape: (N_samples, T)
         'contexts': contexts_batch,
-        # 'mu_kal_filt': kalman_mu_filt,      # Filtered estimates - not used
-        # 'sigma_kal_filt': kalman_sigma_filt,
-        'mu_kal_pred': kalman_mu_pred,       # Predictions - predict y[t+1]
-        'sigma_kal_pred': kalman_sigma_pred,
+        'mu_kal_pred': kalman_mu_pred,       # shape: (N_samples, T-MIN_OBS_FOR_EM), predicts y[:, MIN_OBS_FOR_EM:]
+        'sigma_kal_pred': kalman_sigma_pred, # shape: (N_samples, T-MIN_OBS_FOR_EM)
         'pars': pars_batch, 
         'perf': mses,
-        'n_ctx': N_ctx
+        'n_ctx': N_ctx,
+        'min_obs_for_em': MIN_OBS_FOR_EM     # Store for downstream alignment
     }
 
     if save:
@@ -274,6 +304,7 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     Args:
         benchmarks: Dictionary with 'y', 'mu_kal_pred', 'sigma_kal_pred', 'perf', 'pars'
                    where 'pars' is a dictionary with keys: 'tau', 'lim', 'si_stat', 'si_q', 'si_r'
+                   Note: 'mu_kal_pred' has shape (N_samples, T-3) - predictions for y[:, 3:]
         data_config: Data configuration dictionary
         save_path: Optional path to save visualizations (defaults to benchmarks/ folder)
         suffix: Optional suffix to add to filenames (e.g., 'train', 'test')
@@ -281,17 +312,19 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     param_bins = bin_params(data_config)
     y = benchmarks['y']
     # Use prediction estimates for MSE computation (matches model evaluation)
+    # mu_kal has shape (N_samples, T-MIN_OBS_FOR_EM) and predicts y[:, MIN_OBS_FOR_EM:]
+    min_obs = benchmarks.get('min_obs_for_em', MIN_OBS_FOR_EM)
     mu_kal = benchmarks['mu_kal_pred']
     sigma_kal = benchmarks['sigma_kal_pred']
     mse_kal = benchmarks['perf']
     pars_kal = benchmarks['pars']
     
-    # Compute binned metrics
-    binned_metrics_df = map_binned_params_2_metrics(param_bins, y, mu_kal, pars_kal)
+    # Compute binned metrics - use y[:, min_obs:] to match mu_kal dimensions
+    binned_metrics_df = map_binned_params_2_metrics(param_bins, y[:, min_obs:], mu_kal, pars_kal)
     
     # Set up save path - include gm_name only when N_ctx > 1 to distinguish different GMs
     if save_path is None:
-        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks' / get_ctx_gm_subpath(N_ctx, gm_name) / f'visualizations{N_ctx}'
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks' / get_ctx_gm_subpath(N_ctx, gm_name) / f'visualizations{data_config["N_samples"]}'
     os.makedirs(save_path, exist_ok=True)
     
     # Add suffix to filename if provided
@@ -357,8 +390,6 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
         benchmarks: Optional benchmark dictionary containing Kalman filter results for comparison
         device: Device to run on (cuda/cpu)
     
-    Returns:
-        MinMaxScaler if use_minmax is True, else None
     """
     # Set optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=model_config["weight_decay"])
@@ -400,7 +431,7 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
     print("TRAINING \n")
 
     # Epochs
-    for epoch in tqdm(range(model_config["num_epochs"]), desc="Epochs"):
+    for epoch in tqdm(range(model_config["num_epochs"]), desc="Epochs", leave=False):
         train_losses = []
         tt = time.time()
         model.train()
@@ -418,17 +449,10 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
 
             y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
 
-            # Transform data if specified
-            if model_config["use_minmax"]:
-                minmax_train = MinMaxScaler()
-                y_norm = minmax_train.fit_normalize(y) #, margin=data_config["si_r"]+data_config["si_q"])
-            else:
-                y_norm = y
-
             # Always train to predict the next observation
             # Input: y[0:T-1], Target: y[1:T]
-            model_output = model(y_norm[:, :-1, :])
-            loss = model.loss(y_norm[:, 1:, :], model_output, loss_func=loss_function)
+            model_output = model(y[:, :-1, :])
+            loss = model.loss(y[:, 1:, :], model_output, loss_func=loss_function)
 
             # Learning model weigths
             # Only compute weight changes when you're going to log them
@@ -483,16 +507,11 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
                 _, _, y, pars_bench = gm.generate_batch(return_pars=True)
                 y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
             
-            # Transform data
-            if model_config["use_minmax"]:
-                y_norm = minmax_train.normalize(y)
-            else:
-                y_norm = y
-
+            
             # Always predict next observation
             # Input: y[0:T-1], Target: y[1:T]
-            model_output = model(y_norm[:, :-1, :])
-            valid_loss = model.loss(y_norm[:, 1:, :], model_output, loss_func=loss_function).detach().cpu().numpy()
+            model_output = model(y[:, :-1, :]) # model is given y[0:T-1] to predict y[1:T]
+            valid_loss = model.loss(y[:, 1:, :], model_output, loss_func=loss_function).detach().cpu().numpy()
 
             # Get estimated distribution
             if model.name=='vrnn': model_output_dist = model_output[0]
@@ -502,10 +521,6 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
             mu_estim = model_output_dist[...,0].detach().cpu().numpy()
             var_estim = (F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()
             
-            # Rescale data according to observation scale
-            if model_config["use_minmax"]:
-                mu_estim    = minmax_train.denormalize_mean(mu_estim)
-                var_estim   = minmax_train.denormalize_var(var_estim)
 
             # Compute standard deviation                    
             sigma_estim = np.sqrt(var_estim)
@@ -518,17 +533,22 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
 
             # If benchmarks available, also compare model output with Kalman filter PREDICTIONS
             if use_benchmarks:
-                # Compare with Kalman filter predictions (both predict y[t+1])
-                # mu_estim has length T-1, mu_kal_pred has length T, so slice to match
-                mse_model2kal = ((mu_estim - mu_kal_pred[:, :-1])**2).mean()
+                # Compare with Kalman filter predictions
+                # mu_estim has shape (N_samples, T-1) predicting y[:, 1:]
+                # mu_kal_pred has shape (N_samples, T-MIN_OBS_FOR_EM) predicting y[:, MIN_OBS_FOR_EM:]
+                # Align by slicing mu_estim to match KF predictions (skip first MIN_OBS_FOR_EM-1 predictions)
+                min_obs = benchmarks.get('min_obs_for_em', MIN_OBS_FOR_EM)
+                mu_estim_aligned = mu_estim[:, min_obs - 1:]  # shape: (N_samples, T-MIN_OBS_FOR_EM)
+                mse_model2kal = ((mu_estim_aligned - mu_kal_pred)**2).mean()
             
             # Save valid samples for this epoch
             # Use PREDICTION estimates for visualization (both model and KF predict y[t+1])
             if epoch % model_config["epoch_res"] == model_config["epoch_res"]-1:
                 if use_benchmarks:
-                    # Pass KF predictions for visualization - both model and KF predict y[t+1]
-                    # Slice mu_kal_pred to match mu_estim length (exclude last prediction which has no target)
-                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=mu_kal_pred[:, :-1], kalman_sigma=sigma_kal_pred[:, :-1], data_config=data_config, seq_len=seq_len_viz) 
+                    # Pass KF predictions for visualization
+                    # mu_estim has shape (N_samples, T-1) predicting y[:, 1:]
+                    # mu_kal_pred has shape (N_samples, T-MIN_OBS_FOR_EM) predicting y[:, MIN_OBS_FOR_EM:]
+                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=mu_kal_pred, kalman_sigma=sigma_kal_pred, data_config=data_config, seq_len=seq_len_viz, min_obs_for_em=min_obs) 
                 else:
                     plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, data_config=data_config, seq_len=seq_len_viz)
 
@@ -594,7 +614,16 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
         benchmarks: Optional benchmark dictionary containing Kalman filter results for comparison
     
     Returns:
-        tuple: (test_sigma, test_mse) or (test_sigma, test_mse, test_mse_model2kal) if benchmarks provided
+        tuple: 
+            - Without benchmarks: (test_sigma, test_mse)
+            - With benchmarks: (test_sigma, test_mse, test_mse_kal, test_mse_model2kal)
+              where test_mse_kal is the KF MSE wrt target (insight on task difficulty)
+              and test_mse_model2kal is the model MSE wrt KF predictions (model performance wrt upper bound)
+        
+        When params_testing is enabled, saves binned metrics CSV with:
+            - mse: Model MSE wrt target per parameter bin
+            - mse_kal: KF MSE wrt target per parameter bin (if benchmarks provided)
+            - mse_model2kal: Model MSE wrt KF predictions per parameter bin (if benchmarks provided)
     """
 
     ### TESTING
@@ -602,7 +631,8 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
 
     # Paths 
     if not os.path.exists(save_path):
-        raise ValueError("Model has not been trained yet - no folder found")
+        return
+        # raise ValueError("Model has not been trained yet - no folder found")
 
     # Load the saved weights
     model.load_state_dict(torch.load(f'{save_path}/lr{lr_id}_weights.pth'))
@@ -625,6 +655,7 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
 
     test_sigma = []
     test_mse = []
+    test_mse_kal = []  # KF MSE wrt target
     if use_benchmarks:
         test_mse_model2kal = []
 
@@ -636,22 +667,17 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
         sigma_kal_pred = benchmarks['sigma_kal_pred']
         pars = benchmarks['pars']
         mse_kal = benchmarks['perf']
+        test_mse_kal = mse_kal  # Store KF MSE for return
     else:
         # Generate data
         _, _, y, pars = gm.generate_batch(N_samples=model_config["batch_size_test"], return_pars=True)
         y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
    
-    # Transform data
-    if model_config["use_minmax"]:
-        y_norm = minmax_train.normalize(y)
-    else:
-        y_norm = y
-
 
     with torch.no_grad():
         # Always predict next observation
         # Input: y[0:T-1], Target: y[1:T]
-        model_output = model(y_norm[:, :-1, :])
+        model_output = model(y[:, :-1, :])
 
         # Get estimated distribution
         if model.name=='vrnn': model_output_dist = model_output[0]
@@ -660,11 +686,6 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
         # Extract model's output
         mu_estim = model_output_dist[...,0].detach().cpu().numpy()
         var_estim = (F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()
-        
-        # Rescale data according to observation scale
-        if model_config["use_minmax"]:
-            mu_estim    = minmax_train.denormalize_mean(mu_estim)
-            var_estim   = minmax_train.denormalize_var(var_estim)
 
         # Compute standard deviation                    
         sigma_estim = np.sqrt(var_estim)
@@ -679,17 +700,31 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
 
         # If benchmarks available, also compare model output with Kalman filter PREDICTIONS
         if use_benchmarks:
-            # Compare with Kalman filter predictions (both predict y[t+1])
-            mse_model2kal = ((mu_estim - mu_kal_pred[:, :-1])**2).mean()
+            # Compare with Kalman filter predictions
+            # mu_estim has shape (N_samples, T-1) predicting y[:, 1:]
+            # mu_kal_pred has shape (N_samples, T-MIN_OBS_FOR_EM) predicting y[:, MIN_OBS_FOR_EM:]
+            # Align by slicing mu_estim to match KF predictions (skip first MIN_OBS_FOR_EM-1 predictions)
+            min_obs = benchmarks.get('min_obs_for_em', MIN_OBS_FOR_EM)
+            mu_estim_aligned = mu_estim[:, min_obs - 1:]  # shape: (N_samples, T-MIN_OBS_FOR_EM)
+            mse_model2kal = ((mu_estim_aligned - mu_kal_pred)**2).mean()
             test_mse_model2kal.append(mse_model2kal)
         
     # Track performance along data parameters
     if data_config["params_testing"]:
-        binned_metrics_df = map_binned_params_2_metrics(param_bins, y[:, 1:], mu_estim, pars)
+        # Pass KF predictions if available for comparison metrics per bin
+        # Note: KF predictions are shorter, need alignment for binned metrics
+        if use_benchmarks:
+            min_obs = benchmarks.get('min_obs_for_em', MIN_OBS_FOR_EM)
+            # Align model predictions and observations with KF predictions
+            mu_estim_aligned = mu_estim[:, min_obs - 1:]
+            y_aligned = y[:, min_obs:]
+            binned_metrics_df = map_binned_params_2_metrics(param_bins, y_aligned, mu_estim_aligned, pars, mu_kal=mu_kal_pred)
+        else:
+            binned_metrics_df = map_binned_params_2_metrics(param_bins, y[:, 1:], mu_estim, pars)
         binned_metrics_df.to_csv((save_path/f'test_binned_metrics_lr{lr_id}.csv'), index=False)
 
     if use_benchmarks:
-        return test_sigma, test_mse, test_mse_model2kal
+        return test_sigma, test_mse, test_mse_kal, test_mse_model2kal
     else:
         return test_sigma, test_mse
 
@@ -752,21 +787,32 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.close()
 
 
-def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_len=None, data_config=None):
+def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_len=None, data_config=None, hidden_states=None, contexts=None, min_obs_for_em=None):
     """
     Plot observation sequences with model and optional Kalman filter predictions.
     
     Note on alignment:
     - obs has length T (full sequence)
     - mu_estim has length T-1 (predictions for y[1:T])
-    - kalman_mu has length T-1 (predictions for y[1:T], pre-sliced by caller)
-    - All predictions at index t predict observation at index t+1
+    - kalman_mu has length T-MIN_OBS_FOR_EM (predictions for y[MIN_OBS_FOR_EM:T])
+      KF needs MIN_OBS_FOR_EM observations for EM, so starts predicting later
+    - Model predictions plotted at x=[1, T-1], KF predictions at x=[MIN_OBS_FOR_EM, T-1]
+    
+    Args:
+        min_obs_for_em: Minimum observations needed for KF EM (default: MIN_OBS_FOR_EM constant)
     """
+    # Set default for min_obs_for_em
+    if min_obs_for_em is None:
+        min_obs_for_em = MIN_OBS_FOR_EM
+    
     # Convert to numpy if it's a tensor
     if isinstance(obs, torch.Tensor):
         obs = obs.detach().cpu().numpy()
     obs = obs.squeeze() # for safety
     
+    # Get N_ctx from data_config
+    n_ctx = data_config.get("N_ctx", 1) if data_config is not None else 1
+
     # For HierarchicalGM, plot only the last 8 blocks if sequence is long enough
     if data_config is not None and data_config.get("gm_name") == "HierarchicalGM":
         N_tones = data_config.get("N_tones", 8)
@@ -778,13 +824,18 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
     if seq_len is not None:
         # Take last seq_len observations: obs indices [T-seq_len, ..., T-1]
         obs = obs[:, -seq_len:]
-        # Take last seq_len-1 predictions that predict obs[1:seq_len] (the last seq_len-1 obs)
+        # Take last seq_len-1 model predictions that predict obs[1:seq_len] (the last seq_len-1 obs)
         mu_estim = mu_estim[:, -(seq_len-1):]
         sigma_estim = sigma_estim[:, -(seq_len-1):]
+        # Take last seq_len-min_obs_for_em KF predictions that predict obs[min_obs_for_em:seq_len]
         if kalman_mu is not None:
-            kalman_mu = kalman_mu[:, -(seq_len-1):]
+            kalman_mu = kalman_mu[:, -(seq_len-min_obs_for_em):]
         if kalman_sigma is not None:
-            kalman_sigma = kalman_sigma[:, -(seq_len-1):]
+            kalman_sigma = kalman_sigma[:, -(seq_len-min_obs_for_em):]
+        if hidden_states is not None:
+            hidden_states = hidden_states[:, -seq_len:, :]
+        if contexts is not None:
+            contexts = contexts[:, -seq_len:]
             
     # for some 8 randomly sampled sequences out of the whole batch of length obs.shape[0]
     N = min(8, obs.shape[0])
@@ -803,56 +854,71 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
         plt.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
         plt.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2)
         
-        # Plot Kalman PREDICTION if provided (same alignment as model)
+        # Plot Kalman PREDICTION if provided
+        # KF predictions start at min_obs_for_em (needs 3 obs for EM before first prediction)
+        # kalman_mu has length T-min_obs_for_em, predicting obs[min_obs_for_em:]
+        # kalman_mu[k] predicts obs[k+min_obs_for_em]
         if kalman_mu is not None and kalman_sigma is not None:
-            kal_x = range(1, len(obs[i]))  # Same alignment as model predictions
+            kal_x = range(min_obs_for_em, len(obs[i]))  # [min_obs, ..., len(obs)-1]
             plt.plot(kal_x, kalman_mu[i], label='y_kal_pred', color='green', alpha=0.8)
             plt.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
+
+        # Plot hidden states if provided
+        if hidden_states is not None:
+            if n_ctx > 1 and contexts is not None:
+                # Plot only hidden state of current active context
+                # --> Stack hidden states for each unique context along a new axis
+                unique_contexts = np.unique(contexts)
+                hidden_states_active = np.stack(
+                    [np.where((contexts == ctx)[..., None], hidden_states, 0) for ctx in unique_contexts],
+                    axis=-1
+                )
+                hidden_states_active = np.sum(hidden_states_active, axis=-1)  # Sum to get active context hidden states
+            else:
+                hidden_states_active = hidden_states  # Single context case  
+            plt.plot(range(len(hidden_states)), hidden_states[i, :], label=f'hidden state', color='orange', alpha=0.8)
+
+        # For different contexts, add vertical lines to indicate context switches
+        if n_ctx > 1 and contexts is not None:
+            context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1  # +1 to get the index of the new context start
+            for cc in context_changes:
+                plt.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
 
         plt.legend()
         plot_title = title
         if params is not None:
             # Extract parameters for sample i, handling both dict and legacy array formats
-            if isinstance(params, dict):
-                # Dictionary format: access by key
-                tau_i = params['tau'][i] if params['tau'].ndim > 0 else params['tau']
-                lim_i = params['lim'][i] if params['lim'].ndim > 0 else params['lim']
-                si_stat_i = params['si_stat'][i] if np.asarray(params['si_stat']).ndim > 0 else params['si_stat']
-                si_q_i = params['si_q'][i] if params['si_q'].ndim > 0 else params['si_q']
-                si_r_i = params['si_r'][i] if np.asarray(params['si_r']).ndim > 0 else params['si_r']
+            # Dictionary format: access by key
+            tau_i = params['tau'][i] if params['tau'].ndim > 0 else params['tau']
+            lim_i = params['lim'][i] if params['lim'].ndim > 0 else params['lim']
+            si_stat_i = params['si_stat'][i] if np.asarray(params['si_stat']).ndim > 0 else params['si_stat']
+            si_q_i = params['si_q'][i] if params['si_q'].ndim > 0 else params['si_q']
+            si_r_i = params['si_r'][i] if np.asarray(params['si_r']).ndim > 0 else params['si_r']
+            
+            # Compute si_r/si_stat ratio
+            si_ratio = si_r_i / si_stat_i if si_stat_i != 0 else np.nan
+            
+            if n_ctx == 2:
+                # Two-context case: format like audit_gm with std/dvt labels
+                tau_str = f"std: {tau_i[0]:.2f}, dvt: {tau_i[1]:.2f}"
+                lim_str = f"std: {lim_i[0]:.2f}, dvt: {lim_i[1]:.2f}"
+                si_q_str = f"std: {si_q_i[0]:.2f}, dvt: {si_q_i[1]:.2f}"
                 
-                # Compute si_r/si_stat ratio
-                si_ratio = si_r_i / si_stat_i if si_stat_i != 0 else np.nan
+                # Compute d and d_eff for two-context case
+                # d_eff = lim[1] - lim[0] (actual distance)
+                # d = d_eff / si_eff where si_eff = sqrt(si_stat**2 + si_r**2)
+                d_eff = lim_i[1] - lim_i[0]
+                si_eff = np.sqrt(si_stat_i**2 + si_r_i**2)
+                d = d_eff / si_eff if si_eff != 0 else np.nan
                 
-                # Get N_ctx from data_config
-                n_ctx = data_config.get("N_ctx", 1) if data_config is not None else 1
-                
-                if n_ctx == 2:
-                    # Two-context case: format like audit_gm with std/dvt labels
-                    tau_str = f"std: {tau_i[0]:.2f}, dvt: {tau_i[1]:.2f}"
-                    lim_str = f"std: {lim_i[0]:.2f}, dvt: {lim_i[1]:.2f}"
-                    si_q_str = f"std: {si_q_i[0]:.2f}, dvt: {si_q_i[1]:.2f}"
-                    
-                    # Compute d and d_eff for two-context case
-                    # d_eff = lim[1] - lim[0] (actual distance)
-                    # d = d_eff / si_eff where si_eff = sqrt(si_stat**2 + si_r**2)
-                    d_eff = lim_i[1] - lim_i[0]
-                    si_eff = np.sqrt(si_stat_i**2 + si_r_i**2)
-                    d = d_eff / si_eff if si_eff != 0 else np.nan
-                    
-                    title_line1 = f"tau: {tau_str}  |  lim: {lim_str}  | d: {d:.2f},  d_eff: {d_eff:.2f}"
-                    title_line2 = f"si_stat: {si_stat_i:.2f}  |  si_q: {si_q_str}  |  si_r: {si_r_i:.2f}  |  si_r/si_stat: {si_ratio:.2f}"
-                    plot_title = f"{title}\n{title_line1}\n{title_line2}"
-                else:
-                    # Single-context case
-                    title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat: {si_ratio:.2f}"
-                    plot_title = f"{title}\n{title_line1}"
-            else:
-                # Legacy array format (for backward compatibility)
-                si_ratio = params[i,4] / params[i,2] if params[i,2] != 0 else np.nan
-                title_line1 = f"tau: {params[i,0]:.2f}  |  lim: {params[i,1]:.2f}  |  si_stat: {params[i,2]:.2f}"
-                title_line2 = f"si_q: {params[i,3]:.2f}  |  si_r: {params[i,4]:.2f}  |  si_r/si_stat: {si_ratio:.2f}"
+                title_line1 = f"tau: {tau_str}  |  lim: {lim_str}  | d: {d:.2f},  d_eff: {d_eff:.2f}"
+                title_line2 = f"si_stat: {si_stat_i:.2f}  |  si_q: {si_q_str}  |  si_r: {si_r_i:.2f}  |  si_r/si_stat: {si_ratio:.2f}"
                 plot_title = f"{title}\n{title_line1}\n{title_line2}"
+            else:
+                # Single-context case
+                title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat: {si_ratio:.2f}"
+                plot_title = f"{title}\n{title_line1}"
+
         plt.title(plot_title)
         plt.savefig(f'{save_path}_s{id}.png')
         plt.close()
@@ -904,7 +970,7 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
     return benchmarks_train, benchmarks_test
 
 
-def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=None, benchmarks_test=None, device=DEVICE):
+def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=None, benchmarks_test=None, device=DEVICE, train_only=False, test_only=False):
     
     # Define save path - include gm_name only when N_ctx > 1
     save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results' / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_h{h_dim}/'
@@ -915,16 +981,19 @@ def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_na
     else:
         model = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=h_dim, phi_x_dim=h_dim, phi_z_dim=h_dim, phi_prior_dim=h_dim, rnn_hidden_states_dim=h_dim, rnn_n_layers=model_config['rnn_n_layers'], device=device)
     
-    # Train
-    print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}...")
-    minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, gm_name=gm_name, model_name=model_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_train, seq_len_viz=model_config["seq_len_viz"])
-    
-    # Test
-    print(f"\nTesting {model_name} with h_dim={h_dim}, lr={learning_rate}...")
-    test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, minmax_train=minmax, device=device, benchmarks=benchmarks_test)
+    minmax=None
+    if not test_only:
+        # Train
+        print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}...")
+        minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, gm_name=gm_name, model_name=model_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_train, seq_len_viz=model_config["seq_len_viz"])
+
+    if not train_only:
+        # Test
+        print(f"\nTesting {model_name} with h_dim={h_dim}, lr={learning_rate}...")
+        test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, minmax_train=minmax, device=device, benchmarks=benchmarks_test)
 
 
-def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE):
+def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False):
     """
     Run the full training and testing pipeline with multiple hyperparameter configurations.
     
@@ -954,7 +1023,7 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
     for h_dim in model_config["rnn_hidden_dim"]:
         for lr_id, learning_rate in enumerate(model_config["learning_rates"]): 
             for model_name in model_config["model"]:
-                pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device)
+                pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only)
                 
                 # Explicit garbage collection to free memory between configurations
                 gc.collect()
@@ -963,7 +1032,7 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
 
 
 
-def pipeline_model(model_config, data_config):
+def pipeline_model(model_config, data_config, test_only=False, train_only=False):
     # STEP 1: Pre-compute benchmarks and visualize parameter distributions
     # This computes Kalman filter estimates on training and test data, and saves:
     #   - benchmarks/benchmarks_<N>_<GM>_train.pkl
@@ -974,7 +1043,7 @@ def pipeline_model(model_config, data_config):
     print("\n" + "="*60)
     print("STEP 1: Computing benchmarks (Kalman filter baseline)")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=True)
+    pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only)
     
     
     # STEP 2: Train the RNN model with different learning rates and number of hidden units
@@ -984,7 +1053,15 @@ def pipeline_model(model_config, data_config):
     print("\n" + "="*60)
     print("STEP 2: Training RNN models")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=False)
+    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only)
+
+
+def pipeline_test(model_config, data_config):
+    # Test trained models on held-out data
+    print("\n" + "="*60)
+    print("Testing trained RNN models")
+    print("="*60)
+    pipeline_multi_config(model_config, data_config, test_only=True)
 
 
 if __name__=='__main__':
