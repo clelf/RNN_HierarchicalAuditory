@@ -9,32 +9,34 @@ import numpy as np
 
 
 class SimpleRNN(nn.Module):
-    def __init__(self, x_dim, output_dim, hidden_dim, n_layers, device=torch.device('cpu')):
+    def __init__(self, config):
         super().__init__()
 
         self.name = 'rnn'
-        self.x_dim = x_dim
-        self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
-        self.n_layers = n_layers
-        self.device = device
+        self.input_dim = config['input_dim']
+        self.output_dim = config['output_dim']
+        self.hidden_dim = config['hidden_dim']
+        self.n_layers = config['n_layers']
+        self.device = config.get('device', torch.device('cpu'))
 
-        self.rnn = nn.GRU(self.x_dim, self.hidden_dim, self.n_layers, batch_first=True, device=device) # expect x of size (batch_size, seq_len, input_dim)
-        self.output_layer = nn.Linear(self.hidden_dim, self.output_dim, device=device)
+        self.rnn = nn.GRU(self.input_dim, self.hidden_dim, self.n_layers, batch_first=True, device=self.device) # expect x of size (batch_size, seq_len, input_dim)
+        self.output_layer = nn.Linear(self.hidden_dim, self.output_dim, device=self.device)
 
 
     def init_hidden(self, batch_size):
         return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
 
-    def forward(self, x, hx=None):
+    def forward(self, x, hx=None, return_hidden=False):
         if hx is None:
-            batch_size = x.size(0)         # batch_size, seq_len, x_dim = x.size()
+            batch_size = x.size(0)         # batch_size, seq_len, input_dim = x.size()
             hx = self.init_hidden(batch_size)
 
-        output_last, _ = self.rnn(x, hx)  # output_last is the sequence of final hidden states after the last layer / h_last is the final hidden state of each layer
+        output_last, hx_new = self.rnn(x, hx)  # output_last is the sequence of final hidden states after the last layer / hx_new is the final hidden state of each layer
         output_seq = self.output_layer(output_last)
 
-        return output_seq # has last dimension = output_dim # TODO: make sure of the dimensions here
+        if return_hidden:
+            return output_seq, hx_new
+        return output_seq
     
     def loss(self, target, x_output, loss_func): # torch.nn.GaussianNLLLoss()
         out_estim_mu    = x_output[..., [0]]
@@ -45,7 +47,7 @@ class SimpleRNN(nn.Module):
 
 class VAE(nn.Module):
     
-    def __init__(self, x_dim, output_dim, latent_dim, hidden_units_dim=None, device=torch.device('cpu')): # activation_fn?
+    def __init__(self, config): # activation_fn?
         """Variational Autoencoder
         Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
         https://arxiv.org/abs/1312.6114
@@ -54,23 +56,26 @@ class VAE(nn.Module):
 
         Parameters
         ----------
-        x_dim : _type_
-            _description_
-        latent_dim : _type_
-            _description_
+        config : dict
+            Configuration dictionary with keys:
+            - input_dim: Input dimension
+            - output_dim: Output dimension
+            - latent_dim: Latent dimension
+            - hidden_units_dim (optional): Hidden units dimension (defaults to latent_dim)
+            - device (optional): Device to use (defaults to 'cpu')
         """
 
         super().__init__()
 
         self.name = 'vae'
-        self.x_dim = x_dim
-        self.output_dim = output_dim
-        self.latent_dim = latent_dim
-        self.hidden_units_dim = hidden_units_dim if hidden_units_dim is not None else latent_dim
-        self.device = device
+        self.input_dim = config['input_dim']
+        self.output_dim = config['output_dim']
+        self.latent_dim = config['latent_dim']
+        self.hidden_units_dim = config.get('hidden_units_dim', self.latent_dim)
+        self.device = config.get('device', torch.device('cpu'))
 
-        # Encoder: x_dim -> hidden_units_dim (intermediate representation)
-        self.encoder = self.build_encoder(self.x_dim, self.hidden_units_dim)
+        # Encoder: input_dim -> hidden_units_dim (intermediate representation)
+        self.encoder = self.build_encoder(self.input_dim, self.hidden_units_dim)
         # Decoder: latent_dim -> output_dim
         self.decoder = self.build_decoder(self.latent_dim, self.output_dim)
 
@@ -141,16 +146,16 @@ class VAE(nn.Module):
 
 
 class VRNN(VAE): 
-    def __init__(self, x_dim, output_dim, latent_dim, phi_x_dim, phi_z_dim, phi_prior_dim, rnn_hidden_states_dim, rnn_n_layers, hidden_units_dim=None, device=torch.device('cpu')):
-        # x_dim, output_dim, latent_dim, hidden_units_dim=None
-        super().__init__(x_dim=x_dim, output_dim=output_dim, latent_dim=latent_dim, hidden_units_dim=hidden_units_dim, device=device)
+    def __init__(self, config):
+        # input_dim, output_dim, latent_dim, hidden_units_dim=None
+        super().__init__(config)
         
         self.name = 'vrnn'
-        self.rnn_hidden_states_dim = rnn_hidden_states_dim
-        self.rnn_n_layers = rnn_n_layers
-        self.phi_x_dim = phi_x_dim # just h_dim most of the times
-        self.phi_z_dim = phi_z_dim # h_dim
-        self.phi_prior_dim = phi_prior_dim # h_dim
+        self.rnn_hidden_states_dim = config['rnn_hidden_states_dim']
+        self.rnn_n_layers = config['rnn_n_layers']
+        self.phi_x_dim = config['phi_x_dim'] # just h_dim most of the times
+        self.phi_z_dim = config['phi_z_dim'] # h_dim
+        self.phi_prior_dim = config['phi_prior_dim'] # h_dim
 
         # NOTE: in VRNN paper all phi functions have 4 layers combined with ReLU
 
@@ -160,7 +165,7 @@ class VRNN(VAE):
         self.decoder = self.build_decoder(self.phi_z_dim + self.rnn_hidden_states_dim, self.output_dim) # shared with standard RNN (S.4 Models)
 
         # Feature extractors 
-        self.phi_x = self.build_feature_extractor(self.x_dim, self.phi_x_dim)  # shared with standard RNN (S.4 Models)
+        self.phi_x = self.build_feature_extractor(self.input_dim, self.phi_x_dim)  # shared with standard RNN (S.4 Models)
         self.phi_z = self.build_feature_extractor(self.latent_dim, self.phi_z_dim)
         self.phi_prior = self.build_feature_extractor(self.rnn_hidden_states_dim, self.phi_prior_dim)
         self.mu_prior = self.build_fc_mu(self.phi_prior_dim, self.latent_dim)
@@ -168,9 +173,9 @@ class VRNN(VAE):
 
 
         # RNN part
-        # self.recurrence = SimpleRNN(x_dim=self.phi_x_dim + self.phi_z_dim, output_dim=..., hidden_dim=self.rnn_hidden_states_dim, n_layers=self.rnn_n_layers, batch_size=batch_size)
-        self.rnn = nn.GRU(input_size=self.phi_x_dim + self.phi_z_dim, hidden_size=self.rnn_hidden_states_dim, num_layers=self.rnn_n_layers, batch_first=True, device=device)
-        # self.output_layer = nn.Linear(self.rnn_hidden_states_dim, x_dim, device=device)
+        # self.recurrence = SimpleRNN(input_dim=self.phi_x_dim + self.phi_z_dim, output_dim=..., hidden_dim=self.rnn_hidden_states_dim, n_layers=self.rnn_n_layers, batch_size=batch_size)
+        self.rnn = nn.GRU(input_size=self.phi_x_dim + self.phi_z_dim, hidden_size=self.rnn_hidden_states_dim, num_layers=self.rnn_n_layers, batch_first=True, device=self.device)
+        # self.output_layer = nn.Linear(self.rnn_hidden_states_dim, input_dim, device=device)
 
 
     def build_feature_extractor(self, in_dim, out_dim):
@@ -183,9 +188,8 @@ class VRNN(VAE):
 
     def forward(self, x):
         
-        batch_size, seq_len, x_dim = x.size()
-        if x_dim!=self.x_dim: raise ValueError("Incorrect dimensions for input x")
-        # TODO: set to empty, not zeros?
+        batch_size, seq_len, input_dim = x.size()
+        if input_dim!=self.input_dim: raise ValueError("Incorrect dimensions for input x")
         h_prev  = torch.zeros(self.rnn_n_layers, batch_size, self.rnn_hidden_states_dim, device=self.device) # self.n_layers, batch_size, self.hidden_dim
         outputs = []
         mus_latent = []
@@ -194,7 +198,7 @@ class VRNN(VAE):
         logvars_prior = []
 
         for t in range(seq_len):            
-            x_t = x[:, t, :] # x_t has shape (batch_size, x_dim)
+            x_t = x[:, t, :] # x_t has shape (batch_size, input_dim)
             
             # Feature extraction (compute once, use twice)
             phi_x_t = self.phi_x(x_t)
@@ -230,7 +234,7 @@ class VRNN(VAE):
         # self.rnn_hidden_states = self.recurrence.hidden_states
 
         # Stack across time
-        outputs = torch.stack(outputs, dim=1)             # [B, T, x_dim]
+        outputs = torch.stack(outputs, dim=1)             # [B, T, input_dim]
         mus_latent = torch.stack(mus_latent, dim=1)               # [B, T, latent_dim]
         logvars_latent = torch.stack(logvars_latent, dim=1)       # [B, T, latent_dim]
         mus_prior = torch.stack(mus_prior, dim=1)         # [B, T, latent_dim]
@@ -264,10 +268,96 @@ class VRNN(VAE):
         return recon_loss + kl_loss # Eq. 11 : - KL divergence + log posterior
 
 
+class ModuleNetwork(nn.Module):
+    """A multi-module neural network architecture with observation and context modules."""
+    
+    def __init__(self, config):
+        super(ModuleNetwork, self).__init__()
+
+        self.name = 'module_network'  # For Objective class to identify model type
+
+        # Initialize modules (observation module, context module, rule module)
+        self.observation_module = SimpleRNN({
+            'input_dim': config['observation_module']['input_dim'],
+            'output_dim': config['observation_module']['output_dim'],
+            'hidden_dim': config['observation_module']['rnn_hidden_dim'],
+            'n_layers': config['observation_module']['rnn_n_layers'],
+            'device': config.get('device', torch.device('cpu'))
+        }) # can be replaced with VRNN
+        
+        self.context_module = SimpleRNN({
+            'input_dim': config['context_module']['input_dim'],
+            'output_dim': config['context_module']['output_dim'],
+            'hidden_dim': config['context_module']['rnn_hidden_dim'],
+            'n_layers': config['context_module']['rnn_n_layers'],
+            'device': config.get('device', torch.device('cpu'))
+        })
+        # self.rule_module = ...
+        
+        
+        self.readout_obs2ctx = self.inter_module_readout(
+            in_dim=config['observation_module']['output_dim'],
+            out_dim=config['context_module']['input_dim'],
+            bottleneck_dim=config['observation_module']['bottleneck_dim']
+        )
+        
+        self.readout_ctx2obs = self.inter_module_readout(
+            in_dim=config['context_module']['output_dim'],
+            out_dim=config['observation_module']['input_dim'],
+            bottleneck_dim=config['context_module']['bottleneck_dim']
+        )
+
+        # self.readout_obs2ctx = nn.Sequential(
+        #     nn.Linear(config['observation_module']['output_dim'],
+        #               config['observation_module']['bottleneck_dim']),
+        #     nn.ReLU(),
+        #     nn.Linear(config['observation_module']['bottleneck_dim'],
+        #               config['context_module']['input_dim']),
+        # )
+        # self.readout_ctx2obs = nn.Sequential(
+        #     nn.Linear(config['context_module']['output_dim'],
+        #               config['context_module']['bottleneck_dim']),
+        #     nn.ReLU(),
+        #     nn.Linear(config['context_module']['bottleneck_dim'],
+        #               config['observation_module']['input_dim']),
+        # )
+
+    def inter_module_readout(self, in_dim, out_dim, bottleneck_dim):
+        return nn.Sequential(
+            nn.Linear(in_dim, bottleneck_dim),
+            nn.ReLU(),
+            nn.Linear(bottleneck_dim, out_dim),
+        )
+
+
+    def forward(self, x):
+        # First pass: observation module processes input
+        obs_output, obs_hx = self.observation_module(x, return_hidden=True)  # get hidden state
+        # obs_output, obs_hx = self.observation_module(x, hx=obs_hx, return_hidden=True) # Example of "thinking"
+        
+        # Compress and send to context module
+        enc_output = self.readout_obs2ctx(obs_output)
+        context_output = self.context_module(enc_output)  # context module has its own independent hidden state
+            
+        # Feedback: compress context output
+        enc_feedback = self.readout_ctx2obs(context_output)
+        
+        # Second pass: combine context feedback and previous hidden state
+        informed_obs_output = self.observation_module(enc_feedback, hx=obs_hx)
+        
+        return informed_obs_output, context_output
+    
+
+
+
+
+
+
 if __name__ == '__main__':
 
     DEVICE = torch.device('cpu')
 
+    # THIS IS JUST FOR DEBUG TESTING
 
     # Define model dimensions
     batch_size=1
@@ -284,10 +374,30 @@ if __name__ == '__main__':
     phi_z_dim       = rnn_hidden_dim
     phi_prior_dim   = rnn_hidden_dim
 
+    # Create config dictionaries
+    rnn_config = {
+        'input_dim': input_dim,
+        'output_dim': dim_out_obs,
+        'hidden_dim': rnn_hidden_dim,
+        'n_layers': rnn_n_layers,
+        'device': DEVICE
+    }
+    
+    vrnn_config = {
+        'input_dim': input_dim,
+        'output_dim': dim_out_obs,
+        'latent_dim': latent_dim,
+        'phi_x_dim': phi_x_dim,
+        'phi_z_dim': phi_z_dim,
+        'phi_prior_dim': phi_prior_dim,
+        'rnn_hidden_states_dim': rnn_hidden_dim,
+        'rnn_n_layers': rnn_n_layers,
+        'device': DEVICE
+    }
         
     # Define model
-    rnn     = SimpleRNN(x_dim=input_dim, output_dim=dim_out_obs, hidden_dim=rnn_hidden_dim, n_layers=rnn_n_layers)
-    vrnn    = VRNN(x_dim=input_dim, output_dim=dim_out_obs, latent_dim=latent_dim, phi_x_dim=phi_x_dim, phi_z_dim=phi_z_dim, phi_prior_dim=phi_prior_dim, rnn_hidden_states_dim=rnn_hidden_dim, rnn_n_layers=rnn_n_layers)
+    rnn     = SimpleRNN(rnn_config)
+    vrnn    = VRNN(vrnn_config)
     
     y = [1., 2., 1., 2.]
     # Shape should be (batch_size, seq_len, input_dim) since batch_first=True

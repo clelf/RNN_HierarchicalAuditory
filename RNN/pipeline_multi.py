@@ -1,8 +1,8 @@
 import torch
 import os
 import numpy as np
-from pipeline_next import pipeline_model, pipeline_test
-from config import get_model_config, get_data_config
+from pipeline_next import pipeline_train_valid, pipeline_test
+from config import get_base_model_config, get_data_config
 
 
 
@@ -12,9 +12,9 @@ FREQ_MAX = 1650
 
 if __name__=='__main__':
 
-    unit_test = False
+    unit_test = True
 
-    # model_config = get_model_config(unit_test=unit_test)
+    # model_config = get_base_model_config(unit_test=unit_test)
     # data_config = get_data_config(model_config, unit_test=unit_test)
 
     # DEFINE MODEL AND TRAINING PARAMETERS
@@ -32,7 +32,7 @@ if __name__=='__main__':
         "output_dim": 2,  # learn the sufficient statistics mu and var
 
         # RNN configuration
-        "rnn_hidden_dim": [16, 32, 64] if not unit_test else [16],  # prev: 8  # [16], #
+        "rnn_hidden_dims": [16, 32, 64] if not unit_test else [16, 32],  # scalar or list of hidden dims to try
         "rnn_n_layers": 1,  # number of RNN layers
 
         # Training parameters
@@ -119,7 +119,7 @@ if __name__=='__main__':
     
     # TRAINING MODEL WITH NON HIERARCHICAL GM AND SINGLE CONTEXT
     print("Running N_ctx = 1")
-    pipeline_model(model_config, data_config)
+    pipeline_train_valid(model_config, data_config)
 
 
     # TESTING TRAINED MODELS
@@ -144,7 +144,7 @@ if __name__=='__main__':
     #         if data_config["gm_name"] == "HierarchicalGM":
     #             data_config.update(add_hierarchical_params)
             
-    #         pipeline_model(model_config, data_config)
+    #         pipeline_train_valid(model_config, data_config)
 
 
 

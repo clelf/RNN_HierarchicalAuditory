@@ -1,4 +1,5 @@
-from model import SimpleRNN, VRNN
+from model import SimpleRNN, VRNN, ModuleNetwork
+from objectives import Objective
 import os
 from pathlib import Path
 import torch
@@ -15,6 +16,15 @@ from tqdm import tqdm
 import pickle
 import warnings
 warnings.filterwarnings('error')
+from multiprocessing import cpu_count
+
+# Try to import pathos for better multiprocessing (handles lambdas/closures)
+# Falls back to standard multiprocessing if not available
+try:
+    from pathos.multiprocessing import ProcessingPool
+    HAS_PATHOS = True
+except ImportError:
+    HAS_PATHOS = False
 
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -23,22 +33,43 @@ from PreProParadigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
 
 # Check which folder exists and append the correct path
 base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-kalman_folder = None
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 if os.path.exists(os.path.join(base_path, 'Kalman')):
-    from Kalman.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch, kalman_fit_predict_batch, kalman_fit_context_aware_batch, kalman_fit_context_aware_predict_batch, MIN_OBS_FOR_EM
+    from Kalman.kalman import kalman_fit_predict_batch, kalman_fit_predict_multicontext_batch, MIN_OBS_FOR_EM, kalman_fit_predict, kalman_fit_predict_multicontext
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
-    from KalmanFilterViz1D.kalman import kalman_tau, plot_estim, kalman_batch, kalman_fit_batch, kalman_fit_predict_batch, kalman_fit_context_aware_batch, kalman_fit_context_aware_predict_batch, MIN_OBS_FOR_EM
+    from KalmanFilterViz1D.kalman import kalman_fit_predict_batch, kalman_fit_predict_multicontext_batch, MIN_OBS_FOR_EM, kalman_fit_predict, kalman_fit_predict_multicontext
 else:
     raise ImportError("Neither 'Kalman' nor 'KalmanFilterViz1D' folder found.")
-
-
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 FREQ_MIN = 1400
 FREQ_MAX = 1650
 
+
+def contexts_to_responsibilities(contexts, n_ctx):
+    """
+    Convert hard context labels to one-hot responsibilities (soft assignments).
+    
+    This function bridges the gap between generative models that produce hard
+    context labels and Kalman filter functions that expect soft responsibilities.
+    
+    Parameters
+    ----------
+    contexts : np.array
+        1D integer array of shape (T,) with values in [0, n_ctx-1]
+    n_ctx : int
+        Number of contexts
+    
+    Returns
+    -------
+    responsibilities : np.array
+        One-hot encoded array of shape (T, n_ctx) where each row sums to 1.0
+    """
+    T = len(contexts)
+    responsibilities = np.zeros((T, n_ctx))
+    responsibilities[np.arange(T), contexts.astype(int)] = 1.0
+    return responsibilities
 
 
 # TODO CHECK-LIST
@@ -76,6 +107,198 @@ class MinMaxScaler():
     
     def denormalize_var(self, var_norm):
         return var_norm * (self.freq_max - self.freq_min)**2
+
+
+# =============================================================================
+# Data Mode and Learning Objective Helpers
+# =============================================================================
+
+# Supported data modes (determines data generation and context handling):
+#   'single_ctx': Single context scenario (N_ctx=1), works with SimpleRNN/VRNN
+#   'multi_ctx': Multi-context scenario (N_ctx>1), contexts are generated and available
+VALID_DATA_MODES = ['single_ctx', 'multi_ctx']
+
+# Supported learning objectives for ModuleNetwork (only applies when data_mode='multi_ctx'):
+#   'obs': Train observation module only (hidden process prediction)
+#   'ctx': Train context module only (context inference)  
+#   'obs_ctx': Train both modules with combined loss (weighted by kappa)
+VALID_LEARNING_OBJECTIVES = ['obs', 'ctx', 'obs_ctx']
+
+# Kappa values to explore for 'obs_ctx' learning objective
+# kappa=1.0 means full weight on observation loss, kappa=0.0 on context loss
+DEFAULT_KAPPA_VALUES = [0.3, 0.5, 0.7]
+
+
+def prepare_batch_data(gm, gm_name, data_mode, device, return_pars=False):
+    """
+    Generate a batch of data and prepare tensors based on data mode.
+    
+    Parameters
+    ----------
+    gm : NonHierachicalAuditGM or HierarchicalAuditGM
+        The generative model instance
+    gm_name : str
+        Name of the generative model ('NonHierarchicalGM' or 'HierarchicalGM')
+    data_mode : str
+        Data mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+    device : str or torch.device
+        Device to place tensors on
+    return_pars : bool
+        Whether to return the parameters used for generation
+    
+    Returns
+    -------
+    dict
+        Dictionary containing:
+        - 'y': Observation tensor of shape (batch, seq_len, 1)
+        - 'contexts': Context tensor of shape (batch, seq_len) if data_mode='multi_ctx', else None
+        - 'pars': Parameters dict if return_pars=True, else None
+    """
+    if gm_name == 'NonHierarchicalGM':
+        if return_pars:
+            contexts, _, y, pars = gm.generate_batch(return_pars=True)
+        else:
+            contexts, _, y = gm.generate_batch(return_pars=False)
+            pars = None
+    elif gm_name == 'HierarchicalGM':
+        if return_pars:
+            _, _, _, _, _, contexts, _, y, pars = gm.generate_batch(return_pars=True)
+        else:
+            _, _, _, _, _, contexts, _, y = gm.generate_batch(return_pars=False)
+            pars = None
+    else:
+        raise ValueError(f"Invalid GM name: {gm_name}")
+    
+    # Convert observations to tensor
+    y_tensor = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
+    
+    # Prepare context tensor if in multi-context mode
+    if data_mode == 'multi_ctx':
+        # contexts is a numpy array of shape (batch, seq_len) with integer context labels
+        contexts_tensor = torch.tensor(contexts, dtype=torch.long, requires_grad=False).to(device)
+    else:
+        contexts_tensor = None
+    
+    return {
+        'y': y_tensor,
+        'contexts': contexts_tensor,
+        'pars': pars
+    }
+
+
+def prepare_benchmark_data(benchmarks, data_mode, device):
+    """
+    Prepare benchmark data for validation based on data mode.
+    
+    Parameters
+    ----------
+    benchmarks : dict
+        Benchmark dictionary containing 'y', 'contexts', 'mu_kal_pred', etc.
+    data_mode : str
+        Data mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+    device : str or torch.device
+        Device to place tensors on
+    
+    Returns
+    -------
+    dict
+        Dictionary containing prepared tensors and benchmark data
+    """
+    y = benchmarks['y']
+    y_tensor = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(-1).to(device)
+    
+    result = {
+        'y': y_tensor,
+        'mu_kal_pred': benchmarks['mu_kal_pred'],
+        'sigma_kal_pred': benchmarks['sigma_kal_pred'],
+        'mse_kal': benchmarks['perf'],
+        'pars': benchmarks['pars'],
+        'min_obs_for_em': benchmarks.get('min_obs_for_em', MIN_OBS_FOR_EM),
+    }
+    
+    if data_mode == 'multi_ctx':
+        contexts = benchmarks.get('contexts')
+        if contexts is not None:
+            result['contexts'] = torch.tensor(contexts, dtype=torch.long, requires_grad=False).to(device)
+        else:
+            result['contexts'] = None
+    else:
+        result['contexts'] = None
+    
+    return result
+
+
+def compute_model_loss(model, objective, y_tensor, model_output, data_mode, learning_objective='obs_ctx', contexts_tensor=None, kappa=0.5):
+    """
+    Compute loss based on model type, data mode, and learning objective.
+    
+    Parameters
+    ----------
+    model : nn.Module
+        The model (SimpleRNN, VRNN, or ModuleNetwork)
+    objective : Objective
+        The objective function wrapper
+    y_tensor : torch.Tensor
+        Target observations of shape (batch, seq_len, 1)
+    model_output : tuple or torch.Tensor
+        Output from model forward pass
+    data_mode : str
+        Data mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+    learning_objective : str
+        Learning objective for ModuleNetwork: 'obs', 'ctx', or 'obs_ctx' (default)
+        Only used when data_mode='multi_ctx' and model is ModuleNetwork
+    contexts_tensor : torch.Tensor, optional
+        Target contexts for ModuleNetwork training
+    kappa : float
+        Weighting factor between observation and context losses (default: 0.5)
+        Only used when learning_objective='obs_ctx'
+    
+    Returns
+    -------
+    torch.Tensor
+        The computed loss
+    """
+    if data_mode == 'multi_ctx' and model.name == 'module_network':
+        # ModuleNetwork returns (obs_output, context_output)
+        # Pass learning_objective to control which loss components are used
+        return objective.loss(model, y_tensor[:, 1:, :], model_output, 
+                             target_ctx=contexts_tensor[:, 1:],
+                             kappa=kappa, learning_objective=learning_objective)
+    else:
+        # Standard RNN/VRNN loss
+        return objective.loss(model, y_tensor[:, 1:, :], model_output)
+
+
+def extract_model_predictions(model, model_output):
+    """
+    Extract mu and variance estimates from model output based on model type.
+    
+    Parameters
+    ----------
+    model : nn.Module
+        The model (SimpleRNN, VRNN, or ModuleNetwork)
+    model_output : tuple or torch.Tensor
+        Output from model forward pass
+    
+    Returns
+    -------
+    tuple
+        (mu_estim, var_estim, context_output) where context_output is None for non-ModuleNetwork models
+    """
+    if model.name == 'module_network':
+        obs_output, context_output = model_output
+        model_output_dist = obs_output
+    elif model.name == 'vrnn':
+        model_output_dist = model_output[0]
+        context_output = None
+    else:
+        model_output_dist = model_output
+        context_output = None
+    
+    mu_estim = model_output_dist[..., 0].detach().cpu().numpy()
+    var_estim = (F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()
+    
+    return mu_estim, var_estim, context_output
 
 
 def bin_params(data_config):
@@ -222,11 +445,129 @@ def benchmark_filename(benchmarkpath, N_ctx, gm_name, N_samples, suffix=''):
     return benchmarkpath / get_ctx_gm_subpath(N_ctx, gm_name) / f"benchmarks_{N_samples}{suffix}.pkl"
 
 
-def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, benchmarkpath=None, save=False, suffix=''):
+def benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, N_samples, suffix=''):
+    """Get directory for individual benchmark files."""
+    if suffix != '':
+        suffix = '_' + suffix
+    return benchmarkpath / get_ctx_gm_subpath(N_ctx, gm_name) / f"benchmarks_{N_samples}{suffix}_individual"
+
+
+def aggregate_individual_benchmarks(benchmarkpath, N_ctx, gm_name, N_samples, suffix=''):
+    """
+    Aggregate individual benchmark files into a single benchmark file.
+    
+    This function reads all sample-wise .pkl files from the individual directory,
+    stacks them into arrays, and saves the aggregated benchmark file.
+    
+    Returns:
+        dict: Aggregated benchmark dictionary, or None if no individual files found
+    """
+    incr_dir = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, N_samples, suffix)
+    final_file = benchmark_filename(benchmarkpath, N_ctx, gm_name, N_samples, suffix)
+    
+    if not incr_dir.exists():
+        print(f"  No individual directory found at {incr_dir}")
+        return None
+    
+    # Find all sample files
+    sample_files = sorted(incr_dir.glob("sample_*.pkl"), key=lambda f: int(f.stem.split('_')[1]))
+    
+    if len(sample_files) == 0:
+        print(f"  No sample files found in {incr_dir}")
+        return None
+    
+    print(f"  Found {len(sample_files)} individual sample files, aggregating...")
+    
+    # Load all samples
+    samples = []
+    for sf in sample_files:
+        with open(sf, 'rb') as f:
+            samples.append(pickle.load(f))
+    
+    # Stack arrays from all samples
+    benchmark_kit = {
+        'y': np.stack([s['y'] for s in samples], axis=0),
+        'contexts': np.stack([s['contexts'] for s in samples], axis=0) if samples[0]['contexts'] is not None else None,
+        'mu_kal_pred': np.stack([s['mu_kal_pred'] for s in samples], axis=0),
+        'sigma_kal_pred': np.stack([s['sigma_kal_pred'] for s in samples], axis=0),
+        'pars': {key: np.stack([s['pars'][key] for s in samples], axis=0) for key in samples[0]['pars'].keys()},
+        'perf': np.array([s['perf'] for s in samples]),
+        'n_ctx': samples[0]['n_ctx'],
+        'min_obs_for_em': samples[0]['min_obs_for_em'],
+    }
+    
+    # Save aggregated file
+    with open(final_file, 'wb') as f:
+        pickle.dump(benchmark_kit, f)
+    print(f"  Benchmark saved to {final_file}")
+    
+    return benchmark_kit
+
+
+def _process_single_kf_sample(args):
+    """
+    Process a single sample for KF benchmarking. Helper for parallel processing.
+    
+    Args:
+        args: Tuple of (i, y_i, ctx_i, pars_i, n_ctx, n_iter, incr_dir)
+            - i: Sample index
+            - y_i: Observation array of shape (T,)
+            - ctx_i: Context array of shape (T,) or None
+            - pars_i: Parameters dict for this sample
+            - n_ctx: Number of contexts
+            - n_iter: Number of EM iterations
+            - incr_dir: Path to save individual sample files (or None to skip saving)
+    
+    Returns:
+        dict: Sample data dictionary with 'y', 'contexts', 'mu_kal_pred', 'sigma_kal_pred', 
+              'pars', 'perf', 'n_ctx', 'min_obs_for_em'
+    """
+    i, y_i, ctx_i, pars_i, n_ctx, n_iter, incr_dir = args
+    
+    # Fit Kalman filter for this single sample
+    if n_ctx == 1:
+        mu_pred_i, sigma_pred_i, _ = kalman_fit_predict(y_i, n_iter=n_iter)
+    else:
+        # Convert context labels to responsibilities for multicontext KF
+        responsibilities_i = contexts_to_responsibilities(ctx_i, n_ctx)
+        mu_pred_i, sigma_pred_i, _ = kalman_fit_predict_multicontext(
+            y_i, responsibilities_i, n_iter=n_iter
+        )
+    
+    # Compute MSE for this sample
+    mse_i = ((mu_pred_i - y_i[MIN_OBS_FOR_EM:]) ** 2).mean()
+    
+    # Build sample data
+    sample_data = {
+        'y': y_i,
+        'contexts': ctx_i,
+        'mu_kal_pred': mu_pred_i,
+        'sigma_kal_pred': sigma_pred_i,
+        'pars': pars_i,
+        'perf': float(mse_i),
+        'n_ctx': n_ctx,
+        'min_obs_for_em': MIN_OBS_FOR_EM,
+    }
+    
+    # Save this sample if directory provided
+    if incr_dir is not None:
+        sample_file = incr_dir / f"sample_{i:06d}.pkl"
+        with open(sample_file, 'wb') as f:
+            pickle.dump(sample_data, f)
+    
+    return sample_data
+
+
+def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, benchmarkpath=None, save=False, suffix='', individual=True, max_workers=None):
     """
     Benchmarks the Kalman filter on a batch of data, tracking MSE along parameter configurations.
     Uses standard Kalman filter for single-context (N_ctx=1) and context-aware Kalman filter
     for multi-context (N_ctx>1) scenarios.
+    
+    Supports individual saving: each sample is saved individually so that progress is not lost
+    if the computation is interrupted. Use individual=True (default) for long-running jobs.
+    
+    Supports parallel processing: set max_workers > 1 to process multiple samples simultaneously.
 
     Args:
         data_config (dict): Configuration parameters for the data generative model.
@@ -235,6 +576,12 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
         benchmarkpath (Path or None): Path to save the benchmark file. If None, benchmarks are not saved.
         save (bool): Whether to save the benchmark data.
         suffix (str): Suffix for the benchmark filename.
+        individual (bool): If True, save each sample individually to avoid losing progress on crash.
+                           The samples are aggregated at the end. Default: True.
+        max_workers (int, optional): Number of parallel workers for KF fitting.
+                                     None or 1 = sequential processing (default).
+                                     >1 = parallel processing with that many workers.
+                                     -1 = use all available CPU cores.
 
     Returns:
         dict: A dictionary containing observations, contexts (if N_ctx>1), Kalman estimates, 
@@ -246,53 +593,139 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
     elif gm_name == 'HierarchicalGM': gm = HierarchicalAuditGM(data_config)
     else: raise ValueError("Invalid GM name")
     
-    # Generate a batch of data
+    # Determine number of samples
     if N_samples is None:
         N_samples = data_config["N_samples"]
-    else:
-        N_samples = N_samples
     
-    # Generate batch - includes contexts and states
-    if gm_name == 'NonHierarchicalGM':
-        contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
-    elif gm_name == 'HierarchicalGM':
-        # rules, rules_long, dpos, timbres, timbres_long, contexts, states, obs, pars
-        _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
-
-    # Fit Kalman filters - get predictions (for MSE and visualization)
-    # Note: kalman_fit_predict functions return T-MIN_OBS_FOR_EM predictions (EM needs min 3 observations)
-    #   y_hat[t] predicts y[t+MIN_OBS_FOR_EM] based on parameters fit on y[0:t+MIN_OBS_FOR_EM]
-    if data_config["N_ctx"] == 1:
-        # Standard Kalman filter for single context
-        kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_batch(y_batch, n_iter=n_iter)
-    else:
-        # Context-aware Kalman filter for multiple contexts
-        kalman_mu_pred, kalman_sigma_pred = kalman_fit_context_aware_predict_batch(
-            y_batch, contexts_batch, n_iter=n_iter
-        )
+    # Determine parallelization settings
+    if max_workers == -1:
+        max_workers = cpu_count()
+    use_parallel = HAS_PATHOS and max_workers is not None and max_workers > 1 and N_samples > 1
+    if use_parallel:
+        print(f"  Parallel processing enabled with {max_workers} workers (pathos available: {HAS_PATHOS})")
     
-    # Compute MSE using PREDICTIONS: compare KF prediction at t with observation at t+MIN_OBS_FOR_EM
-    # kalman_mu_pred has shape (N_samples, T-MIN_OBS_FOR_EM) where kalman_mu_pred[:, t] predicts y[:, t+MIN_OBS_FOR_EM]
-    mses = ((kalman_mu_pred - y_batch[:, MIN_OBS_FOR_EM:]) ** 2).mean(axis=1)  # shape: (N_samples,)
+    # Set up individual directory if needed
+    if save and individual and benchmarkpath is not None:
+        incr_dir = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, N_samples, suffix)
+        os.makedirs(incr_dir, exist_ok=True)
+        
+        # Check if we have saved input data from a previous run (for reproducibility on resume)
+        input_data_file = incr_dir / "input_data.pkl"
+        
+        # Check which samples already exist (for resuming)
+        existing_samples = set(int(f.stem.split('_')[1]) for f in incr_dir.glob("sample_*.pkl"))
+        start_sample = len(existing_samples)
+        
+        if input_data_file.exists() and start_sample > 0:
+            # Resume: load the original input data to ensure consistency
+            print(f"  Resuming from sample {start_sample}/{N_samples} (found {start_sample} existing samples)")
+            print(f"  Loading original input data for consistency...")
+            with open(input_data_file, 'rb') as f:
+                input_data = pickle.load(f)
+            y_batch = input_data['y']
+            contexts_batch = input_data['contexts']
+            pars_batch = input_data['pars']
+        else:
+            # Fresh start: generate new samples and save input data
+            print(f"  Generating {N_samples} samples...")
+            if gm_name == 'NonHierarchicalGM':
+                contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
+            elif gm_name == 'HierarchicalGM':
+                _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
+            
+            # Save input data for potential resume
+            input_data = {'y': y_batch, 'contexts': contexts_batch, 'pars': pars_batch}
+            with open(input_data_file, 'wb') as f:
+                pickle.dump(input_data, f)
+            print(f"  Input data saved")
+    else:
+        existing_samples = set()
+        start_sample = 0
+        incr_dir = None  # No saving in non-individual mode
+        # Generate samples (non-individual mode)
+        print(f"  Generating {N_samples} samples...")
+        if gm_name == 'NonHierarchicalGM':
+            contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
+        elif gm_name == 'HierarchicalGM':
+            _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
+    
+    # Process sample-by-sample with individual saving (supports parallel processing)
+    if individual and save and benchmarkpath is not None:
+        # Build list of samples to process (skip already-processed ones)
+        samples_to_process = [i for i in range(N_samples) if i not in existing_samples]
+        
+        if len(samples_to_process) == 0:
+            print(f"  All {N_samples} samples already processed.")
+        else:
+            print(f"  Processing {len(samples_to_process)} samples with individual saving...")
+            
+            # Prepare arguments for each sample
+            args_list = [
+                (i, 
+                 y_batch[i], 
+                 contexts_batch[i] if contexts_batch is not None else None,
+                 {key: val[i] for key, val in pars_batch.items()},
+                 N_ctx,
+                 n_iter,
+                 incr_dir)
+                for i in samples_to_process
+            ]
+            
+            if use_parallel:
+                # Parallel processing with pathos
+                print(f"  Using {max_workers} parallel workers...")
+                with ProcessingPool(nodes=max_workers) as pool:
+                    # Use imap for progress tracking
+                    results = list(tqdm(
+                        pool.imap(_process_single_kf_sample, args_list),
+                        total=N_samples,
+                        desc="KF fitting (parallel)",
+                        initial=start_sample
+                    ))
+            else:
+                # Sequential processing with progress bar
+                for args in tqdm(args_list, desc="KF fitting", total=N_samples, initial=start_sample):
+                    _process_single_kf_sample(args)
+        
+        # Aggregate all individual files into final benchmark file
+        print(f"  Aggregating individual files...")
+        benchmark_kit = aggregate_individual_benchmarks(benchmarkpath, N_ctx, gm_name, N_samples, suffix)
+        
+    else:
+        # Original batch processing (faster but no crash recovery)
+        print(f"  Fitting Kalman filters (batch mode)...")
+        if N_ctx == 1:
+            kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_batch(y_batch, n_iter=n_iter)
+        else:
+            # Convert context labels to responsibilities for multicontext KF
+            responsibilities_batch = np.array([
+                contexts_to_responsibilities(contexts_batch[i], N_ctx) 
+                for i in range(len(contexts_batch))
+            ])  # Shape: (N_samples, T, N_ctx)
+            kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_multicontext_batch(
+                y_batch, responsibilities_batch, n_iter=n_iter
+            )
+        
+        # Compute MSE
+        mses = ((kalman_mu_pred - y_batch[:, MIN_OBS_FOR_EM:]) ** 2).mean(axis=1)
 
-    # Return observations, Kalman estimates, parameters, and performance
-    benchmark_kit = {
-        'y': y_batch,                        # shape: (N_samples, T)
-        'contexts': contexts_batch,
-        'mu_kal_pred': kalman_mu_pred,       # shape: (N_samples, T-MIN_OBS_FOR_EM), predicts y[:, MIN_OBS_FOR_EM:]
-        'sigma_kal_pred': kalman_sigma_pred, # shape: (N_samples, T-MIN_OBS_FOR_EM)
-        'pars': pars_batch, 
-        'perf': mses,
-        'n_ctx': N_ctx,
-        'min_obs_for_em': MIN_OBS_FOR_EM     # Store for downstream alignment
-    }
+        benchmark_kit = {
+            'y': y_batch,
+            'contexts': contexts_batch,
+            'mu_kal_pred': kalman_mu_pred,
+            'sigma_kal_pred': kalman_sigma_pred,
+            'pars': pars_batch, 
+            'perf': mses,
+            'n_ctx': N_ctx,
+            'min_obs_for_em': MIN_OBS_FOR_EM
+        }
 
-    if save:
-        benchmark_file = benchmark_filename(benchmarkpath, N_ctx, gm_name, N_samples, suffix=suffix)
-        if benchmarkpath is not None and not benchmark_file.parent.exists():
-            os.makedirs(benchmark_file.parent)
-        with open(benchmark_file, 'wb') as f:
-            pickle.dump(benchmark_kit, f)
+        if save:
+            benchmark_file = benchmark_filename(benchmarkpath, N_ctx, gm_name, N_samples, suffix=suffix)
+            if benchmarkpath is not None and not benchmark_file.parent.exists():
+                os.makedirs(benchmark_file.parent)
+            with open(benchmark_file, 'wb') as f:
+                pickle.dump(benchmark_kit, f)
 
     return benchmark_kit
 
@@ -373,12 +806,12 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     print(f"  Saved binned metrics to {save_path / f'binned_metrics_kalman{suffix_str}.csv'}")
 
 
-def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_config, save_path, benchmarks=None, device=DEVICE, seq_len_viz=None):
+def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_config, save_path, benchmarks=None, device=DEVICE, seq_len_viz=None, data_mode='single_ctx', learning_objective='obs_ctx', kappa=0.5):
     """
-    Train the model to predict the next observation.
+    Train the model to predict the next observation (and optionally infer contexts).
     
     Args:
-        model: The RNN model to train
+        model: The RNN model to train (SimpleRNN, VRNN, or ModuleNetwork)
         model_config: Model configuration dictionary
         lr: Learning rate
         lr_id: Learning rate index for logging
@@ -389,8 +822,26 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
         save_path: Path to save results
         benchmarks: Optional benchmark dictionary containing Kalman filter results for comparison
         device: Device to run on (cuda/cpu)
+        seq_len_viz: Sequence length for visualization (optional)
+        data_mode: Data mode - 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+        learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
+                           Only used when data_mode='multi_ctx' and model is ModuleNetwork
+        kappa: Weight for observation loss in combined loss (only used when learning_objective='obs_ctx')
+               total_loss = kappa * obs_loss + (1 - kappa) * ctx_loss
     
     """
+    # Validate data mode
+    if data_mode not in VALID_DATA_MODES:
+        raise ValueError(f"Invalid data_mode: {data_mode}. Must be one of {VALID_DATA_MODES}")
+    
+    # Check model compatibility with data mode
+    if data_mode == 'multi_ctx' and model.name != 'module_network':
+        raise ValueError(f"data_mode='multi_ctx' requires ModuleNetwork, got {model.name}")
+    
+    # Validate learning objective for ModuleNetwork
+    if model.name == 'module_network' and learning_objective not in VALID_LEARNING_OBJECTIVES:
+        raise ValueError(f"Invalid learning_objective: {learning_objective}. Must be one of {VALID_LEARNING_OBJECTIVES}")
+    
     # Set optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=model_config["weight_decay"])
     
@@ -420,8 +871,14 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
     if use_benchmarks:
         model_kf_mse_report = []
 
-    # Define loss instance
-    loss_function   = torch.nn.GaussianNLLLoss(reduction='mean') # GaussianNLL
+    # Define loss instance using Objective class for model-agnostic loss computation
+    loss_function = torch.nn.GaussianNLLLoss(reduction='mean')
+    # For ModuleNetwork with context learning, add CrossEntropyLoss for context classification
+    if data_mode == 'multi_ctx' and learning_objective in ['ctx', 'obs_ctx']:
+        loss_function_ctx = torch.nn.CrossEntropyLoss(reduction='mean')
+        objective = Objective(loss_function, loss_func_ctx=loss_function_ctx) # TODO: make Objective more modular 
+    else:
+        objective = Objective(loss_function)
 
     # Track learning of model parameters 
     weights_updates   = []
@@ -441,18 +898,17 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
 
             optimizer.zero_grad()
             
-            # Generate data (N_samples samples)
-            if gm_name == 'NonHierarchicalGM':
-                _, _, y = gm.generate_batch(return_pars=False)
-            elif gm_name == 'HierarchicalGM':
-                _, _, _, _, _, _, _, y = gm.generate_batch(return_pars=False)
-
-            y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
+            # Generate data (N_samples samples) using helper function
+            batch_data = prepare_batch_data(gm, gm_name, data_mode, device, return_pars=False)
+            y = batch_data['y']
+            contexts = batch_data['contexts']  # None if data_mode='single_ctx'
 
             # Always train to predict the next observation
             # Input: y[0:T-1], Target: y[1:T]
             model_output = model(y[:, :-1, :])
-            loss = model.loss(y[:, 1:, :], model_output, loss_func=loss_function)
+            loss = compute_model_loss(model, objective, y, model_output, data_mode, 
+                                       learning_objective=learning_objective,
+                                       contexts_tensor=contexts, kappa=kappa)
 
             # Learning model weigths
             # Only compute weight changes when you're going to log them
@@ -494,32 +950,30 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
         with torch.no_grad():    
             # If benchmarks available, use benchmark batch, else, generate new batch
             if use_benchmarks:
-                y = benchmarks['y']
-                y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(-1).to(device)
-                # Use predictions for MSE comparison with model and visualization
-                # mu_kal_filt = benchmarks['mu_kal_filt']  # Filtered estimates - not used
-                # sigma_kal_filt = benchmarks['sigma_kal_filt']
-                mu_kal_pred = benchmarks['mu_kal_pred']
-                sigma_kal_pred = benchmarks['sigma_kal_pred']
-                mse_kal = benchmarks['perf']
-                pars_bench = benchmarks['pars']
+                bench_data = prepare_benchmark_data(benchmarks, data_mode, device)
+                y = bench_data['y']
+                contexts_valid = bench_data['contexts']  # None if data_mode='single_ctx'
+                mu_kal_pred = bench_data['mu_kal_pred']
+                sigma_kal_pred = bench_data['sigma_kal_pred']
+                mse_kal = bench_data['mse_kal']
+                pars_bench = bench_data['pars']
+                min_obs = bench_data['min_obs_for_em']
             else:
-                _, _, y, pars_bench = gm.generate_batch(return_pars=True)
-                y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
+                batch_data = prepare_batch_data(gm, gm_name, data_mode, device, return_pars=True)
+                y = batch_data['y']
+                contexts_valid = batch_data['contexts']
+                pars_bench = batch_data['pars']
             
             
             # Always predict next observation
             # Input: y[0:T-1], Target: y[1:T]
             model_output = model(y[:, :-1, :]) # model is given y[0:T-1] to predict y[1:T]
-            valid_loss = model.loss(y[:, 1:, :], model_output, loss_func=loss_function).detach().cpu().numpy()
+            valid_loss = compute_model_loss(model, objective, y, model_output, data_mode,
+                                            learning_objective=learning_objective,
+                                            contexts_tensor=contexts_valid, kappa=kappa).detach().cpu().numpy()
 
-            # Get estimated distribution
-            if model.name=='vrnn': model_output_dist = model_output[0]
-            else: model_output_dist = model_output
-
-            # Extract model's output
-            mu_estim = model_output_dist[...,0].detach().cpu().numpy()
-            var_estim = (F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()
+            # Extract model's predictions using helper function
+            mu_estim, var_estim, context_output = extract_model_predictions(model, model_output)
             
 
             # Compute standard deviation                    
@@ -591,27 +1045,26 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
         weights_updates = torch.stack(weights_updates, dim=1)
         plot_weights(train_steps, weights_updates, list(param_names), lr_title, save_path=save_path/f'weights_updates_lr{lr_id}.png')
 
-    if model_config["use_minmax"]:
-        return minmax_train
-    else:
-        return None
 
 
 
-def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax_train, device=DEVICE, benchmarks=None):
+def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, device=DEVICE, benchmarks=None, data_mode='single_ctx', learning_objective='obs_ctx', kappa=0.5):
     """
     Test the model on held-out data.
     
     Args:
-        model: The RNN model to test
+        model: The RNN model to test (SimpleRNN, VRNN, or ModuleNetwork)
         model_config: Model configuration dictionary
         lr: Learning rate (for logging)
         lr_id: Learning rate index for logging
+        gm_name: Name of the generative model
         data_config: Data configuration dictionary
         save_path: Path to save results
-        minmax_train: MinMaxScaler used during training (or None)
         device: Device to run on (cuda/cpu)
         benchmarks: Optional benchmark dictionary containing Kalman filter results for comparison
+        data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+        learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
+        kappa: Weight for observation loss in combined loss (only used when learning_objective='obs_ctx')
     
     Returns:
         tuple: 
@@ -631,8 +1084,7 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
 
     # Paths 
     if not os.path.exists(save_path):
-        return
-        # raise ValueError("Model has not been trained yet - no folder found")
+        raise ValueError("Model has not been trained yet - no folder found")
 
     # Load the saved weights
     model.load_state_dict(torch.load(f'{save_path}/lr{lr_id}_weights.pth'))
@@ -661,17 +1113,25 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
 
     # If benchmarks provided, use benchmark data; else generate new test data
     if use_benchmarks:
-        y = benchmarks['y']
-        y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(-1).to(device)
-        mu_kal_pred = benchmarks['mu_kal_pred']
-        sigma_kal_pred = benchmarks['sigma_kal_pred']
-        pars = benchmarks['pars']
-        mse_kal = benchmarks['perf']
+        bench_data = prepare_benchmark_data(benchmarks, data_mode, device)
+        y = bench_data['y']
+        contexts_test = bench_data['contexts']  # None if data_mode='single_ctx'
+        mu_kal_pred = bench_data['mu_kal_pred']
+        sigma_kal_pred = bench_data['sigma_kal_pred']
+        pars = bench_data['pars']
+        mse_kal = bench_data['mse_kal']
         test_mse_kal = mse_kal  # Store KF MSE for return
     else:
-        # Generate data
-        _, _, y, pars = gm.generate_batch(N_samples=model_config["batch_size_test"], return_pars=True)
-        y = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
+        # Generate data using helper function
+        batch_data = prepare_batch_data(gm, gm_name, data_mode, device, return_pars=True)
+        # Override batch size for testing
+        data_config_test = data_config.copy()
+        data_config_test['N_samples'] = model_config["batch_size_test"]
+        gm_test = NonHierachicalAuditGM(data_config_test) if gm_name == 'NonHierarchicalGM' else HierarchicalAuditGM(data_config_test)
+        batch_data = prepare_batch_data(gm_test, gm_name, data_mode, device, return_pars=True)
+        y = batch_data['y']
+        contexts_test = batch_data['contexts']
+        pars = batch_data['pars']
    
 
     with torch.no_grad():
@@ -679,13 +1139,8 @@ def test(model, model_config, lr, lr_id, gm_name, data_config, save_path, minmax
         # Input: y[0:T-1], Target: y[1:T]
         model_output = model(y[:, :-1, :])
 
-        # Get estimated distribution
-        if model.name=='vrnn': model_output_dist = model_output[0]
-        else: model_output_dist = model_output
-        
-        # Extract model's output
-        mu_estim = model_output_dist[...,0].detach().cpu().numpy()
-        var_estim = (F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()
+        # Extract model's predictions using helper function
+        mu_estim, var_estim, context_output = extract_model_predictions(model, model_output)
 
         # Compute standard deviation                    
         sigma_estim = np.sqrt(var_estim)
@@ -925,9 +1380,11 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
 
 
 
-def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True):
+def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_workers=None):
     """
     Load precomputed benchmarks if available, otherwise compute and save them.
+    
+    Supports resuming from partial individual computation if the job was interrupted.
     
     Args:
         data_config: Data configuration dictionary
@@ -935,6 +1392,8 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
         N_ctx: Number of contexts
         gm_name: Name of the generative model
         visualize: Whether to visualize parameter distributions for newly computed benchmarks
+        max_workers: Number of parallel workers for KF fitting. None or 1 = sequential, 
+                     >1 = parallel with that many workers, -1 = use all CPU cores.
     
     Returns:
         tuple: (benchmarks_train, benchmarks_test)
@@ -942,16 +1401,28 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
     benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
     benchmarkfile_train = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='train')
     benchmarkfile_test = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='test')
+    
+    # Check for individual directories (partial computation from previous interrupted run)
+    incr_dir_train = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='train')
+    incr_dir_test = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, model_config['batch_size_test'], suffix='test')
 
     benchmarks_exist = benchmarkfile_train.exists() and benchmarkfile_test.exists()
     
     if not benchmarks_exist:
-        # Compute benchmarks if not existing
-        # Uses standard KF for N_ctx=1, context-aware KF for N_ctx>1
-        print("Computing benchmarks...")
+        # Check if we have partial individual results to resume from
+        has_partial_train = incr_dir_train.exists() and len(list(incr_dir_train.glob("sample_*.pkl"))) > 0
+        has_partial_test = incr_dir_test.exists() and len(list(incr_dir_test.glob("sample_*.pkl"))) > 0
+        
+        if has_partial_train or has_partial_test:
+            print("Found partial individual benchmarks from previous run, resuming...")
+        else:
+            print("Computing benchmarks...")
+        
         print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-        benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train')
-        benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test')
+        
+        # Compute/resume benchmarks (individual=True enables sample-by-sample saving and resume)
+        benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train', individual=True, max_workers=max_workers)
+        benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test', individual=True, max_workers=max_workers)
         
         # Visualize parameter distributions
         if visualize:
@@ -970,30 +1441,82 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
     return benchmarks_train, benchmarks_test
 
 
-def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=None, benchmarks_test=None, device=DEVICE, train_only=False, test_only=False):
+def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=None, benchmarks_test=None, device=DEVICE, train_only=False, test_only=False, data_mode='single_ctx', learning_objective='obs_ctx', kappa=0.5):
+    """
+    Run training and testing for a single model configuration.
     
+    Args:
+        N_ctx: Number of contexts
+        gm_name: Name of the generative model
+        h_dim: Hidden dimension size
+        lr_id: Learning rate index
+        learning_rate: Learning rate value
+        model_name: Name of the model ('rnn', 'vrnn', or 'module_network')
+        model_config: Model configuration dictionary
+        data_config: Data configuration dictionary
+        benchmarks_train: Training benchmarks
+        benchmarks_test: Test benchmarks
+        device: Device to run on
+        train_only: If True, only train
+        test_only: If True, only test
+        data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+        learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
+        kappa: Weighting factor for obs_ctx objective (default: 0.5)
+    """
     # Define save path - include gm_name only when N_ctx > 1
-    save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results' / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_h{h_dim}/'
+    # For ModuleNetwork, also include learning_objective in path to separate different variants
+    # For obs_ctx, also include kappa to distinguish different balance settings
+    if model_name == 'module_network':
+        if learning_objective == 'obs_ctx':
+            save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results' / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_{learning_objective}_kappa{kappa}/'
+        else:
+            save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results' / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_{learning_objective}/'
+    else:
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results' / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_h{h_dim}/'
     
     # Define models with current hidden dimension
     if model_name == 'rnn':
-        model = SimpleRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], hidden_dim=h_dim, n_layers=model_config['rnn_n_layers'], device=device)
+        rnn_config = {
+            'input_dim': model_config['input_dim'],
+            'output_dim': model_config['output_dim'],
+            'hidden_dim': h_dim,
+            'n_layers': model_config['rnn_n_layers'],
+            'device': device
+        }
+        model = SimpleRNN(rnn_config)
+    elif model_name == 'vrnn':
+        vrnn_config = {
+            'input_dim': model_config['input_dim'],
+            'output_dim': model_config['output_dim'],
+            'latent_dim': h_dim,
+            'phi_x_dim': h_dim,
+            'phi_z_dim': h_dim,
+            'phi_prior_dim': h_dim,
+            'rnn_hidden_states_dim': h_dim,
+            'rnn_n_layers': model_config['rnn_n_layers'],
+            'device': device
+        }
+        model = VRNN(vrnn_config)
+    elif model_name == 'module_network':
+        # ModuleNetwork uses fixed hidden dims from module_config (not overridden by h_dim)
+        model = ModuleNetwork(model_config)
     else:
-        model = VRNN(x_dim=model_config['input_dim'], output_dim=model_config['output_dim'], latent_dim=h_dim, phi_x_dim=h_dim, phi_z_dim=h_dim, phi_prior_dim=h_dim, rnn_hidden_states_dim=h_dim, rnn_n_layers=model_config['rnn_n_layers'], device=device)
+        raise ValueError(f"Unknown model_name: {model_name}")
     
-    minmax=None
     if not test_only:
         # Train
-        print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}...")
-        minmax = train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, gm_name=gm_name, model_name=model_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_train, seq_len_viz=model_config["seq_len_viz"])
+        kappa_str = f", kappa={kappa}" if learning_objective == 'obs_ctx' else ""
+        print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}, learning_objective={learning_objective}{kappa_str}...")
+        train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, gm_name=gm_name, model_name=model_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_train, seq_len_viz=model_config["seq_len_viz"], data_mode=data_mode, learning_objective=learning_objective, kappa=kappa)
 
     if not train_only:
         # Test
-        print(f"\nTesting {model_name} with h_dim={h_dim}, lr={learning_rate}...")
-        test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, minmax_train=minmax, device=device, benchmarks=benchmarks_test)
+        kappa_str = f", kappa={kappa}" if learning_objective == 'obs_ctx' else ""
+        print(f"\nTesting {model_name} with h_dim={h_dim}, lr={learning_rate}, learning_objective={learning_objective}{kappa_str}...")
+        test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_test, data_mode=data_mode, learning_objective=learning_objective)
 
 
-def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False):
+def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_workers=None, skip_benchmarks=False):
     """
     Run the full training and testing pipeline with multiple hyperparameter configurations.
     
@@ -1005,34 +1528,94 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
         data_config: Data configuration dictionary  
         benchmark_only: If True, only compute benchmarks and exit
         device: Device to run on (cuda/cpu)
+        test_only: If True, only test (skip training)
+        train_only: If True, only train (skip testing)
+        data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+        learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
+                           Can also be a list to train all variants: ['obs', 'ctx', 'obs_ctx']
+        max_workers: Number of parallel workers for KF benchmark fitting.
+                     None or 1 = sequential, >1 = parallel, -1 = use all CPU cores.
+        skip_benchmarks: If True, skip benchmark computation and train without KF comparison.
+                        Useful for faster iteration when benchmarks are slow to compute.
     """
     
     N_ctx = data_config["N_ctx"]
     gm_name = data_config["gm_name"]
 
-    # Load or compute benchmarks
-    benchmarks_train, benchmarks_test = load_or_compute_benchmarks(
-        data_config, model_config, N_ctx, gm_name, visualize=True
-    )
+    # Load or compute benchmarks (unless skipped)
+    if skip_benchmarks:
+        print("Skipping benchmark computation (skip_benchmarks=True)")
+        benchmarks_train, benchmarks_test = None, None
+    else:
+        benchmarks_train, benchmarks_test = load_or_compute_benchmarks(
+            data_config, model_config, N_ctx, gm_name, visualize=True, max_workers=max_workers
+        )
     
     # Exit early if only benchmarking
     if benchmark_only:
         print("Benchmark step complete. Exiting (benchmark_only=True).")
         return
+    
+    # Support both list and scalar for hidden dims
+    hidden_dims = model_config.get("rnn_hidden_dims", model_config.get("rnn_hidden_dim", 64))
+    if not isinstance(hidden_dims, list):
+        hidden_dims = [hidden_dims]
+    
+    # Support list of learning objectives for training multiple variants
+    learning_objectives = learning_objective if isinstance(learning_objective, list) else [learning_objective]
            
-    for h_dim in model_config["rnn_hidden_dim"]:
+    for model_name in model_config["model"]:
         for lr_id, learning_rate in enumerate(model_config["learning_rates"]): 
-            for model_name in model_config["model"]:
-                pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only)
+            for h_dim in hidden_dims:
+                # For ModuleNetwork, iterate over learning objectives to train different variants
+                if model_name == 'module_network':
+                    for obj in learning_objectives:
+                        # For 'obs_ctx' objective, iterate over kappa values
+                        if obj == 'obs_ctx':
+                            for kappa in DEFAULT_KAPPA_VALUES:
+                                pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=obj, kappa=kappa)
+                                
+                                # Explicit garbage collection to free memory between configurations
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                        else:
+                            # For 'obs' or 'ctx' objectives, kappa is not used (default 0.5)
+                            pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=obj)
+                            
+                            # Explicit garbage collection to free memory between configurations
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                    # ModuleNetwork uses fixed hidden dims, so only run once per learning rate
+                    break
+                else:
+                    pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=learning_objective)
                 
-                # Explicit garbage collection to free memory between configurations
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    # Explicit garbage collection to free memory between configurations
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
 
 
-def pipeline_model(model_config, data_config, test_only=False, train_only=False):
+def pipeline_train_valid(model_config, data_config, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_workers=None, skip_benchmarks=False):
+    """
+    Run the full model training pipeline.
+    
+    Args:
+        model_config: Model configuration dictionary
+        data_config: Data configuration dictionary
+        test_only: If True, only test
+        train_only: If True, only train
+        data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+        learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
+                           Can also be a list to train all variants: ['obs', 'ctx', 'obs_ctx']
+        max_workers: Number of parallel workers for KF benchmark fitting.
+                     None or 1 = sequential, >1 = parallel, -1 = use all CPU cores.
+        skip_benchmarks: If True, skip benchmark computation and train without KF comparison.
+                        Useful for faster iteration when benchmarks are slow to compute.
+    """
     # STEP 1: Pre-compute benchmarks and visualize parameter distributions
     # This computes Kalman filter estimates on training and test data, and saves:
     #   - benchmarks/benchmarks_<N>_<GM>_train.pkl
@@ -1040,10 +1623,15 @@ def pipeline_model(model_config, data_config, test_only=False, train_only=False)
     #   - benchmarks/visualizations_<N>/param_distribution_*.png
     #   - benchmarks/visualizations_<N>/binned_metrics_kalman.csv
     
-    print("\n" + "="*60)
-    print("STEP 1: Computing benchmarks (Kalman filter baseline)")
-    print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only)
+    if not skip_benchmarks:
+        print("\n" + "="*60)
+        print("STEP 1: Computing benchmarks (Kalman filter baseline)")
+        print("="*60)
+        pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=False)
+    else:
+        print("\n" + "="*60)
+        print("STEP 1: Skipping benchmarks (skip_benchmarks=True)")
+        print("="*60)
     
     
     # STEP 2: Train the RNN model with different learning rates and number of hidden units
@@ -1053,15 +1641,23 @@ def pipeline_model(model_config, data_config, test_only=False, train_only=False)
     print("\n" + "="*60)
     print("STEP 2: Training RNN models")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only)
+    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=skip_benchmarks)
 
 
-def pipeline_test(model_config, data_config):
-    # Test trained models on held-out data
+def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_objective='obs_ctx'):
+    """
+    Test trained models on held-out data.
+    
+    Args:
+        model_config: Model configuration dictionary
+        data_config: Data configuration dictionary
+        data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
+        learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
+    """
     print("\n" + "="*60)
     print("Testing trained RNN models")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, test_only=True)
+    pipeline_multi_config(model_config, data_config, test_only=True, data_mode=data_mode, learning_objective=learning_objective)
 
 
 if __name__=='__main__':
