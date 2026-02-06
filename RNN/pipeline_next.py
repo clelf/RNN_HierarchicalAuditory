@@ -1644,7 +1644,7 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
     pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=skip_benchmarks)
 
 
-def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_objective='obs_ctx'):
+def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_objective='obs_ctx', skip_benchmarks=False):
     """
     Test trained models on held-out data.
     
@@ -1653,11 +1653,12 @@ def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_ob
         data_config: Data configuration dictionary
         data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
         learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
+        skip_benchmarks: If True, skip benchmark computation and test without KF comparison.
     """
     print("\n" + "="*60)
     print("Testing trained RNN models")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, test_only=True, data_mode=data_mode, learning_objective=learning_objective)
+    pipeline_multi_config(model_config, data_config, test_only=True, data_mode=data_mode, learning_objective=learning_objective, skip_benchmarks=skip_benchmarks)
 
 
 if __name__=='__main__':
