@@ -841,6 +841,8 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
     # Validate learning objective for ModuleNetwork
     if model.name == 'module_network' and learning_objective not in VALID_LEARNING_OBJECTIVES:
         raise ValueError(f"Invalid learning_objective: {learning_objective}. Must be one of {VALID_LEARNING_OBJECTIVES}")
+    elif model.name != 'module_network' and learning_objective != 'obs':
+        raise ValueError(f"learning_objective='{learning_objective}' is only valid for ModuleNetwork, got {model.name}")
     
     # Set optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=model_config["weight_decay"])
@@ -1380,7 +1382,7 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
 
 
 
-def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_workers=None):
+def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_workers=None, benchmark_mode='both'):
     """
     Load precomputed benchmarks if available, otherwise compute and save them.
     
@@ -1394,9 +1396,13 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
         visualize: Whether to visualize parameter distributions for newly computed benchmarks
         max_workers: Number of parallel workers for KF fitting. None or 1 = sequential, 
                      >1 = parallel with that many workers, -1 = use all CPU cores.
+        benchmark_mode: Which benchmarks to compute. Options:
+                       'both' (default): Compute/load both train and test benchmarks
+                       'test_only': Compute/load only test benchmarks (train=None)
+                       'train_only': Compute/load only train benchmarks (test=None)
     
     Returns:
-        tuple: (benchmarks_train, benchmarks_test)
+        tuple: (benchmarks_train, benchmarks_test) - either may be None based on benchmark_mode
     """
     benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
     benchmarkfile_train = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='train')
@@ -1406,37 +1412,46 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
     incr_dir_train = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='train')
     incr_dir_test = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, model_config['batch_size_test'], suffix='test')
 
-    benchmarks_exist = benchmarkfile_train.exists() and benchmarkfile_test.exists()
+    # Determine which benchmarks to compute based on mode
+    compute_train = benchmark_mode in ['both', 'train_only']
+    compute_test = benchmark_mode in ['both', 'test_only']
     
-    if not benchmarks_exist:
-        # Check if we have partial individual results to resume from
-        has_partial_train = incr_dir_train.exists() and len(list(incr_dir_train.glob("sample_*.pkl"))) > 0
-        has_partial_test = incr_dir_test.exists() and len(list(incr_dir_test.glob("sample_*.pkl"))) > 0
-        
-        if has_partial_train or has_partial_test:
-            print("Found partial individual benchmarks from previous run, resuming...")
+    benchmarks_train = None
+    benchmarks_test = None
+    
+    # Handle training benchmarks
+    if compute_train:
+        if benchmarkfile_train.exists():
+            print("Loading precomputed training benchmarks...")
+            with open(benchmarkfile_train, 'rb') as f:
+                benchmarks_train = pickle.load(f)
         else:
-            print("Computing benchmarks...")
-        
-        print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-        
-        # Compute/resume benchmarks (individual=True enables sample-by-sample saving and resume)
-        benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train', individual=True, max_workers=max_workers)
-        benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test', individual=True, max_workers=max_workers)
-        
-        # Visualize parameter distributions
-        if visualize:
-            print("Visualizing parameter distributions...")
-            benchmarks_pars_viz(benchmarks_train, data_config, N_ctx, gm_name, suffix='train')
-            benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix='test')
-    else:
-        # Load precomputed benchmarks
-        print("Loading precomputed benchmarks...")
-        with open(benchmarkfile_train, 'rb') as f:
-            benchmarks_train = pickle.load(f)
-        with open(benchmarkfile_test, 'rb') as f:
-            benchmarks_test = pickle.load(f)
-        print("Benchmarks loaded successfully.")
+            has_partial_train = incr_dir_train.exists() and len(list(incr_dir_train.glob("sample_*.pkl"))) > 0
+            if has_partial_train:
+                print("Found partial training benchmarks, resuming...")
+            else:
+                print("Computing training benchmarks...")
+            print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
+            benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train', individual=True, max_workers=max_workers)
+            if visualize:
+                benchmarks_pars_viz(benchmarks_train, data_config, N_ctx, gm_name, suffix='train')
+    
+    # Handle test benchmarks
+    if compute_test:
+        if benchmarkfile_test.exists():
+            print("Loading precomputed test benchmarks...")
+            with open(benchmarkfile_test, 'rb') as f:
+                benchmarks_test = pickle.load(f)
+        else:
+            has_partial_test = incr_dir_test.exists() and len(list(incr_dir_test.glob("sample_*.pkl"))) > 0
+            if has_partial_test:
+                print("Found partial test benchmarks, resuming...")
+            else:
+                print("Computing test benchmarks...")
+            print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
+            benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test', individual=True, max_workers=max_workers)
+            if visualize:
+                benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix='test')
     
     return benchmarks_train, benchmarks_test
 
@@ -1516,7 +1531,7 @@ def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_na
         test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_test, data_mode=data_mode, learning_objective=learning_objective)
 
 
-def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_workers=None, skip_benchmarks=False):
+def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_workers=None, skip_benchmarks=False, benchmark_mode='both'):
     """
     Run the full training and testing pipeline with multiple hyperparameter configurations.
     
@@ -1537,6 +1552,10 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
                      None or 1 = sequential, >1 = parallel, -1 = use all CPU cores.
         skip_benchmarks: If True, skip benchmark computation and train without KF comparison.
                         Useful for faster iteration when benchmarks are slow to compute.
+        benchmark_mode: Which benchmarks to compute. Options:
+                       'both' (default): Compute/load both train and test benchmarks
+                       'test_only': Compute/load only test benchmarks
+                       'train_only': Compute/load only train benchmarks
     """
     
     N_ctx = data_config["N_ctx"]
@@ -1548,7 +1567,7 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
         benchmarks_train, benchmarks_test = None, None
     else:
         benchmarks_train, benchmarks_test = load_or_compute_benchmarks(
-            data_config, model_config, N_ctx, gm_name, visualize=True, max_workers=max_workers
+            data_config, model_config, N_ctx, gm_name, visualize=True, max_workers=max_workers, benchmark_mode=benchmark_mode
         )
     
     # Exit early if only benchmarking
@@ -1599,7 +1618,7 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
 
 
 
-def pipeline_train_valid(model_config, data_config, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_workers=None, skip_benchmarks=False):
+def pipeline_train_valid(model_config, data_config, test_only=False, train_only=False, data_mode=None, learning_objective=None, max_workers=None, skip_benchmarks=False, benchmark_mode='both'):
     """
     Run the full model training pipeline.
     
@@ -1615,6 +1634,10 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
                      None or 1 = sequential, >1 = parallel, -1 = use all CPU cores.
         skip_benchmarks: If True, skip benchmark computation and train without KF comparison.
                         Useful for faster iteration when benchmarks are slow to compute.
+        benchmark_mode: Which benchmarks to compute. Options:
+                       'both' (default): Compute/load both train and test benchmarks
+                       'test_only': Compute/load only test benchmarks
+                       'train_only': Compute/load only train benchmarks
     """
     # STEP 1: Pre-compute benchmarks and visualize parameter distributions
     # This computes Kalman filter estimates on training and test data, and saves:
@@ -1623,11 +1646,14 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
     #   - benchmarks/visualizations_<N>/param_distribution_*.png
     #   - benchmarks/visualizations_<N>/binned_metrics_kalman.csv
     
+    if data_mode or learning_objective is None:
+        raise ValueError("data_mode and learning_objective must be specified for pipeline_train_valid")
+
     if not skip_benchmarks:
         print("\n" + "="*60)
         print("STEP 1: Computing benchmarks (Kalman filter baseline)")
         print("="*60)
-        pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=False)
+        pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=False, benchmark_mode=benchmark_mode)
     else:
         print("\n" + "="*60)
         print("STEP 1: Skipping benchmarks (skip_benchmarks=True)")
@@ -1639,12 +1665,12 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
     # Uncomment the following line to run training:
     
     print("\n" + "="*60)
-    print("STEP 2: Training RNN models")
+    print("STEP 2: Training model(s)")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=skip_benchmarks)
+    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=skip_benchmarks, benchmark_mode=benchmark_mode)
 
 
-def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_objective='obs_ctx', skip_benchmarks=False):
+def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_objective='obs_ctx', skip_benchmarks=False, benchmark_mode='test_only'):
     """
     Test trained models on held-out data.
     
@@ -1654,11 +1680,12 @@ def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_ob
         data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
         learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
         skip_benchmarks: If True, skip benchmark computation and test without KF comparison.
+        benchmark_mode: Which benchmarks to compute. Default 'test_only' for testing phase.
     """
     print("\n" + "="*60)
     print("Testing trained RNN models")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, test_only=True, data_mode=data_mode, learning_objective=learning_objective, skip_benchmarks=skip_benchmarks)
+    pipeline_multi_config(model_config, data_config, test_only=True, data_mode=data_mode, learning_objective=learning_objective, skip_benchmarks=skip_benchmarks, benchmark_mode=benchmark_mode)
 
 
 if __name__=='__main__':

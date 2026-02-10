@@ -119,7 +119,7 @@ if __name__=='__main__':
     
     # TRAINING MODEL WITH NON HIERARCHICAL GM AND SINGLE CONTEXT
     print("Running N_ctx = 1")
-    pipeline_train_valid(model_config, data_config)
+    pipeline_train_valid(model_config, data_config, data_mode='single_ctx', learning_objective='obs')
 
 
     # TESTING TRAINED MODELS
