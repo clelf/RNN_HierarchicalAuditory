@@ -558,7 +558,7 @@ def _process_single_kf_sample(args):
     return sample_data
 
 
-def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, benchmarkpath=None, save=False, suffix='', individual=True, max_workers=None):
+def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, benchmarkpath=None, save=False, suffix='', individual=True, max_cores=None):
     """
     Benchmarks the Kalman filter on a batch of data, tracking MSE along parameter configurations.
     Uses standard Kalman filter for single-context (N_ctx=1) and context-aware Kalman filter
@@ -567,7 +567,7 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
     Supports individual saving: each sample is saved individually so that progress is not lost
     if the computation is interrupted. Use individual=True (default) for long-running jobs.
     
-    Supports parallel processing: set max_workers > 1 to process multiple samples simultaneously.
+    Supports parallel processing: set max_cores > 1 to process multiple samples simultaneously.
 
     Args:
         data_config (dict): Configuration parameters for the data generative model.
@@ -578,9 +578,9 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
         suffix (str): Suffix for the benchmark filename.
         individual (bool): If True, save each sample individually to avoid losing progress on crash.
                            The samples are aggregated at the end. Default: True.
-        max_workers (int, optional): Number of parallel workers for KF fitting.
+        max_cores (int, optional): Number of parallel cores for KF fitting.
                                      None or 1 = sequential processing (default).
-                                     >1 = parallel processing with that many workers.
+                                     >1 = parallel processing with that many cores.
                                      -1 = use all available CPU cores.
 
     Returns:
@@ -598,11 +598,11 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
         N_samples = data_config["N_samples"]
     
     # Determine parallelization settings
-    if max_workers == -1:
-        max_workers = cpu_count()
-    use_parallel = HAS_PATHOS and max_workers is not None and max_workers > 1 and N_samples > 1
+    if max_cores == -1:
+        max_cores = cpu_count()
+    use_parallel = HAS_PATHOS and max_cores is not None and max_cores > 1 and N_samples > 1
     if use_parallel:
-        print(f"  Parallel processing enabled with {max_workers} workers (pathos available: {HAS_PATHOS})")
+        print(f"  Parallel processing enabled with {max_cores} cores (pathos available: {HAS_PATHOS})")
     
     # Set up individual directory if needed
     if save and individual and benchmarkpath is not None:
@@ -673,8 +673,8 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
             
             if use_parallel:
                 # Parallel processing with pathos
-                print(f"  Using {max_workers} parallel workers...")
-                with ProcessingPool(nodes=max_workers) as pool:
+                print(f"  Using {max_cores} parallel cores...")
+                with ProcessingPool(nodes=max_cores) as pool:
                     # Use imap for progress tracking
                     results = list(tqdm(
                         pool.imap(_process_single_kf_sample, args_list),
@@ -1382,7 +1382,7 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
 
 
 
-def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_workers=None, benchmark_mode='both'):
+def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_cores=None, benchmark_mode='both'):
     """
     Load precomputed benchmarks if available, otherwise compute and save them.
     
@@ -1394,8 +1394,8 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
         N_ctx: Number of contexts
         gm_name: Name of the generative model
         visualize: Whether to visualize parameter distributions for newly computed benchmarks
-        max_workers: Number of parallel workers for KF fitting. None or 1 = sequential, 
-                     >1 = parallel with that many workers, -1 = use all CPU cores.
+        max_cores: Number of parallel cores for KF fitting. None or 1 = sequential, 
+                     >1 = parallel with that many cores, -1 = use all CPU cores.
         benchmark_mode: Which benchmarks to compute. Options:
                        'both' (default): Compute/load both train and test benchmarks
                        'test_only': Compute/load only test benchmarks (train=None)
@@ -1432,7 +1432,7 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
             else:
                 print("Computing training benchmarks...")
             print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-            benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train', individual=True, max_workers=max_workers)
+            benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train', individual=True, max_cores=max_cores)
             if visualize:
                 benchmarks_pars_viz(benchmarks_train, data_config, N_ctx, gm_name, suffix='train')
     
@@ -1449,7 +1449,7 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
             else:
                 print("Computing test benchmarks...")
             print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-            benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test', individual=True, max_workers=max_workers)
+            benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test', individual=True, max_cores=max_cores)
             if visualize:
                 benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix='test')
     
@@ -1531,7 +1531,7 @@ def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_na
         test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_test, data_mode=data_mode, learning_objective=learning_objective)
 
 
-def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_workers=None, skip_benchmarks=False, benchmark_mode='both'):
+def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_cores=None, skip_benchmarks=False, benchmark_mode='both'):
     """
     Run the full training and testing pipeline with multiple hyperparameter configurations.
     
@@ -1548,8 +1548,9 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
         data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
         learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
                            Can also be a list to train all variants: ['obs', 'ctx', 'obs_ctx']
-        max_workers: Number of parallel workers for KF benchmark fitting.
-                     None or 1 = sequential, >1 = parallel, -1 = use all CPU cores.
+        max_cores: Number of parallel cores for KF benchmark fitting.
+                     None = use data_config["max_cores"] if available, else sequential.
+                     1 = sequential, >1 = parallel, -1 = use all CPU cores.
         skip_benchmarks: If True, skip benchmark computation and train without KF comparison.
                         Useful for faster iteration when benchmarks are slow to compute.
         benchmark_mode: Which benchmarks to compute. Options:
@@ -1560,15 +1561,17 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
     
     N_ctx = data_config["N_ctx"]
     gm_name = data_config["gm_name"]
+    
+    # Use max_cores from data_config if max_cores not explicitly set
+    if max_cores is None:
+        max_cores = data_config.get("max_cores", None)
 
     # Load or compute benchmarks (unless skipped)
     if skip_benchmarks:
         print("Skipping benchmark computation (skip_benchmarks=True)")
         benchmarks_train, benchmarks_test = None, None
     else:
-        benchmarks_train, benchmarks_test = load_or_compute_benchmarks(
-            data_config, model_config, N_ctx, gm_name, visualize=True, max_workers=max_workers, benchmark_mode=benchmark_mode
-        )
+        benchmarks_train, benchmarks_test = load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_cores=max_cores, benchmark_mode=benchmark_mode)
     
     # Exit early if only benchmarking
     if benchmark_only:
@@ -1618,7 +1621,7 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
 
 
 
-def pipeline_train_valid(model_config, data_config, test_only=False, train_only=False, data_mode=None, learning_objective=None, max_workers=None, skip_benchmarks=False, benchmark_mode='both'):
+def pipeline_train_valid(model_config, data_config, test_only=False, train_only=False, data_mode=None, learning_objective=None, max_cores=None, skip_benchmarks=False, benchmark_mode='both'):
     """
     Run the full model training pipeline.
     
@@ -1630,7 +1633,7 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
         data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
         learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
                            Can also be a list to train all variants: ['obs', 'ctx', 'obs_ctx']
-        max_workers: Number of parallel workers for KF benchmark fitting.
+        max_cores: Number of parallel cores for KF benchmark fitting.
                      None or 1 = sequential, >1 = parallel, -1 = use all CPU cores.
         skip_benchmarks: If True, skip benchmark computation and train without KF comparison.
                         Useful for faster iteration when benchmarks are slow to compute.
@@ -1653,7 +1656,7 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
         print("\n" + "="*60)
         print("STEP 1: Computing benchmarks (Kalman filter baseline)")
         print("="*60)
-        pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=False, benchmark_mode=benchmark_mode)
+        pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_cores=max_cores, skip_benchmarks=False, benchmark_mode=benchmark_mode)
     else:
         print("\n" + "="*60)
         print("STEP 1: Skipping benchmarks (skip_benchmarks=True)")
@@ -1667,7 +1670,7 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
     print("\n" + "="*60)
     print("STEP 2: Training model(s)")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_workers=max_workers, skip_benchmarks=skip_benchmarks, benchmark_mode=benchmark_mode)
+    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_cores=max_cores, skip_benchmarks=skip_benchmarks, benchmark_mode=benchmark_mode)
 
 
 def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_objective='obs_ctx', skip_benchmarks=False, benchmark_mode='test_only'):
