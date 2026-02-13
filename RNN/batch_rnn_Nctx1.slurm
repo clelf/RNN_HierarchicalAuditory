@@ -30,9 +30,12 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 
 # source ~/.bashrcq
 
+# Skip benchmarks
+ARGS="--skip_benchmarks"
+
 # Run the Python script
 # /scratch/clevyfidel/conda_env/rnn/bin/python /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/pipeline_multi.py
-/scratch/clevyfidel/conda_env/rnn2/bin/python /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/pipeline_multi.py
+/scratch/clevyfidel/conda_env/rnn2/bin/python /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/pipeline_multi.py $ARGS
 
 
 # Verify Python version and activated environment

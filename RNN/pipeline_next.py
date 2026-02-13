@@ -1649,7 +1649,7 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
     #   - benchmarks/visualizations_<N>/param_distribution_*.png
     #   - benchmarks/visualizations_<N>/binned_metrics_kalman.csv
     
-    if data_mode or learning_objective is None:
+    if data_mode is None or learning_objective is None:
         raise ValueError("data_mode and learning_objective must be specified for pipeline_train_valid")
 
     if not skip_benchmarks:

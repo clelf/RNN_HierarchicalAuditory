@@ -11,10 +11,12 @@ Computes:
 
 Usage:
     python pipeline_benchmarks_only.py
+    python pipeline_benchmarks_only.py --unit_test
 """
 
 import torch
 import os
+import argparse
 import numpy as np
 from pipeline_next import load_or_compute_benchmarks
 from config import get_base_model_config, get_data_config, get_module_network_config
@@ -25,7 +27,11 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 if __name__ == '__main__':
     
-    unit_test = True  # Set to False for full training
+    parser = argparse.ArgumentParser(description='Compute Kalman filter benchmarks only')
+    parser.add_argument('--unit_test', action='store_true', help='Run in unit test mode')
+    args = parser.parse_args()
+
+    unit_test = args.unit_test
 
     # =========================================================================
     # N_ctx=2, NonHierarchicalGM (for ModuleNetwork)
@@ -57,7 +63,7 @@ if __name__ == '__main__':
         N_ctx=N_ctx,
         gm_name=gm_name,
         visualize=True,
-        max_workers=data_config_2.get("max_cores", None),
+        max_cores=data_config_2.get("max_cores", None),
         benchmark_mode='test_only',  # Only compute test benchmarks
     )
     
@@ -94,7 +100,7 @@ if __name__ == '__main__':
         N_ctx=N_ctx,
         gm_name=gm_name,
         visualize=True,
-        max_workers=data_config_1.get("max_cores", None),
+        max_cores=data_config_1.get("max_cores", None),
         benchmark_mode='test_only',  # Only compute test benchmarks
     )
     

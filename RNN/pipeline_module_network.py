@@ -14,10 +14,12 @@ Learning objectives for multi-context scenarios (N_ctx > 1):
 
 Usage:
     python pipeline_module_network.py
+    python pipeline_module_network.py --unit_test --skip_benchmarks
 """
 
 import torch
 import os
+import argparse
 import numpy as np
 from pipeline_next import pipeline_train_valid, pipeline_test, VALID_LEARNING_OBJECTIVES
 from config import get_base_model_config, get_data_config, get_module_network_config
@@ -28,8 +30,13 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 if __name__ == '__main__':
     
-    unit_test = False
-    skip_benchmarks = True
+    parser = argparse.ArgumentParser(description='Train ModuleNetwork models')
+    parser.add_argument('--unit_test', action='store_true', help='Run in unit test mode')
+    parser.add_argument('--skip_benchmarks', action='store_true', help='Skip benchmark computation')
+    args = parser.parse_args()
+
+    unit_test = args.unit_test
+    skip_benchmarks = args.skip_benchmarks
 
     # BASE MODULES CONFIG
     

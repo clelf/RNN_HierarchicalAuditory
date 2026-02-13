@@ -1,5 +1,6 @@
 import torch
 import os
+import argparse
 import numpy as np
 from pipeline_next import pipeline_train_valid, pipeline_test
 from config import get_base_model_config, get_data_config
@@ -12,8 +13,13 @@ FREQ_MAX = 1650
 
 if __name__=='__main__':
 
-    unit_test = False
-    skip_benchmarks = True
+    parser = argparse.ArgumentParser(description='Train RNN models')
+    parser.add_argument('--unit_test', action='store_true', help='Run in unit test mode')
+    parser.add_argument('--skip_benchmarks', action='store_true', help='Skip benchmark computation')
+    args = parser.parse_args()
+
+    unit_test = args.unit_test
+    skip_benchmarks = args.skip_benchmarks
 
 
     # model_config = get_base_model_config(unit_test=unit_test)
