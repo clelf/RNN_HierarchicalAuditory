@@ -12,7 +12,9 @@ FREQ_MAX = 1650
 
 if __name__=='__main__':
 
-    unit_test = True
+    unit_test = False
+    skip_benchmarks = True
+
 
     # model_config = get_base_model_config(unit_test=unit_test)
     # data_config = get_data_config(model_config, unit_test=unit_test)
@@ -119,11 +121,11 @@ if __name__=='__main__':
     
     # TRAINING MODEL WITH NON HIERARCHICAL GM AND SINGLE CONTEXT
     print("Running N_ctx = 1")
-    pipeline_train_valid(model_config, data_config, data_mode='single_ctx', learning_objective='obs')
+    pipeline_train_valid(model_config, data_config, data_mode='single_ctx', learning_objective='obs', skip_benchmarks=skip_benchmarks)
 
 
     # TESTING TRAINED MODELS
-    pipeline_test(model_config, data_config)
+    pipeline_test(model_config, data_config, skip_benchmarks=skip_benchmarks)
 
 
     # #### RUNNING DIFFERENT GMS (OBSOLETE)

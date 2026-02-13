@@ -28,7 +28,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 if __name__ == '__main__':
     
-    unit_test = True  # Set to False for full training
+    unit_test = False
     skip_benchmarks = True
 
     # BASE MODULES CONFIG
