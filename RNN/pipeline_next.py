@@ -1456,7 +1456,7 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
     return benchmarks_train, benchmarks_test
 
 
-def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=None, benchmarks_test=None, device=DEVICE, train_only=False, test_only=False, data_mode='single_ctx', learning_objective='obs_ctx', kappa=0.5):
+def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=None, benchmarks_test=None, device=DEVICE, train_only=False, test_only=False, data_mode='single_ctx', learning_objective='obs_ctx', kappa=0.5, run_id=None, bottleneck_dim=None):
     """
     Run training and testing for a single model configuration.
     
@@ -1477,17 +1477,27 @@ def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_na
         data_mode: 'single_ctx' (N_ctx=1) or 'multi_ctx' (N_ctx>1)
         learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
         kappa: Weighting factor for obs_ctx objective (default: 0.5)
+        run_id: Run identifier for output folders (default: None, no run_id subfolder)
+        bottleneck_dim: Bottleneck dimension for ModuleNetwork (default: None, uses config default)
     """
     # Define save path - include gm_name only when N_ctx > 1
     # For ModuleNetwork, also include learning_objective in path to separate different variants
     # For obs_ctx, also include kappa to distinguish different balance settings
+    # Also include bottleneck_dim if specified to distinguish different bottleneck sizes
+    base_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results'
+    if run_id:
+        base_path = base_path / run_id
+    
     if model_name == 'module_network':
+        # Build folder name with learning objective
+        folder_name = f'{model_name}_{learning_objective}'
         if learning_objective == 'obs_ctx':
-            save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results' / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_{learning_objective}_kappa{kappa}/'
-        else:
-            save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results' / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_{learning_objective}/'
+            folder_name += f'_kappa{kappa}'
+        if bottleneck_dim is not None:
+            folder_name += f'_bn{bottleneck_dim}'
+        save_path = base_path / get_ctx_gm_subpath(N_ctx, gm_name) / f'{folder_name}/'
     else:
-        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'training_results' / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_h{h_dim}/'
+        save_path = base_path / get_ctx_gm_subpath(N_ctx, gm_name) / f'{model_name}_h{h_dim}/'
     
     # Define models with current hidden dimension
     if model_name == 'rnn':
@@ -1514,24 +1524,33 @@ def pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_na
         model = VRNN(vrnn_config)
     elif model_name == 'module_network':
         # ModuleNetwork uses fixed hidden dims from module_config (not overridden by h_dim)
+        # If bottleneck_dim is specified, override the config values
+        if bottleneck_dim is not None:
+            model_config = model_config.copy()
+            model_config['observation_module'] = model_config['observation_module'].copy()
+            model_config['context_module'] = model_config['context_module'].copy()
+            model_config['observation_module']['bottleneck_dim'] = bottleneck_dim
+            model_config['context_module']['bottleneck_dim'] = bottleneck_dim
         model = ModuleNetwork(model_config)
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
     
     if not test_only:
         # Train
+        bn_str = f", bottleneck_dim={bottleneck_dim}" if bottleneck_dim is not None else ""
         kappa_str = f", kappa={kappa}" if learning_objective == 'obs_ctx' else ""
-        print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}, learning_objective={learning_objective}{kappa_str}...")
+        print(f"\nTraining {model_name} with h_dim={h_dim}, lr={learning_rate}, learning_objective={learning_objective}{kappa_str}{bn_str}...")
         train(model, model_config=model_config, lr=learning_rate, lr_id=lr_id, h_dim=h_dim, gm_name=gm_name, model_name=model_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_train, seq_len_viz=model_config["seq_len_viz"], data_mode=data_mode, learning_objective=learning_objective, kappa=kappa)
 
     if not train_only:
         # Test
+        bn_str = f", bottleneck_dim={bottleneck_dim}" if bottleneck_dim is not None else ""
         kappa_str = f", kappa={kappa}" if learning_objective == 'obs_ctx' else ""
-        print(f"\nTesting {model_name} with h_dim={h_dim}, lr={learning_rate}, learning_objective={learning_objective}{kappa_str}...")
+        print(f"\nTesting {model_name} with h_dim={h_dim}, lr={learning_rate}, learning_objective={learning_objective}{kappa_str}{bn_str}...")
         test(model, model_config, lr=learning_rate, lr_id=lr_id, gm_name=gm_name, data_config=data_config, save_path=save_path, device=device, benchmarks=benchmarks_test, data_mode=data_mode, learning_objective=learning_objective)
 
 
-def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_cores=None, skip_benchmarks=False, benchmark_mode='both'):
+def pipeline_multi_config(model_config, data_config, benchmark_only=False, device=DEVICE, test_only=False, train_only=False, data_mode='single_ctx', learning_objective='obs_ctx', max_cores=None, skip_benchmarks=False, benchmark_mode='both', run_id=None):
     """
     Run the full training and testing pipeline with multiple hyperparameter configurations.
     
@@ -1557,6 +1576,7 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
                        'both' (default): Compute/load both train and test benchmarks
                        'test_only': Compute/load only test benchmarks
                        'train_only': Compute/load only train benchmarks
+        run_id: Run identifier for output folders (default: None, no run_id subfolder)
     """
     
     N_ctx = data_config["N_ctx"]
@@ -1585,34 +1605,38 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
     
     # Support list of learning objectives for training multiple variants
     learning_objectives = learning_objective if isinstance(learning_objective, list) else [learning_objective]
+    
+    # Support list of bottleneck dims for ModuleNetwork
+    bottleneck_dims = model_config.get("bottleneck_dims", [None])
            
     for model_name in model_config["model"]:
         for lr_id, learning_rate in enumerate(model_config["learning_rates"]): 
             for h_dim in hidden_dims:
-                # For ModuleNetwork, iterate over learning objectives to train different variants
+                # For ModuleNetwork, iterate over learning objectives and bottleneck dims
                 if model_name == 'module_network':
-                    for obj in learning_objectives:
-                        # For 'obs_ctx' objective, iterate over kappa values
-                        if obj == 'obs_ctx':
-                            for kappa in DEFAULT_KAPPA_VALUES:
-                                pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=obj, kappa=kappa)
+                    for bn_dim in bottleneck_dims:
+                        for obj in learning_objectives:
+                            # For 'obs_ctx' objective, iterate over kappa values
+                            if obj == 'obs_ctx':
+                                for kappa in DEFAULT_KAPPA_VALUES:
+                                    pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=obj, kappa=kappa, run_id=run_id, bottleneck_dim=bn_dim)
+                                    
+                                    # Explicit garbage collection to free memory between configurations
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                            else:
+                                # For 'obs' or 'ctx' objectives, kappa is not used (default 0.5)
+                                pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=obj, run_id=run_id, bottleneck_dim=bn_dim)
                                 
                                 # Explicit garbage collection to free memory between configurations
                                 gc.collect()
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
-                        else:
-                            # For 'obs' or 'ctx' objectives, kappa is not used (default 0.5)
-                            pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=obj)
-                            
-                            # Explicit garbage collection to free memory between configurations
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
                     # ModuleNetwork uses fixed hidden dims, so only run once per learning rate
                     break
                 else:
-                    pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=learning_objective)
+                    pipeline_single_config(N_ctx, gm_name, h_dim, lr_id, learning_rate, model_name, model_config, data_config, benchmarks_train=benchmarks_train, benchmarks_test=benchmarks_test, device=device, train_only=train_only, test_only=test_only, data_mode=data_mode, learning_objective=learning_objective, run_id=run_id)
                 
                     # Explicit garbage collection to free memory between configurations
                     gc.collect()
@@ -1621,7 +1645,7 @@ def pipeline_multi_config(model_config, data_config, benchmark_only=False, devic
 
 
 
-def pipeline_train_valid(model_config, data_config, test_only=False, train_only=False, data_mode=None, learning_objective=None, max_cores=None, skip_benchmarks=False, benchmark_mode='both'):
+def pipeline_train_valid(model_config, data_config, test_only=False, train_only=False, data_mode=None, learning_objective=None, max_cores=None, skip_benchmarks=False, benchmark_mode='both', run_id=None):
     """
     Run the full model training pipeline.
     
@@ -1641,6 +1665,7 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
                        'both' (default): Compute/load both train and test benchmarks
                        'test_only': Compute/load only test benchmarks
                        'train_only': Compute/load only train benchmarks
+        run_id: Run identifier for output folders (default: None, no run_id subfolder)
     """
     # STEP 1: Pre-compute benchmarks and visualize parameter distributions
     # This computes Kalman filter estimates on training and test data, and saves:
@@ -1656,7 +1681,7 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
         print("\n" + "="*60)
         print("STEP 1: Computing benchmarks (Kalman filter baseline)")
         print("="*60)
-        pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_cores=max_cores, skip_benchmarks=False, benchmark_mode=benchmark_mode)
+        pipeline_multi_config(model_config, data_config, benchmark_only=True, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_cores=max_cores, skip_benchmarks=False, benchmark_mode=benchmark_mode, run_id=run_id)
     else:
         print("\n" + "="*60)
         print("STEP 1: Skipping benchmarks (skip_benchmarks=True)")
@@ -1670,10 +1695,10 @@ def pipeline_train_valid(model_config, data_config, test_only=False, train_only=
     print("\n" + "="*60)
     print("STEP 2: Training model(s)")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_cores=max_cores, skip_benchmarks=skip_benchmarks, benchmark_mode=benchmark_mode)
+    pipeline_multi_config(model_config, data_config, benchmark_only=False, test_only=test_only, train_only=train_only, data_mode=data_mode, learning_objective=learning_objective, max_cores=max_cores, skip_benchmarks=skip_benchmarks, benchmark_mode=benchmark_mode, run_id=run_id)
 
 
-def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_objective='obs_ctx', skip_benchmarks=False, benchmark_mode='test_only'):
+def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_objective='obs_ctx', skip_benchmarks=False, benchmark_mode='test_only', run_id=None):
     """
     Test trained models on held-out data.
     
@@ -1684,11 +1709,12 @@ def pipeline_test(model_config, data_config, data_mode='single_ctx', learning_ob
         learning_objective: Learning objective for ModuleNetwork - 'obs', 'ctx', or 'obs_ctx' (default)
         skip_benchmarks: If True, skip benchmark computation and test without KF comparison.
         benchmark_mode: Which benchmarks to compute. Default 'test_only' for testing phase.
+        run_id: Run identifier for output folders (default: None, no run_id subfolder)
     """
     print("\n" + "="*60)
     print("Testing trained RNN models")
     print("="*60)
-    pipeline_multi_config(model_config, data_config, test_only=True, data_mode=data_mode, learning_objective=learning_objective, skip_benchmarks=skip_benchmarks, benchmark_mode=benchmark_mode)
+    pipeline_multi_config(model_config, data_config, test_only=True, data_mode=data_mode, learning_objective=learning_objective, skip_benchmarks=skip_benchmarks, benchmark_mode=benchmark_mode, run_id=run_id)
 
 
 if __name__=='__main__':

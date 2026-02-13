@@ -30,7 +30,11 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 
 # source ~/.bashrcq
 
+# ============ CONFIGURABLE PARAMETERS ============
+# Add flags as needed: --unit_test
+# Benchmarks are saved to a fixed location (no run_id needed)
 ARGS=""
+# =================================================
 
 # Run the Python script (benchmarks only)
 /scratch/clevyfidel/conda_env/rnn2/bin/python /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/pipeline_benchmarks_only.py $ARGS

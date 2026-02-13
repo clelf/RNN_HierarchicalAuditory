@@ -1,6 +1,7 @@
 import torch
 import os
 import argparse
+from datetime import datetime
 import numpy as np
 from pipeline_next import pipeline_train_valid, pipeline_test
 from config import get_base_model_config, get_data_config
@@ -16,10 +17,18 @@ if __name__=='__main__':
     parser = argparse.ArgumentParser(description='Train RNN models')
     parser.add_argument('--unit_test', action='store_true', help='Run in unit test mode')
     parser.add_argument('--skip_benchmarks', action='store_true', help='Skip benchmark computation')
+    parser.add_argument('--use_run_id', type=str, nargs='?', const='', default=None,
+                        help='Create a run subfolder. If name provided, uses that; otherwise uses timestamp.')
     args = parser.parse_args()
 
     unit_test = args.unit_test
     skip_benchmarks = args.skip_benchmarks
+    
+    # Determine run_id: None by default, timestamp if --use_run_id alone, or custom value if --use_run_id <name>
+    if args.use_run_id is not None:
+        run_id = args.use_run_id if args.use_run_id else datetime.now().strftime('%Y%m%d_%H%M%S')
+    else:
+        run_id = None
 
 
     # model_config = get_base_model_config(unit_test=unit_test)
@@ -127,11 +136,13 @@ if __name__=='__main__':
     
     # TRAINING MODEL WITH NON HIERARCHICAL GM AND SINGLE CONTEXT
     print("Running N_ctx = 1")
-    pipeline_train_valid(model_config, data_config, data_mode='single_ctx', learning_objective='obs', skip_benchmarks=skip_benchmarks)
+    if run_id:
+        print(f"Run ID: {run_id}")
+    pipeline_train_valid(model_config, data_config, data_mode='single_ctx', learning_objective='obs', skip_benchmarks=skip_benchmarks, run_id=run_id)
 
 
     # TESTING TRAINED MODELS
-    pipeline_test(model_config, data_config, skip_benchmarks=skip_benchmarks)
+    pipeline_test(model_config, data_config, skip_benchmarks=skip_benchmarks, run_id=run_id)
 
 
     # #### RUNNING DIFFERENT GMS (OBSOLETE)

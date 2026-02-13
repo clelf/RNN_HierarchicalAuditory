@@ -30,8 +30,15 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 
 # source ~/.bashrcq
 
-# Skip benchmarks
+# ============ CONFIGURABLE PARAMETERS ============
+# Flags: --unit_test --skip_benchmarks --use_run_id [name]
+# By default, outputs go to training_results/ directly (no subfolder)
+# Use --use_run_id to create a timestamped subfolder
+# Use --use_run_id <name> to create a custom-named subfolder
 ARGS="--skip_benchmarks"
+# Example with timestamp subfolder: ARGS="--skip_benchmarks --use_run_id"
+# Example with custom subfolder: ARGS="--skip_benchmarks --use_run_id exp_v2"
+# =================================================
 
 # Run the Python script
 # /scratch/clevyfidel/conda_env/rnn/bin/python /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/pipeline_multi.py

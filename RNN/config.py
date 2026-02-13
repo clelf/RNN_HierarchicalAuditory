@@ -110,21 +110,27 @@ def get_module_network_config(model_config, data_config, bottleneck_dim=24):
         Base model configuration (learning rates, epochs, etc.)
     data_config : dict  
         Data configuration containing N_ctx (number of contexts)
-    bottleneck_dim : int
-        Dimension of the bottleneck layer between modules (default: 24)
+    bottleneck_dim : int or list
+        Dimension of the bottleneck layer between modules (default: 24).
+        If a list, pipeline will iterate over all values.
     
     Returns
     -------
     dict
-        Configuration dictionary with 'observation_module' and 'context_module' sub-configs
+        Configuration dictionary with 'observation_module' and 'context_module' sub-configs,
+        plus 'bottleneck_dims' list for iteration in pipeline.
     """
+    # Support both scalar and list for bottleneck_dim
+    bottleneck_dims = bottleneck_dim if isinstance(bottleneck_dim, list) else [bottleneck_dim]
+    # Use first value as default for config (will be overridden per-run)
+    default_bottleneck = bottleneck_dims[0]
     
     observation_module_config = {
         "input_dim": model_config.get('input_dim', 1),
         "output_dim": model_config.get('output_dim', 2),  # (mu, var)
         "rnn_hidden_dim": 64, # or model_config.get('rnn_hidden_dim', 64) model # Will be overridden per-run by h_dim in pipeline_single_config # TODO: why and where overriden?
         "rnn_n_layers": model_config.get('rnn_n_layers', 1),
-        "bottleneck_dim": bottleneck_dim,
+        "bottleneck_dim": default_bottleneck,
     }
     
     context_module_config = {
@@ -132,11 +138,12 @@ def get_module_network_config(model_config, data_config, bottleneck_dim=24):
         "output_dim": data_config.get('N_ctx', 2),  # Number of contexts to classify
         "rnn_hidden_dim": 32, # or model_config.get('rnn_hidden_dim', 32)  # Will be overridden per-run by h_dim in pipeline_single_config
         "rnn_n_layers": model_config.get('rnn_n_layers', 1),
-        "bottleneck_dim": bottleneck_dim,
+        "bottleneck_dim": default_bottleneck,
     }
     
     return {
         "kappa": 0.5,  # Balance between observation and context losses # TODO: study best value
+        "bottleneck_dims": bottleneck_dims,  # List of bottleneck dims to iterate over
         "observation_module": observation_module_config,
         "context_module": context_module_config,
         **{k: v for k, v in model_config.items() if k not in ['input_dim', 'output_dim', 'rnn_hidden_dims', 'rnn_n_layers']},
