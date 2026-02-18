@@ -34,10 +34,10 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/refactored
 /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
     --models module_network \
     --learning_rates 0.01 \
-    --bottleneck_dims 4 8 16 32 \
+    --bottleneck_dims 2 4 8 16 32 \
     --objectives obs \
     --n_ctx 2 \
-    --gm_name HierarchicalGM \
+    --gm_name NonHierarchicalGM \
     --skip_benchmarks
 
 # Verify Python version and activated environment

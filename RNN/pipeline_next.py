@@ -1422,15 +1422,15 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
     # Handle training benchmarks
     if compute_train:
         if benchmarkfile_train.exists():
-            print("Loading precomputed training benchmarks...")
+            print(f"Loading precomputed training benchmarks from {benchmarkfile_train}")
             with open(benchmarkfile_train, 'rb') as f:
                 benchmarks_train = pickle.load(f)
         else:
             has_partial_train = incr_dir_train.exists() and len(list(incr_dir_train.glob("sample_*.pkl"))) > 0
             if has_partial_train:
-                print("Found partial training benchmarks, resuming...")
+                print(f"Found partial training benchmarks in {incr_dir_train}, resuming...")
             else:
-                print("Computing training benchmarks...")
+                print(f"Computing training benchmarks (will save to {benchmarkfile_train})...")
             print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
             benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train', individual=True, max_cores=max_cores)
             if visualize:
@@ -1439,15 +1439,15 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
     # Handle test benchmarks
     if compute_test:
         if benchmarkfile_test.exists():
-            print("Loading precomputed test benchmarks...")
+            print(f"Loading precomputed test benchmarks from {benchmarkfile_test}")
             with open(benchmarkfile_test, 'rb') as f:
                 benchmarks_test = pickle.load(f)
         else:
             has_partial_test = incr_dir_test.exists() and len(list(incr_dir_test.glob("sample_*.pkl"))) > 0
             if has_partial_test:
-                print("Found partial test benchmarks, resuming...")
+                print(f"Found partial test benchmarks in {incr_dir_test}, resuming...")
             else:
-                print("Computing test benchmarks...")
+                print(f"Computing test benchmarks (will save to {benchmarkfile_test})...")
             print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
             benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test', individual=True, max_cores=max_cores)
             if visualize:
