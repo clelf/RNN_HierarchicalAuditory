@@ -35,6 +35,11 @@ from typing import List, Optional
 
 import torch
 
+# Add current directory to path for local imports
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 # Local imports
 from config_v2 import (
     RunConfig,
@@ -49,9 +54,6 @@ from pipeline_core_v2 import (
 )
 
 # Import benchmark functions from original pipeline (reusing, not rewriting)
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from pipeline_next import load_or_compute_benchmarks, get_ctx_gm_subpath, compute_benchmarks, benchmarks_pars_viz
 
 

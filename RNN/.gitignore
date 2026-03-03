@@ -2,5 +2,6 @@
 *.pkl
 *.out
 *.err
+*.json
 
 

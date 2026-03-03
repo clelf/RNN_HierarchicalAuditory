@@ -29,12 +29,10 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 # Plotting backend
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# Local imports - reuse existing code
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Local imports - reuse existing code (files are now in the same directory)
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from model import SimpleRNN, VRNN, ModuleNetwork
 from objectives import Objective
 
@@ -66,11 +64,11 @@ from pipeline_next import (
     MIN_OBS_FOR_EM,
 )
 
-# Generative models
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+# Generative models (PreProParadigm is one level up from RNN/)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from PreProParadigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
 
-# Local config
+# Local config (config_v2 is now in the same directory)
 from config_v2 import RunConfig, run_config_to_model_dict, run_config_to_training_dict
 
 
@@ -519,7 +517,7 @@ def _save_validation_samples(metrics, config, epoch, title, benchmarks):
         kwargs['kalman_mu'] = metrics['mu_kal']
         kwargs['min_obs_for_em'] = metrics['min_obs']
     
-    plot_samples(metrics['y'], metrics['mu_estim'], metrics['sigma_estim'], save_path, **kwargs)
+    plot_samples(metrics['y'], metrics['mu_estim'], metrics['sigma_estim'], save_path, **kwargs) # TODO: also pass contexts
 
 
 def _save_training_plots(history, config, title, benchmarks):

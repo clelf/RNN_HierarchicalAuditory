@@ -1244,19 +1244,30 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.close()
 
 
-def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_len=None, data_config=None, hidden_states=None, contexts=None, min_obs_for_em=None):
+
+
+
+def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_start=None, seq_end=None, data_config=None, hidden_states=None, contexts=None, min_obs_for_em=None, N_plots=8, shared_ylim=False, contexts_probs=None, contexts_preds=None):
     """
     Plot observation sequences with model and optional Kalman filter predictions.
     
-    Note on alignment:
-    - obs has length T (full sequence)
-    - mu_estim has length T-1 (predictions for y[1:T])
-    - kalman_mu has length T-MIN_OBS_FOR_EM (predictions for y[MIN_OBS_FOR_EM:T])
-      KF needs MIN_OBS_FOR_EM observations for EM, so starts predicting later
-    - Model predictions plotted at x=[1, T-1], KF predictions at x=[MIN_OBS_FOR_EM, T-1]
+    Alignment:
+    - obs has shape (N, T)
+    - mu_estim has shape (N, T-1): mu_estim[:, k] predicts obs[:, k+1], so their ends are aligned
+    - kalman_mu has shape (N, T-MIN_OBS_FOR_EM): predicts obs[:, MIN_OBS_FOR_EM:], ends also aligned
+    - contexts_preds / contexts_probs have shape (N, T-1): aligned with mu_estim
+    - contexts has shape (N, T): aligned with obs
+
+    Windowing via seq_start / seq_end (both refer to obs indices, negative = from end):
+    - obs is sliced as obs[:, seq_start:seq_end]
+    - all other arrays are sliced from their END by the same number of obs steps (since ends are aligned)
     
     Args:
+        seq_start: Start obs index for the window (default None = beginning). Use negative values
+                   (e.g. -100) to take the last N observations.
+        seq_end:   End obs index for the window (default None = end of sequence).
         min_obs_for_em: Minimum observations needed for KF EM (default: MIN_OBS_FOR_EM constant)
+        shared_ylim: If True, use the same y-axis limits across all plotted samples (default: False)
     """
     # Set default for min_obs_for_em
     if min_obs_for_em is None:
@@ -1271,81 +1282,217 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
     n_ctx = data_config.get("N_ctx", 1) if data_config is not None else 1
 
     # For HierarchicalGM, plot only the last 8 blocks if sequence is long enough
-    if data_config is not None and data_config.get("gm_name") == "HierarchicalGM":
-        N_tones = data_config.get("N_tones", 8)
+    if data_config is not None and data_config["gm_name"] == "HierarchicalGM":
+        N_tones = data_config["N_tones"]
         last_8_blocks_len = 8 * N_tones
         if obs.shape[1] > last_8_blocks_len:
-            seq_len = last_8_blocks_len
-    
-    # Truncate sequences if seq_len is provided
-    if seq_len is not None:
-        # Take last seq_len observations: obs indices [T-seq_len, ..., T-1]
-        obs = obs[:, -seq_len:]
-        # Take last seq_len-1 model predictions that predict obs[1:seq_len] (the last seq_len-1 obs)
-        mu_estim = mu_estim[:, -(seq_len-1):]
-        sigma_estim = sigma_estim[:, -(seq_len-1):]
-        # Take last seq_len-min_obs_for_em KF predictions that predict obs[min_obs_for_em:seq_len]
-        if kalman_mu is not None:
-            kalman_mu = kalman_mu[:, -(seq_len-min_obs_for_em):]
-        if kalman_sigma is not None:
-            kalman_sigma = kalman_sigma[:, -(seq_len-min_obs_for_em):]
-        if hidden_states is not None:
-            hidden_states = hidden_states[:, -seq_len:, :]
+            seq_start = -last_8_blocks_len
+            seq_end = None
+
+    # ── Windowing ──────────────────────────────────────────────────────────────
+    # Resolve start/end to concrete obs indices so we can compute how many obs steps
+    # the window covers and slice all other arrays consistently from their ends.
+    #
+    # Alignment note:
+    #   mu_estim[k] predicts obs[k+1] (shape T-1). When the window starts past the
+    #   very first obs (start_idx > 0), we can include mu_estim[start_idx-1] which
+    #   predicts obs[start_idx], giving predictions the SAME length as the obs window.
+    #   In that case preds_aligned=True and predictions are plotted at x = 0..W-1
+    #   just like obs. When start_idx == 0 the first obs has no prediction, so
+    #   preds_aligned=False and predictions are plotted at x = 1..W-1 (one fewer).
+    preds_aligned = False  # default: predictions are 1 shorter than obs
+
+    if seq_start is not None or seq_end is not None:
+        T_obs = obs.shape[1]
+        # Resolve to non-negative indices
+        start_idx = (seq_start % T_obs) if seq_start is not None else 0
+        end_idx   = (seq_end   % T_obs) if seq_end   is not None else T_obs
+
+        obs = obs[:, start_idx:end_idx]
+
+        if start_idx > 0:
+            # We can grab the prediction for obs[start_idx] from mu_estim[start_idx-1],
+            # so predictions have the same length as the obs window.
+            preds_aligned = True
+            mu_estim    = mu_estim[:, start_idx - 1:end_idx - 1]
+            sigma_estim = sigma_estim[:, start_idx - 1:end_idx - 1]
+        else:
+            mu_estim    = mu_estim[:, :end_idx - 1]
+            sigma_estim = sigma_estim[:, :end_idx - 1]
+
         if contexts is not None:
-            contexts = contexts[:, -seq_len:]
-            
-    # for some 8 randomly sampled sequences out of the whole batch of length obs.shape[0]
-    N = min(8, obs.shape[0])
-    for id, i in enumerate(np.random.choice(range(N), size=(N,), replace=False)):
-            
-        plt.figure(figsize=(20, 6))
-        
-        # Plot observation (full length of truncated sequence)
-        plt.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
-
-        # Plot model prediction as a distribution (with uncertainty)
-        # After truncation: mu_estim has seq_len-1 elements predicting obs[1:seq_len]
-        # So mu_estim[0] predicts obs[1], mu_estim[k] predicts obs[k+1]
-        # Plot at positions [1, 2, ..., seq_len-1] to align with the observations they predict
-        estim_x = range(1, len(obs[i]))  # [1, ..., len(obs)-1]
-        plt.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
-        plt.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2)
-        
-        # Plot Kalman PREDICTION if provided
-        # KF predictions start at min_obs_for_em (needs 3 obs for EM before first prediction)
-        # kalman_mu has length T-min_obs_for_em, predicting obs[min_obs_for_em:]
-        # kalman_mu[k] predicts obs[k+min_obs_for_em]
-        if kalman_mu is not None and kalman_sigma is not None:
-            kal_x = range(min_obs_for_em, len(obs[i]))  # [min_obs, ..., len(obs)-1]
-            plt.plot(kal_x, kalman_mu[i], label='y_kal_pred', color='green', alpha=0.8)
-            plt.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
-
-        # Plot hidden states if provided
-        if hidden_states is not None:
-            if n_ctx > 1 and contexts is not None:
-                # Plot only hidden state of current active context
-                # --> Stack hidden states for each unique context along a new axis
-                unique_contexts = np.unique(contexts)
-                hidden_states_active = np.stack(
-                    [np.where((contexts == ctx)[..., None], hidden_states, 0) for ctx in unique_contexts],
-                    axis=-1
-                )
-                hidden_states_active = np.sum(hidden_states_active, axis=-1)  # Sum to get active context hidden states
+            contexts = contexts[:, start_idx:end_idx]
+        if contexts_preds is not None:
+            if start_idx > 0:
+                contexts_preds = contexts_preds[:, start_idx - 1:end_idx - 1]
             else:
-                hidden_states_active = hidden_states  # Single context case  
-            plt.plot(range(len(hidden_states)), hidden_states[i, :], label=f'hidden state', color='orange', alpha=0.8)
+                contexts_preds = contexts_preds[:, :end_idx - 1]
+        if contexts_probs is not None:
+            if start_idx > 0:
+                contexts_probs = contexts_probs[:, start_idx - 1:end_idx - 1]
+            else:
+                contexts_probs = contexts_probs[:, :end_idx - 1]
+        if hidden_states is not None:
+            hidden_states = hidden_states[:, start_idx:end_idx, :]
 
-        # For different contexts, add vertical lines to indicate context switches
+        # KF predicts obs[min_obs_for_em:], so its index k corresponds to obs[min_obs_for_em + k].
+        # Within the window obs[start_idx:end_idx], the KF predictions that fall inside are
+        # those for obs[max(start_idx, min_obs_for_em) : end_idx].
+        if kalman_mu is not None or kalman_sigma is not None:
+            kal_obs_start = max(start_idx, min_obs_for_em)  # first obs index KF predicts inside window
+            kal_slice_start = kal_obs_start - min_obs_for_em  # corresponding index into kalman_mu
+            kal_slice_end   = end_idx - min_obs_for_em
+            if kalman_mu is not None:
+                kalman_mu = kalman_mu[:, kal_slice_start:kal_slice_end]
+            if kalman_sigma is not None:
+                kalman_sigma = kalman_sigma[:, kal_slice_start:kal_slice_end]
+            # x-offset where KF predictions start within the windowed obs axis
+            kal_x_start = kal_obs_start - start_idx
+        else:
+            kal_x_start = min_obs_for_em
+    else:
+        kal_x_start = min_obs_for_em
+
+    # for some N randomly sampled sequences out of the whole batch
+    N = min(N_plots, obs.shape[0])
+    selected_indices = np.random.choice(obs.shape[0], size=N, replace=False)
+
+    # DEBUG: print the contexts and observations of the selected samples for inspection
+    print("Selected sample indices for plotting:", selected_indices)
+    print("Number of contexts per sample: ", contexts[selected_indices].sum(axis=1) if contexts is not None else "N/A")
+
+    # Compute shared y-axis limits across all selected samples if requested
+    if shared_ylim:
+        all_values = [obs[i] for i in selected_indices]
+        all_values += [mu_estim[i] for i in selected_indices]
+        all_values += [mu_estim[i] + sigma_estim[i] for i in selected_indices]
+        all_values += [mu_estim[i] - sigma_estim[i] for i in selected_indices]
+        if kalman_mu is not None:
+            all_values += [kalman_mu[i] for i in selected_indices]
+        if kalman_sigma is not None and kalman_mu is not None:
+            all_values += [kalman_mu[i] + kalman_sigma[i] for i in selected_indices]
+            all_values += [kalman_mu[i] - kalman_sigma[i] for i in selected_indices]
+        global_ymin = min(np.min(v) for v in all_values)
+        global_ymax = max(np.max(v) for v in all_values)
+        y_margin = 0.05 * (global_ymax - global_ymin)
+        ylim = (global_ymin - y_margin, global_ymax + y_margin)
+
+    # Labels to keep in the legend (all others are silently dropped)
+    _LEGEND_KEEP = {'y_obs', 'y_hat (model pred)'}
+
+    for id, i in enumerate(selected_indices):
+        # Decide whether to use two subplots (context panel below) or a single axes
+        use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_probs is not None or contexts_preds is not None)
+        ctx_colors = {0: 'tab:blue', 1: 'tab:orange'}
+
+        if use_ctx_panel:
+            fig, (ax_obs, ax_ctx) = plt.subplots(
+                2, 1, figsize=(20, 8),
+                sharex=True,
+                gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.05}
+            )
+        else:
+            fig, ax_obs = plt.subplots(1, 1, figsize=(20, 6))
+            ax_ctx = None
+
+        # ── top subplot: observations + predictions ──────────────────────────
+        ax_obs.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
+
+        # When preds_aligned, predictions cover the same x-range as obs;
+        # otherwise they start one step later (no prediction for the first obs).
+        if preds_aligned:
+            estim_x = range(len(obs[i]))
+        else:
+            estim_x = range(1, len(obs[i]))
+        ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
+        ax_obs.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2)
+
+        if kalman_mu is not None and kalman_sigma is not None:
+            kal_x = range(kal_x_start, kal_x_start + len(kalman_mu[i]))
+            ax_obs.plot(kal_x, kalman_mu[i], label='y_kal_pred', color='green', alpha=0.8)
+            ax_obs.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
+
+        if hidden_states is not None:
+            ax_obs.plot(range(len(hidden_states[i])), hidden_states[i, :], label='hidden state', color='orange', alpha=0.8)
+
+        # context switch vertical lines on the obs panel
         if n_ctx > 1 and contexts is not None:
-            context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1  # +1 to get the index of the new context start
+            context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1
             for cc in context_changes:
-                plt.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
+                ax_obs.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
 
-        plt.legend()
+        if shared_ylim:
+            ax_obs.set_ylim(ylim)
+        if use_ctx_panel:
+            ax_obs.tick_params(labelbottom=False)  # x labels only on bottom panel
+        else:
+            ax_obs.set_xlabel('time step')
+
+        # ── bottom subplot: context lines ─────────────────────────────────────
+        if use_ctx_panel:
+            # Rows (top→bottom in visual order = decreasing y): probs, pred, true
+            # Use integer y positions; higher y = drawn higher
+            ROW_PROB_BASE = 2  # p(ctx_val) at ROW_PROB_BASE + ctx_val  (topmost)
+            ROW_PRED      = 1
+            ROW_TRUE      = 0
+
+            # x-offset for prediction-aligned arrays:
+            # When preds_aligned, probs/preds have the same length as obs → offset 0
+            # Otherwise they are 1 shorter → offset 1 (skip first obs timestep)
+            pred_x_off = 0 if preds_aligned else 1
+
+            if contexts_probs is not None:
+                probs_i = contexts_probs[i]  # shape (W, n_ctx) or (W-1, n_ctx)
+                for ctx_val in range(probs_i.shape[-1]):
+                    row = ROW_PROB_BASE + ctx_val
+                    label_prob = f'p(ctx {ctx_val}) inferred'
+                    for t in range(len(probs_i)):
+                        ax_ctx.hlines(row, t + pred_x_off, t + pred_x_off + 1,
+                                      colors=ctx_colors[ctx_val],
+                                      linewidth=6, alpha=float(probs_i[t, ctx_val]),
+                                      label=label_prob if t == 0 else None)
+
+            if contexts_preds is not None:
+                pred_boundaries = np.concatenate(([0], np.where(np.diff(contexts_preds[i]) != 0)[0] + 1, [len(contexts_preds[i])]))
+                pred_labels_placed = set()
+                for seg_start, seg_end in zip(pred_boundaries[:-1], pred_boundaries[1:]):
+                    ctx_val = int(contexts_preds[i][seg_start])
+                    label = f'ctx {ctx_val} pred' if ctx_val not in pred_labels_placed else None
+                    pred_labels_placed.add(ctx_val)
+                    ax_ctx.hlines(ROW_PRED, seg_start + pred_x_off, seg_end + pred_x_off,
+                                  colors=ctx_colors[ctx_val],
+                                  linewidth=6, alpha=0.8, label=label)
+
+            if contexts is not None:
+                ctx_counts = {0: int((contexts[i] == 0).sum()), 1: int((contexts[i] == 1).sum())}
+                boundaries = np.concatenate(([0], np.where(np.diff(contexts[i]) != 0)[0] + 1, [len(contexts[i])]))
+                ctx_labels_placed = set()
+                for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+                    ctx_val = int(contexts[i][seg_start])
+                    label = f'ctx {ctx_val} (N={ctx_counts[ctx_val]})' if ctx_val not in ctx_labels_placed else None
+                    ctx_labels_placed.add(ctx_val)
+                    ax_ctx.hlines(ROW_TRUE, seg_start, seg_end, colors=ctx_colors[ctx_val], linewidth=6, alpha=0.8, label=label)
+
+            ax_ctx.set_ylim(-0.5, ROW_PROB_BASE + n_ctx - 0.5)
+            ax_ctx.set_yticks([ROW_TRUE, ROW_PRED] + [ROW_PROB_BASE + c for c in range(n_ctx)])
+            ax_ctx.set_yticklabels(['true', 'pred'] + [f'p(ctx {c})' for c in range(n_ctx)], fontsize=8)
+            ax_ctx.set_xlabel('time step')
+
+        # ── shared legend on the right (only selected labels) ────────────────
+        # Collect labels to show: y_obs, y_hat, and "ctx N (N=...)" from the ctx panel
+        handles, labels = [], []
+        for ax in ([ax_obs, ax_ctx] if use_ctx_panel else [ax_obs]):
+            if ax is None:
+                continue
+            h, l = ax.get_legend_handles_labels()
+            for handle, lbl in zip(h, l):
+                if lbl not in labels and (lbl in _LEGEND_KEEP or (lbl is not None and lbl.startswith('ctx') and '(N=' in lbl)):
+                    handles.append(handle)
+                    labels.append(lbl)
+        fig.legend(handles, labels, loc='center left', bbox_to_anchor=(0.92, 0.5), borderaxespad=0, frameon=True)
         plot_title = title
         if params is not None:
             # Extract parameters for sample i, handling both dict and legacy array formats
-            # Dictionary format: access by key
             tau_i = params['tau'][i] if params['tau'].ndim > 0 else params['tau']
             lim_i = params['lim'][i] if params['lim'].ndim > 0 else params['lim']
             si_stat_i = params['si_stat'][i] if np.asarray(params['si_stat']).ndim > 0 else params['si_stat']
@@ -1376,9 +1523,9 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
                 title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat: {si_ratio:.2f}"
                 plot_title = f"{title}\n{title_line1}"
 
-        plt.title(plot_title)
-        plt.savefig(f'{save_path}_s{id}.png')
-        plt.close()
+        ax_obs.set_title(plot_title)
+        fig.savefig(f'{save_path}_s{id}.png', bbox_inches='tight')
+        plt.close(fig)
 
 
 
