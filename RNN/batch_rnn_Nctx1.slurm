@@ -1,48 +1,48 @@
 #!/bin/bash
 #SBATCH --qos=xlong
-#SBATCH --job-name=rnn
+#SBATCH --job-name=onectx_rnn
 #SBATCH --nodes=1              # Use single node to avoid distributed complexity
 #SBATCH --ntasks=1             # Single task (your Python script)
 #SBATCH --cpus-per-task=8      # CPUs for parallel data generation
-#SBATCH --output=/scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/outputs_terminal/test_rnn_%j.out
-#SBATCH --error=/scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/outputs_terminal/test_rnn_%j.err
+#SBATCH --output=/scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/outputs_terminal/modnet_bn_%j.out
+#SBATCH --error=/scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/outputs_terminal/modnet_bn_%j.err
 #SBATCH --mail-type=END,FAIL           # Notifications for job done or fail
 #SBATCH --mail-user=c.levyfidel@bcbl.eu  # Email address for notifications
 #SBATCH --mem=64G              # Increased memory for large batch sizes
 
 
 # Load modules needed
-# module load Python
 module load Miniforge3
 
-# Delete the existing environment
-# conda env remove -p /scratch/clevyfidel/conda_env/rnn
-
-# Create and activate conda env
-# conda env create -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml -p /scratch/clevyfidel/conda_env/rnn
-# conda env create -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml -p /scratch/clevyfidel/conda_env/rnn2
-
-
-# To update existing env with new packages from yml:
-# conda env update -p /scratch/clevyfidel/conda_env/rnn -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml --prune
-# conda activate /scratch/clevyfidel/conda_env/rnn 
+# Activate conda environment
 conda activate /scratch/clevyfidel/conda_env/rnn2
 
-# source ~/.bashrcq
-
 # ============ CONFIGURABLE PARAMETERS ============
-# Flags: --unit_test --skip_benchmarks --use_run_id [name]
-# By default, outputs go to training_results/ directly (no subfolder)
-# Use --use_run_id to create a timestamped subfolder
-# Use --use_run_id <name> to create a custom-named subfolder
-ARGS="--skip_benchmarks"
-# Example with timestamp subfolder: ARGS="--skip_benchmarks --use_run_id"
-# Example with custom subfolder: ARGS="--skip_benchmarks --use_run_id exp_v2"
+# Training ModuleNetwork models with different bottleneck dimensions
+# Fixed learning rate: 0.01
+# Bottleneck dims: 4, 8, 16, 32 (from experiment.py)
+# 
+# Add --use_run_id for timestamped subfolder
+# Add --objectives to specify learning objectives (obs, ctx, obs_ctx)
+# Add --kappa_values for obs_ctx objective weighting
 # =================================================
 
-# Run the Python script
-# /scratch/clevyfidel/conda_env/rnn/bin/python /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/pipeline_multi.py
-/scratch/clevyfidel/conda_env/rnn2/bin/python /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/pipeline_multi.py $ARGS
+# Navigate to the refactored directory
+cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
+
+
+
+# 1 context
+/scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
+    --models rnn vrnn \
+    --learning_rates 0.01 \
+    --hidden_dims 32 64 \
+    --objectives obs ctx \
+    --n_ctx 1 \
+    --gm_name NonHierarchicalGM \
+    --skip_benchmarks \
+    --train_only
+
 
 
 # Verify Python version and activated environment
