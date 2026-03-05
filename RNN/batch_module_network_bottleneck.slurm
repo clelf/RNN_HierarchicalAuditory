@@ -30,15 +30,40 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 # Navigate to the refactored directory
 cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/refactored
 
-# Run the pipeline with module_network models only
+# Run the pipeline with module_network models only: learning obj=obs & ctx, bottleneck dims=2, 4, 8, 16
 /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
     --models module_network \
     --learning_rates 0.01 \
-    --bottleneck_dims 2 4 8 16 32 \
-    --objectives obs \
+    --hidden_dims 64 \
+    --bottleneck_dims 2 4 8 16 \
+    --objectives obs_ctx \
     --n_ctx 2 \
     --gm_name NonHierarchicalGM \
-    --skip_benchmarks
+    --skip_benchmarks \
+    --train_only
+
+# Run the pipeline with module_network models only: learning ob= obs OR ctx, bottleneck dim=8
+/scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
+    --models module_network \
+    --learning_rates 0.01 \
+    --hidden_dims 64 \
+    --bottleneck_dims 8 \
+    --objectives obs ctx \
+    --n_ctx 2 \
+    --gm_name NonHierarchicalGM \
+    --skip_benchmarks \
+    --train_only
+
+# 1 context
+/scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
+    --models rnn vrnn \
+    --learning_rates 0.01 \
+    --hidden_dims 32 64 \
+    --objectives obs ctx \
+    --n_ctx 1 \
+    --gm_name NonHierarchicalGM \
+    --skip_benchmarks \
+    --train_only
 
 # Verify Python version and activated environment
 echo "Python version: $(python --version)"
