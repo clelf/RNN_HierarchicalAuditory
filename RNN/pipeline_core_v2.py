@@ -510,7 +510,7 @@ def _save_validation_samples(metrics, config, epoch, title, benchmarks):
         'params': metrics['pars'],
         'title': title,
         'data_config': config.data.to_gm_dict(config.training.batch_size),
-        'seq_len': config.seq_len_viz,
+        'seq_start': -config.seq_len_viz if config.seq_len_viz is not None else None,
     }
     
     if benchmarks and 'mu_kal' in metrics:

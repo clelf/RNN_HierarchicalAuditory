@@ -1004,9 +1004,9 @@ def train(model, model_config, lr, lr_id, h_dim, model_name, gm_name, data_confi
                     # Pass KF predictions for visualization
                     # mu_estim has shape (N_samples, T-1) predicting y[:, 1:]
                     # mu_kal_pred has shape (N_samples, T-MIN_OBS_FOR_EM) predicting y[:, MIN_OBS_FOR_EM:]
-                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=mu_kal_pred, kalman_sigma=sigma_kal_pred, data_config=data_config, seq_len=seq_len_viz, min_obs_for_em=min_obs) 
+                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, kalman_mu=mu_kal_pred, kalman_sigma=sigma_kal_pred, data_config=data_config, seq_start=-seq_len_viz if seq_len_viz is not None else None, min_obs_for_em=min_obs) 
                 else:
-                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, data_config=data_config, seq_len=seq_len_viz)
+                    plot_samples(y, mu_estim, sigma_estim, params=pars_bench, save_path=f'{save_path}/samples/lr{lr_id}-epoch-{epoch:0>3}_samples', title=lr_title, data_config=data_config, seq_start=-seq_len_viz if seq_len_viz is not None else None)
 
             # Store valid metrics for this epoch
             valid_mse_report.append(mse_model)
