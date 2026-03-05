@@ -2,5 +2,5 @@
 *.pkl
 *.out
 *.err
-
-
+*.zip
+*.json
