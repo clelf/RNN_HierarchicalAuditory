@@ -1356,10 +1356,7 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
     # for some N randomly sampled sequences out of the whole batch
     N = min(N_plots, obs.shape[0])
     selected_indices = np.random.choice(obs.shape[0], size=N, replace=False)
-
-    # DEBUG: print the contexts and observations of the selected samples for inspection
-    print("Selected sample indices for plotting:", selected_indices)
-    print("Number of contexts per sample: ", contexts[selected_indices].sum(axis=1) if contexts is not None else "N/A")
+    # Debug prints removed to avoid index errors when plotting single samples
 
     # Compute shared y-axis limits across all selected samples if requested
     if shared_ylim:

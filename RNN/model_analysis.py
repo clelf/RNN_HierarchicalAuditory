@@ -2,11 +2,129 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 import os
+import torch
 from pathlib import Path
 import evaluate_models as eval
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_hex
 from tqdm import tqdm
+from scipy.stats import norm as sp_norm
+
+
+
+def plot_calibration_curve(
+    y_true: np.ndarray,
+    mu_pred: np.ndarray,
+    var_pred: np.ndarray,
+    save_path: Path = None,
+    title: str = "KS Calibration Plot",
+    ax: plt.Axes = None,
+    color: str = "#1f77b4",
+    label: str = None,
+    alpha_band: float = 0.05,
+):
+    """
+    Plot the empirical CDF of the Probability Integral Transform (PIT) values
+    against the ideal uniform diagonal.
+
+    For a perfectly calibrated model the PIT values are Uniform(0,1), so the
+    empirical CDF should lie on the diagonal.  The maximum vertical distance
+    from the diagonal is the Kolmogorov–Smirnov D-statistic.
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (n_samples, seq_len)
+        True observations.
+    mu_pred : np.ndarray, shape (n_samples, seq_len)
+        Predicted means.
+    var_pred : np.ndarray, shape (n_samples, seq_len)
+        Predicted variances.
+    save_path : Path, optional
+        If given, save the figure to this path.
+    title : str
+        Plot title.
+    ax : matplotlib Axes, optional
+        If provided, draw on this axes (useful for multi-panel figures).
+    color : str
+        Line colour for the empirical CDF.
+    label : str, optional
+        Legend label for the empirical CDF curve.
+    alpha_band : float
+        Significance level for the KS confidence band (default 0.05 → 95 %).
+
+    Returns
+    -------
+    fig : matplotlib Figure or None
+        The figure object (None when an external *ax* was supplied).
+    ks_stat : float
+        The pooled KS D-statistic.
+    """
+
+    # --- Compute PIT values (pooled across samples & time) ---
+    sigma_pred = np.sqrt(var_pred)
+    pit = sp_norm.cdf((y_true - mu_pred) / sigma_pred)
+    pit_flat = pit.ravel()
+    pit_flat = pit_flat[~np.isnan(pit_flat)]
+    pit_flat.sort()
+
+    n = len(pit_flat)
+    ecdf = np.arange(1, n + 1) / n          # empirical CDF values
+    F    = pit_flat                           # theoretical quantiles (sorted PITs)
+
+    # KS statistic = max |ECDF(f) - f|
+    ks_stat = np.max(np.abs(ecdf - F))
+
+    # --- KS confidence band width ---
+    # c(alpha) for two-sided KS test: 1.36 (alpha=0.05), 1.22 (0.10), 1.63 (0.01)
+    c_alpha = {0.01: 1.63, 0.05: 1.36, 0.10: 1.22}.get(alpha_band, 1.36)
+    band_half = c_alpha / np.sqrt(n)
+
+    # --- Plot ---
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(6, 6))
+    else:
+        fig = None
+
+    # Confidence band around the diagonal
+    F_grid = np.linspace(0, 1, 500)
+    ax.fill_between(
+        F_grid,
+        np.clip(F_grid - band_half, 0, 1),
+        np.clip(F_grid + band_half, 0, 1),
+        color="grey", alpha=0.75,
+        label=f"{int((1-alpha_band)*100)}% KS band",
+    )
+
+    # Ideal diagonal
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Ideal (Uniform)")
+
+    # Empirical CDF of PITs
+    ax.plot(F, ecdf, color=color, linewidth=1.5,
+            label=label or f"Empirical CDF (D={ks_stat:.4f})")
+
+    # Mark the point of maximum deviation
+    idx_max = np.argmax(np.abs(ecdf - F))
+    ax.plot([F[idx_max], F[idx_max]], [F[idx_max], ecdf[idx_max]],
+            color="red", linewidth=1.5, linestyle="-",
+            label=f"Max deviation = {ks_stat:.4f}")
+    ax.plot(F[idx_max], ecdf[idx_max], "o", color="red", markersize=5)
+
+    ax.set_xlabel("PIT value (theoretical quantile)")
+    ax.set_ylabel("Empirical CDF")
+    ax.set_title(title)
+    ax.legend(loc="lower right", fontsize=9)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+
+    if own_fig and save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved calibration plot to: {save_path}")
+        plt.close(fig)
+
+    return fig, ks_stat
+
 
 def get_desired_order(results):
     # Categorize models
@@ -30,12 +148,12 @@ if __name__ == "__main__":
     # Toggle: when True, load KF benchmark predictions and overlay them on the plots
     USE_BENCHMARK_DATA = True
 
-    models_dir = Path(__file__).parent.resolve() / Path('training_results_CORRECT/N_ctx_2/NonHierarchicalGM_selected')
+    models_dir = Path(__file__).parent.resolve() / Path('training_results/N_ctx_2/NonHierarchicalGM')
     output_dir = Path(__file__).parent.resolve() / Path('evaluation_results/model_comparison/')
     output_dir.mkdir(parents=True, exist_ok=True)
     benchmark_results_path = (
         Path(__file__).parent.resolve()
-        / 'benchmarks_CORRECT' / 'N_ctx_2' / 'NonHierarchicalGM' / 'benchmarks_1000_test.pkl'
+        / 'benchmarks' / 'N_ctx_2' / 'NonHierarchicalGM' / 'benchmarks_1000_test.pkl'
     )
 
    # Loading models info
@@ -54,7 +172,6 @@ if __name__ == "__main__":
     if USE_BENCHMARK_DATA:
         benchmark_data = eval.load_benchmark_data(benchmark_results_path)
         # Build test_data dict compatible with evaluate_model
-        import torch
         test_data = {
             'y': torch.tensor(benchmark_data.y, dtype=torch.float32).unsqueeze(-1),
             'y_np': benchmark_data.y,
@@ -67,10 +184,15 @@ if __name__ == "__main__":
     # For each model, test the model on the dataset and compute metrics
     # metrics should not be averaged for one model but should be stored as a distribution of metrics for each model
     # use load_model and evaluate_model functions from evaluate_models.py to load the model and compute metrics
+    # When benchmark data is used, restrict model evaluation to the same timestep
+    # window as the KF (y[min_obs_for_em:]) so per-sample metrics are comparable.
+    eval_min_obs = benchmark_data.min_obs_for_em if USE_BENCHMARK_DATA else None
+
     results = {}
     for info in tqdm(models_info, desc="Evaluating models"):
         model = eval.load_model(info)
-        metrics = eval.evaluate_model(model, info, test_data, reduce=False)
+        metrics = eval.evaluate_model(model, info, test_data, reduce=False,
+                                      min_obs_for_em=eval_min_obs)
         model_name = info.model_dir.name
         results[model_name] = metrics
 
@@ -137,6 +259,36 @@ if __name__ == "__main__":
         results_ord[mod]['color'] = color
         results_ord[mod]["disp_name"] = 'Obj=' + obj + ' ' + (f"(k={results_ord[mod]['kappa']}) " if obj=='obs_ctx' else '') + 'bdim=' + f"{results_ord[mod]['bottleneck_dim']}"
 
+    
+
+    # =========================================================================
+    # Figure 3 – KS Calibration curves for all models
+    # =========================================================================
+    for mod_name in results_ord:
+        # Find corresponding ModelInfo
+        mod_info = next((info for info in models_info if info.model_dir.name == mod_name), None)
+        if mod_info is None:
+            continue
+        # Re-run forward pass to get raw predictions (needed for the plot)
+        model = eval.load_model(mod_info)
+        with torch.no_grad():
+            model_output = model(test_data['y'][:, :-1, :])
+            mu_pred, var_pred, _ = eval.extract_model_predictions(model, model_output)
+
+        y_target = test_data['y_np'][:, 1:]   # same alignment as evaluate_model
+
+        disp = results_ord[mod_name]['disp_name']
+        cal_save = output_dir / f"calibration_curve_{mod_name}.png"
+        plot_calibration_curve(
+            y_target, mu_pred, var_pred,
+            save_path=cal_save,
+            title=f"KS Calibration – {disp}",
+            color=results_ord[mod_name].get('color', '#1f77b4'),
+        )
+    
+    #========================================================================
+    # Figure 1 – Comparison of metrics across models (violin plots)
+    #===========================================================================
     # Plot comparison of the different metrics across models (one plot per metric)
 
     # fig, axd = plt.subplot_mosaic([['mse', 'log_likelihood', 'ks_statistic'],
@@ -248,12 +400,10 @@ if __name__ == "__main__":
         # Observation-level metrics (those with a KF counterpart)
         ratio_metrics = ['mse', 'log_likelihood', 'ks_statistic']
 
-        # Single row of 3 metric plots + 1 legend panel
-        fig2, axs2 = plt.subplots(1, 4, figsize=(22, 5),
-                      gridspec_kw={'width_ratios': [1, 1, 1, 0.45]},
-                      constrained_layout=True)
+        # Single row of 3 metric plots
+        fig2, axs2 = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
 
-        for metric, ax in zip(ratio_metrics, axs2[:3]):
+        for metric, ax in zip(ratio_metrics, axs2):
             kf_vals = kf_metrics[metric]  # (N,)
 
             ratio_arrays = []
@@ -303,10 +453,11 @@ if __name__ == "__main__":
         # Legend outside main axes
         handles = [plt.Line2D([0], [0], color='#9B59B6', linestyle='--', linewidth=2, label='KF baseline (ratio = 1)')]
         handles += [plt.Line2D([0], [0], color=color, linewidth=8, label=name) for name, color in zip(mod_names, mod_colors)]
-        axs2[0].legend(handles=handles, loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=13, frameon=False)
+        fig2.legend(handles=handles, loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=13, frameon=False)
 
         save_path2 = output_dir / "model_comparison_ratio_vs_kf.png"
         fig2.savefig(save_path2, bbox_inches='tight')
         plt.close(fig2)
         print(f"Saved model comparison ratio plot to: {save_path2}")
+
 

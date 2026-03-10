@@ -360,12 +360,16 @@ def _validate_epoch(
     ).item()
     
     # Extract predictions
-    mu_estim, var_estim, _ = extract_model_predictions(model, model_output)
+    mu_estim, var_estim, context_output = extract_model_predictions(model, model_output)
     sigma_estim = np.sqrt(var_estim)
     
     # Compute MSE
     y_np = y.detach().cpu().numpy().squeeze()
     mse = ((mu_estim - y_np[:, 1:])**2).mean()
+    
+    # Convert context tensors to numpy for visualization
+    contexts_np = contexts.detach().cpu().numpy() if contexts is not None else None
+    context_output_np = context_output.detach().cpu().numpy() if context_output is not None else None
     
     metrics = {
         'loss': loss,
@@ -375,6 +379,8 @@ def _validate_epoch(
         'sigma_estim': sigma_estim,
         'y': y_np,
         'pars': pars,
+        'contexts': contexts_np,
+        'context_output': context_output_np,
     }
     
     # Compare with Kalman filter if available
@@ -511,13 +517,28 @@ def _save_validation_samples(metrics, config, epoch, title, benchmarks):
         'title': title,
         'data_config': config.data.to_gm_dict(config.training.batch_size),
         'seq_start': -config.seq_len_viz if config.seq_len_viz is not None else None,
+        'N_plots': 4,
     }
     
     if benchmarks and 'mu_kal' in metrics:
         kwargs['kalman_mu'] = metrics['mu_kal']
         kwargs['min_obs_for_em'] = metrics['min_obs']
     
-    plot_samples(metrics['y'], metrics['mu_estim'], metrics['sigma_estim'], save_path, **kwargs) # TODO: also pass contexts
+    # Pass true contexts if available
+    if metrics.get('contexts') is not None:
+        kwargs['contexts'] = metrics['contexts']
+    
+    # Derive predicted context probabilities and hard predictions from context module output
+    context_output_np = metrics.get('context_output')
+    if context_output_np is not None:
+        # context_output_np: (N, T-1, N_ctx) logits
+        ctx_tensor = torch.from_numpy(context_output_np)
+        contexts_probs = torch.softmax(ctx_tensor, dim=-1).numpy()  # (N, T-1, N_ctx)
+        contexts_preds = np.argmax(context_output_np, axis=-1)       # (N, T-1)
+        kwargs['contexts_probs'] = contexts_probs
+        kwargs['contexts_preds'] = contexts_preds
+    
+    plot_samples(metrics['y'], metrics['mu_estim'], metrics['sigma_estim'], save_path, **kwargs)
 
 
 def _save_training_plots(history, config, title, benchmarks):

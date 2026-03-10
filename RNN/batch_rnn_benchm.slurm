@@ -39,7 +39,8 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
     --objectives obs_ctx \
     --n_ctx 2 \
     --gm_name NonHierarchicalGM \
-    --benchmarks_only
+    --benchmark_only \
+    --benchmark_mode test_only
 
 
 
@@ -51,7 +52,8 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
     --objectives obs ctx \
     --n_ctx 1 \
     --gm_name NonHierarchicalGM \
-    --benchmarks_only
+    --benchmark_only \
+    --benchmark_mode test_only
 
 
 
