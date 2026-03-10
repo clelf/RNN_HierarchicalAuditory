@@ -316,6 +316,10 @@ Examples:
     parser.add_argument('--gm_name', type=str, default='NonHierarchicalGM',
                         choices=['NonHierarchicalGM', 'HierarchicalGM'],
                         help='Generative model name')
+
+    # Training settings
+    parser.add_argument('--num_epochs', type=int, default=100,
+                            help='Number of training epochs (default: 100)')
     
     return parser.parse_args()
 
@@ -332,7 +336,7 @@ def main():
     if args.unit_test:
         training = TrainingConfig.for_unit_test()
     else:
-        training = TrainingConfig()
+        training = TrainingConfig(num_epochs=args.num_epochs)
     
     # Build data config
     data = DataConfig(

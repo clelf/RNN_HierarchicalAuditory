@@ -35,24 +35,27 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
     --models module_network \
     --learning_rates 0.01 \
     --hidden_dims 64 \
-    --bottleneck_dims 2 4 8 16 \
+    --bottleneck_dims 1 2 4\
     --objectives obs_ctx \
     --n_ctx 2 \
     --gm_name NonHierarchicalGM \
     --skip_benchmarks \
-    --train_only
+    --train_only \
+    --num_epochs 200 \
 
-# Run the pipeline with module_network models only: learning ob= obs OR ctx, bottleneck dim=8
-/scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
-    --models module_network \
-    --learning_rates 0.01 \
-    --hidden_dims 64 \
-    --bottleneck_dims 8 \
-    --objectives obs ctx \
-    --n_ctx 2 \
-    --gm_name NonHierarchicalGM \
-    --skip_benchmarks \
-    --train_only
+# # Run the pipeline with module_network models only: learning ob= obs OR ctx, bottleneck dim=8
+# /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
+#     --models module_network \
+#     --learning_rates 0.01 \
+#     --hidden_dims 64 \
+#     --bottleneck_dims 8 \
+#     --objectives obs ctx \
+#     --n_ctx 2 \
+#     --gm_name NonHierarchicalGM \
+#     --skip_benchmarks \
+#     --train_only \
+#     --num_epochs 200 \
+
 
 
 
