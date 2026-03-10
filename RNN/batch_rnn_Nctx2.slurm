@@ -40,7 +40,8 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
     --n_ctx 2 \
     --gm_name NonHierarchicalGM \
     --skip_benchmarks \
-    --train_only
+    --train_only \
+    --num_epochs 200 \
 
 # Run the pipeline with module_network models only: learning ob= obs OR ctx, bottleneck dim=8
 /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
@@ -52,7 +53,9 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
     --n_ctx 2 \
     --gm_name NonHierarchicalGM \
     --skip_benchmarks \
-    --train_only
+    --train_only \
+    --num_epochs 200 \
+
 
 
 
