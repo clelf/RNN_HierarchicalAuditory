@@ -72,17 +72,6 @@ def contexts_to_responsibilities(contexts, n_ctx):
     return responsibilities
 
 
-# TODO CHECK-LIST
-# - a loss tolerance?
-# - an early stopping in case of overfitting (ABSOLUTELY according to Seyma) --> include IF i observe overfitting
-# - dropout?
-# - assess need to change activation function or not (hand in hand with changing the models' inner layers' architecture)
-# - set requires_grad / autograd
-
-
-# TODO:
-# - load params
-
 
 class MinMaxScaler():
     def __init__(self):
@@ -572,11 +561,11 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
     Args:
         data_config (dict): Configuration parameters for the data generative model.
         N_samples (int, optional): Number of samples to generate. If None, uses data_config["N_samples"].
-        n_iter (int): Number of iterations for kalman_fit_batch.
+        n_iter (int): Number of iterations for kalman_fit_predict.
         benchmarkpath (Path or None): Path to save the benchmark file. If None, benchmarks are not saved.
         save (bool): Whether to save the benchmark data.
         suffix (str): Suffix for the benchmark filename.
-        individual (bool): If True, save each sample individually to avoid losing progress on crash.
+        individual (bool): If True, save each sample individually to allow resuming on crash.
                            The samples are aggregated at the end. Default: True.
         max_cores (int, optional): Number of parallel cores for KF fitting.
                                      None or 1 = sequential processing (default).
@@ -587,143 +576,110 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
         dict: A dictionary containing observations, contexts (if N_ctx>1), Kalman estimates, 
               parameters, and performance metrics.
     """
-    
+
     # Define data generative model
     if gm_name == 'NonHierarchicalGM': gm = NonHierachicalAuditGM(data_config)
     elif gm_name == 'HierarchicalGM': gm = HierarchicalAuditGM(data_config)
     else: raise ValueError("Invalid GM name")
-    
+
     # Determine number of samples
     if N_samples is None:
         N_samples = data_config["N_samples"]
-    
+
     # Determine parallelization settings
     if max_cores == -1:
         max_cores = cpu_count()
     use_parallel = HAS_PATHOS and max_cores is not None and max_cores > 1 and N_samples > 1
     if use_parallel:
         print(f"  Parallel processing enabled with {max_cores} cores (pathos available: {HAS_PATHOS})")
-    
-    # Set up individual directory if needed
-    if save and individual and benchmarkpath is not None:
+
+    use_individual = individual and save and benchmarkpath is not None
+
+    # --- Data generation (with optional resume from a previous run) ---
+    existing_samples = set()
+    incr_dir = None
+
+    if use_individual:
         incr_dir = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, N_samples, suffix)
         os.makedirs(incr_dir, exist_ok=True)
-        
-        # Check if we have saved input data from a previous run (for reproducibility on resume)
-        input_data_file = incr_dir / "input_data.pkl"
-        
-        # Check which samples already exist (for resuming)
         existing_samples = set(int(f.stem.split('_')[1]) for f in incr_dir.glob("sample_*.pkl"))
         start_sample = len(existing_samples)
-        
+        input_data_file = incr_dir / "input_data.pkl"
+
         if input_data_file.exists() and start_sample > 0:
-            # Resume: load the original input data to ensure consistency
+            # Resume: reload original input data to guarantee consistency
             print(f"  Resuming from sample {start_sample}/{N_samples} (found {start_sample} existing samples)")
-            print(f"  Loading original input data for consistency...")
             with open(input_data_file, 'rb') as f:
                 input_data = pickle.load(f)
-            y_batch = input_data['y']
-            contexts_batch = input_data['contexts']
-            pars_batch = input_data['pars']
+            y_batch, contexts_batch, pars_batch = input_data['y'], input_data['contexts'], input_data['pars']
         else:
-            # Fresh start: generate new samples and save input data
+            # Fresh start: generate and persist input data for potential future resume
             print(f"  Generating {N_samples} samples...")
             if gm_name == 'NonHierarchicalGM':
                 contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
             elif gm_name == 'HierarchicalGM':
                 _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
-            
-            # Save input data for potential resume
-            input_data = {'y': y_batch, 'contexts': contexts_batch, 'pars': pars_batch}
             with open(input_data_file, 'wb') as f:
-                pickle.dump(input_data, f)
-            print(f"  Input data saved")
+                pickle.dump({'y': y_batch, 'contexts': contexts_batch, 'pars': pars_batch}, f)
+            print(f"  Input data saved to {input_data_file}")
     else:
-        existing_samples = set()
         start_sample = 0
-        incr_dir = None  # No saving in non-individual mode
-        # Generate samples (non-individual mode)
         print(f"  Generating {N_samples} samples...")
         if gm_name == 'NonHierarchicalGM':
             contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
         elif gm_name == 'HierarchicalGM':
             _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
-    
-    # Process sample-by-sample with individual saving (supports parallel processing)
-    if individual and save and benchmarkpath is not None:
-        # Build list of samples to process (skip already-processed ones)
-        samples_to_process = [i for i in range(N_samples) if i not in existing_samples]
-        
-        if len(samples_to_process) == 0:
-            print(f"  All {N_samples} samples already processed.")
+
+    # --- KF fitting (sample-by-sample, sequential or parallel) ---
+    samples_to_process = [i for i in range(N_samples) if i not in existing_samples]
+
+    if len(samples_to_process) == 0:
+        print(f"  All {N_samples} samples already processed.")
+        results = []
+    else:
+        print(f"  Processing {len(samples_to_process)} samples...")
+        args_list = [
+            (i,
+             y_batch[i],
+             contexts_batch[i] if contexts_batch is not None else None,
+             {key: val[i] for key, val in pars_batch.items()},
+             N_ctx, n_iter, incr_dir)
+            for i in samples_to_process
+        ]
+
+        if use_parallel:
+            print(f"  Using {max_cores} parallel cores...")
+            with ProcessingPool(nodes=max_cores) as pool:
+                results = list(tqdm(
+                    pool.imap(_process_single_kf_sample, args_list),
+                    total=N_samples, desc="KF fitting (parallel)", initial=start_sample
+                ))
         else:
-            print(f"  Processing {len(samples_to_process)} samples with individual saving...")
-            
-            # Prepare arguments for each sample
-            args_list = [
-                (i, 
-                 y_batch[i], 
-                 contexts_batch[i] if contexts_batch is not None else None,
-                 {key: val[i] for key, val in pars_batch.items()},
-                 N_ctx,
-                 n_iter,
-                 incr_dir)
-                for i in samples_to_process
+            results = [
+                _process_single_kf_sample(args)
+                for args in tqdm(args_list, desc="KF fitting", total=N_samples, initial=start_sample)
             ]
-            
-            if use_parallel:
-                # Parallel processing with pathos
-                print(f"  Using {max_cores} parallel cores...")
-                with ProcessingPool(nodes=max_cores) as pool:
-                    # Use imap for progress tracking
-                    results = list(tqdm(
-                        pool.imap(_process_single_kf_sample, args_list),
-                        total=N_samples,
-                        desc="KF fitting (parallel)",
-                        initial=start_sample
-                    ))
-            else:
-                # Sequential processing with progress bar
-                for args in tqdm(args_list, desc="KF fitting", total=N_samples, initial=start_sample):
-                    _process_single_kf_sample(args)
-        
-        # Aggregate all individual files into final benchmark file
+
+    # --- Assemble benchmark_kit ---
+    if use_individual:
+        # Aggregate from individually saved files (handles both fresh and resumed runs)
         print(f"  Aggregating individual files...")
         benchmark_kit = aggregate_individual_benchmarks(benchmarkpath, N_ctx, gm_name, N_samples, suffix)
-        
     else:
-        # Original batch processing (faster but no crash recovery)
-        print(f"  Fitting Kalman filters (batch mode)...")
-        if N_ctx == 1:
-            kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_batch(y_batch, n_iter=n_iter)
-        else:
-            # Convert context labels to responsibilities for multicontext KF
-            responsibilities_batch = np.array([
-                contexts_to_responsibilities(contexts_batch[i], N_ctx) 
-                for i in range(len(contexts_batch))
-            ])  # Shape: (N_samples, T, N_ctx)
-            kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_multicontext_batch(
-                y_batch, responsibilities_batch, n_iter=n_iter
-            )
-        
-        # Compute MSE
-        mses = ((kalman_mu_pred - y_batch[:, MIN_OBS_FOR_EM:]) ** 2).mean(axis=1)
-
+        # Build from in-memory results
         benchmark_kit = {
-            'y': y_batch,
-            'contexts': contexts_batch,
-            'mu_kal_pred': kalman_mu_pred,
-            'sigma_kal_pred': kalman_sigma_pred,
-            'pars': pars_batch, 
-            'perf': mses,
+            'y': np.stack([s['y'] for s in results]),
+            'contexts': np.stack([s['contexts'] for s in results]) if results[0]['contexts'] is not None else None,
+            'mu_kal_pred': np.stack([s['mu_kal_pred'] for s in results]),
+            'sigma_kal_pred': np.stack([s['sigma_kal_pred'] for s in results]),
+            'pars': {key: np.stack([s['pars'][key] for s in results]) for key in results[0]['pars'].keys()},
+            'perf': np.array([s['perf'] for s in results]),
             'n_ctx': N_ctx,
-            'min_obs_for_em': MIN_OBS_FOR_EM
+            'min_obs_for_em': MIN_OBS_FOR_EM,
         }
-
-        if save:
+        if save and benchmarkpath is not None:
             benchmark_file = benchmark_filename(benchmarkpath, N_ctx, gm_name, N_samples, suffix=suffix)
-            if benchmarkpath is not None and not benchmark_file.parent.exists():
-                os.makedirs(benchmark_file.parent)
+            os.makedirs(benchmark_file.parent, exist_ok=True)
             with open(benchmark_file, 'wb') as f:
                 pickle.dump(benchmark_kit, f)
 
@@ -1526,7 +1482,7 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
 
 
 
-def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_cores=None, benchmark_mode='both'):
+def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_cores=None, benchmark_mode='both', suffix_tag=''):
     """
     Load precomputed benchmarks if available, otherwise compute and save them.
     
@@ -1544,17 +1500,22 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
                        'both' (default): Compute/load both train and test benchmarks
                        'test_only': Compute/load only test benchmarks (train=None)
                        'train_only': Compute/load only train benchmarks (test=None)
+        suffix_tag: Optional string appended to file/dir suffixes (e.g. 'unit_test')
+                    to produce distinct benchmark files without overwriting existing ones.
     
     Returns:
         tuple: (benchmarks_train, benchmarks_test) - either may be None based on benchmark_mode
     """
     benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
-    benchmarkfile_train = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='train')
-    benchmarkfile_test = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='test')
+    tag = f'_{suffix_tag}' if suffix_tag else ''
+    suffix_train = f'train{tag}'
+    suffix_test = f'test{tag}'
+    benchmarkfile_train = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_train)
+    benchmarkfile_test = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_test)
     
     # Check for individual directories (partial computation from previous interrupted run)
-    incr_dir_train = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='train')
-    incr_dir_test = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, model_config['batch_size_test'], suffix='test')
+    incr_dir_train = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_train)
+    incr_dir_test = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, model_config['batch_size_test'], suffix=suffix_test)
 
     # Determine which benchmarks to compute based on mode
     compute_train = benchmark_mode in ['both', 'train_only']
@@ -1576,9 +1537,9 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
             else:
                 print(f"Computing training benchmarks (will save to {benchmarkfile_train})...")
             print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-            benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train', individual=True, max_cores=max_cores)
+            benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix=suffix_train, individual=True, max_cores=max_cores)
             if visualize:
-                benchmarks_pars_viz(benchmarks_train, data_config, N_ctx, gm_name, suffix='train')
+                benchmarks_pars_viz(benchmarks_train, data_config, N_ctx, gm_name, suffix=suffix_train)
     
     # Handle test benchmarks
     if compute_test:
@@ -1593,9 +1554,9 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
             else:
                 print(f"Computing test benchmarks (will save to {benchmarkfile_test})...")
             print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-            benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test', individual=True, max_cores=max_cores)
+            benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix=suffix_test, individual=True, max_cores=max_cores)
             if visualize:
-                benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix='test')
+                benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix=suffix_test)
     
     return benchmarks_train, benchmarks_test
 

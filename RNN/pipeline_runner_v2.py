@@ -66,6 +66,7 @@ def run_benchmarks(
     benchmark_mode: str = 'both',
     visualize: bool = True,
     verbose: bool = True,
+    suffix_tag: str = '',
 ):
     """
     Compute Kalman filter benchmarks only (no model training/testing).
@@ -110,6 +111,7 @@ def run_benchmarks(
         visualize=visualize,
         max_cores=grid.data.max_cores,
         benchmark_mode=benchmark_mode,
+        suffix_tag=suffix_tag,
     )
     
     if verbose:
@@ -275,6 +277,9 @@ Examples:
     parser.add_argument('--benchmark_mode', type=str, default='both',
                         choices=['both', 'train_only', 'test_only'],
                         help='Which benchmarks to compute (default: both)')
+    parser.add_argument('--benchmark_tag', type=str, default='',
+                        help='Optional tag appended to benchmark file/dir names to avoid '
+                             'overwriting existing files (e.g. "unit_test")')
     parser.add_argument('--train_only', action='store_true',
                         help='Only train, skip testing')
     parser.add_argument('--test_only', action='store_true',
@@ -373,6 +378,7 @@ def main():
             grid,
             benchmark_mode=args.benchmark_mode,
             visualize=True,
+            suffix_tag=args.benchmark_tag,
         )
         return
     
