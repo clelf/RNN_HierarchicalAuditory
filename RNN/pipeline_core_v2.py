@@ -41,7 +41,6 @@ from pipeline_next import (
     # Data utilities
     prepare_batch_data,
     prepare_benchmark_data,
-    contexts_to_probabilities,
     # Loss and prediction extraction
     compute_model_loss,
     extract_model_predictions,

@@ -35,9 +35,9 @@ from PreProParadigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
 base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 if os.path.exists(os.path.join(base_path, 'Kalman')):
-    from Kalman.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext
+    from Kalman.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext, contexts_to_probabilities
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
-    from KalmanFilterViz1D.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext
+    from KalmanFilterViz1D.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext, contexts_to_probabilities
 else:
     raise ImportError("Neither 'Kalman' nor 'KalmanFilterViz1D' folder found.")
 
@@ -47,29 +47,7 @@ FREQ_MIN = 1400
 FREQ_MAX = 1650
 
 
-def contexts_to_probabilities(contexts, n_ctx):
-    """
-    Convert hard context labels to one-hot responsibilities (soft assignments).
-    
-    This function bridges the gap between generative models that produce hard
-    context labels and Kalman filter functions that expect soft responsibilities.
-    
-    Parameters
-    ----------
-    contexts : np.array
-        1D integer array of shape (T,) with values in [0, n_ctx-1]
-    n_ctx : int
-        Number of contexts
-    
-    Returns
-    -------
-    responsibilities : np.array
-        One-hot encoded array of shape (T, n_ctx) where each row sums to 1.0
-    """
-    T = len(contexts)
-    probabilities = np.zeros((T, n_ctx))
-    probabilities[np.arange(T), contexts.astype(int)] = 1.0
-    return probabilities
+
 
 
 
