@@ -35,9 +35,9 @@ from PreProParadigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
 base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 if os.path.exists(os.path.join(base_path, 'Kalman')):
-    from Kalman.kalman import kalman_fit_predict_batch, kalman_fit_predict_multicontext_batch, MIN_OBS_FOR_EM, kalman_fit_predict, kalman_fit_predict_multicontext
+    from Kalman.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
-    from KalmanFilterViz1D.kalman import kalman_fit_predict_batch, kalman_fit_predict_multicontext_batch, MIN_OBS_FOR_EM, kalman_fit_predict, kalman_fit_predict_multicontext
+    from KalmanFilterViz1D.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext
 else:
     raise ImportError("Neither 'Kalman' nor 'KalmanFilterViz1D' folder found.")
 
@@ -47,7 +47,7 @@ FREQ_MIN = 1400
 FREQ_MAX = 1650
 
 
-def contexts_to_responsibilities(contexts, n_ctx):
+def contexts_to_probabilities(contexts, n_ctx):
     """
     Convert hard context labels to one-hot responsibilities (soft assignments).
     
@@ -67,9 +67,9 @@ def contexts_to_responsibilities(contexts, n_ctx):
         One-hot encoded array of shape (T, n_ctx) where each row sums to 1.0
     """
     T = len(contexts)
-    responsibilities = np.zeros((T, n_ctx))
-    responsibilities[np.arange(T), contexts.astype(int)] = 1.0
-    return responsibilities
+    probabilities = np.zeros((T, n_ctx))
+    probabilities[np.arange(T), contexts.astype(int)] = 1.0
+    return probabilities
 
 
 
@@ -515,11 +515,11 @@ def _process_single_kf_sample(args):
     
     # Fit Kalman filter for this single sample
     if n_ctx == 1:
-        mu_pred_i, sigma_pred_i, _ = kalman_fit_predict(y_i, n_iter=n_iter)
+        mu_pred_i, sigma_pred_i, _ = kalman_online_fit_predict(y_i, n_iter=n_iter)
     else:
         # Convert context labels to responsibilities for multicontext KF
-        responsibilities_i = contexts_to_responsibilities(ctx_i, n_ctx)
-        mu_pred_i, sigma_pred_i, _ = kalman_fit_predict_multicontext(
+        responsibilities_i = contexts_to_probabilities(ctx_i, n_ctx)
+        mu_pred_i, sigma_pred_i, _ = kalman_online_fit_predict_multicontext(
             y_i, responsibilities_i, n_iter=n_iter
         )
     
