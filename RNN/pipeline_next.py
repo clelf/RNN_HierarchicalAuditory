@@ -1181,6 +1181,180 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
 
 
 
+def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None, params=None, kalman_mu=None, kalman_sigma=None, hidden_states=None, contexts=None, contexts_probs=None, contexts_preds=None, preds_aligned=False, shared_ylim=False, ylim=None, kal_x_start=None, data_config=None):
+    """
+    Plot a single observation sequence with model and optional Kalman filter predictions.
+    
+    Args:
+        id: Figure index for naming
+        i: Sample index (index into all arrays)
+        obs: Observation sequences array with shape (N, T)
+        mu_estim: Model estimates with shape (N, T-1)
+        sigma_estim: Model uncertainties with shape (N, T-1)
+        save_path: Path/prefix for saving the figure
+        n_ctx: Number of contexts
+        title: Base title for the plot
+        params: Parameter dictionary for display in title
+        kalman_mu: Kalman filter predictions
+        kalman_sigma: Kalman filter uncertainties
+        hidden_states: Hidden state values
+        contexts: True context assignments
+        contexts_probs: Inferred context probabilities
+        contexts_preds: Predicted contexts
+        preds_aligned: Whether model predictions align with obs x-axis
+        shared_ylim: Whether to use pre-computed shared y-limits
+        ylim: Pre-computed shared y-axis limits (required if shared_ylim=True)
+        kal_x_start: Starting x-position for Kalman filter predictions
+        data_config: Data configuration dictionary
+    """
+    # Decide whether to use two subplots (context panel below) or a single axes
+    use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_probs is not None or contexts_preds is not None)
+    ctx_colors = {0: 'tab:blue', 1: 'tab:orange'}
+
+    if use_ctx_panel:
+        fig, (ax_obs, ax_ctx) = plt.subplots(
+            2, 1, figsize=(20, 8),
+            sharex=True,
+            gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.05}
+        )
+    else:
+        fig, ax_obs = plt.subplots(1, 1, figsize=(20, 6))
+        ax_ctx = None
+
+    # ── top subplot: observations + predictions ──────────────────────────
+    ax_obs.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
+
+    # When preds_aligned, predictions cover the same x-range as obs;
+    # otherwise they start one step later (no prediction for the first obs).
+    if preds_aligned:
+        estim_x = range(len(obs[i]))
+    else:
+        estim_x = range(1, len(obs[i]))
+    ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
+    ax_obs.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2, label='std (model)')
+
+    if kalman_mu is not None and kalman_sigma is not None:
+        kal_x = range(kal_x_start, kal_x_start + len(kalman_mu[i]))
+        ax_obs.plot(kal_x, kalman_mu[i], label='y_kal (KF pred)', color='green', alpha=0.8)
+        ax_obs.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2, label='std (KF)')
+    
+    if hidden_states is not None:
+        ax_obs.plot(range(len(hidden_states[i])), hidden_states[i, :], label='hidden state', color='orange', alpha=0.8)
+
+    # context switch vertical lines on the obs panel
+    if n_ctx > 1 and contexts is not None:
+        context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1
+        for cc in context_changes:
+            ax_obs.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
+
+    if shared_ylim:
+        ax_obs.set_ylim(ylim)
+    if use_ctx_panel:
+        ax_obs.tick_params(labelbottom=False)  # x labels only on bottom panel
+    else:
+        ax_obs.set_xlabel('time step')
+
+    # ── bottom subplot: context lines ─────────────────────────────────────
+    if use_ctx_panel:
+        # Rows (top→bottom in visual order = decreasing y): probs, pred, true
+        # Use integer y positions; higher y = drawn higher
+        ROW_PROB_BASE = 2  # p(ctx_val) at ROW_PROB_BASE + ctx_val  (topmost)
+        ROW_PRED      = 1
+        ROW_TRUE      = 0
+
+        # x-offset for prediction-aligned arrays:
+        # When preds_aligned, probs/preds have the same length as obs → offset 0
+        # Otherwise they are 1 shorter → offset 1 (skip first obs timestep)
+        pred_x_off = 0 if preds_aligned else 1
+
+        if contexts_probs is not None:
+            probs_i = contexts_probs[i]  # shape (W, n_ctx) or (W-1, n_ctx)
+            for ctx_val in range(probs_i.shape[-1]):
+                row = ROW_PROB_BASE + ctx_val
+                label_prob = f'p(ctx {ctx_val}) inferred'
+                for t in range(len(probs_i)):
+                    ax_ctx.hlines(row, t + pred_x_off, t + pred_x_off + 1,
+                                  colors=ctx_colors[ctx_val],
+                                  linewidth=6, alpha=float(probs_i[t, ctx_val]),
+                                  label=label_prob if t == 0 else None)
+
+        if contexts_preds is not None:
+            pred_boundaries = np.concatenate(([0], np.where(np.diff(contexts_preds[i]) != 0)[0] + 1, [len(contexts_preds[i])]))
+            pred_labels_placed = set()
+            for seg_start, seg_end in zip(pred_boundaries[:-1], pred_boundaries[1:]):
+                ctx_val = int(contexts_preds[i][seg_start])
+                label = f'ctx {ctx_val} pred' if ctx_val not in pred_labels_placed else None
+                pred_labels_placed.add(ctx_val)
+                ax_ctx.hlines(ROW_PRED, seg_start + pred_x_off, seg_end + pred_x_off,
+                              colors=ctx_colors[ctx_val],
+                              linewidth=6, alpha=0.8, label=label)
+
+        if contexts is not None:
+            ctx_counts = {0: int((contexts[i] == 0).sum()), 1: int((contexts[i] == 1).sum())}
+            boundaries = np.concatenate(([0], np.where(np.diff(contexts[i]) != 0)[0] + 1, [len(contexts[i])]))
+            ctx_labels_placed = set()
+            for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+                ctx_val = int(contexts[i][seg_start])
+                label = f'ctx {ctx_val} (N={ctx_counts[ctx_val]})' if ctx_val not in ctx_labels_placed else None
+                ctx_labels_placed.add(ctx_val)
+                ax_ctx.hlines(ROW_TRUE, seg_start, seg_end, colors=ctx_colors[ctx_val], linewidth=6, alpha=0.8, label=label)
+
+        ax_ctx.set_ylim(-0.5, ROW_PROB_BASE + n_ctx - 0.5)
+        ax_ctx.set_yticks([ROW_TRUE, ROW_PRED] + [ROW_PROB_BASE + c for c in range(n_ctx)])
+        ax_ctx.set_yticklabels(['true', 'pred'] + [f'p(ctx {c})' for c in range(n_ctx)], fontsize=8)
+        ax_ctx.set_xlabel('time step')
+
+    # ── shared legend on the right (only selected labels) ────────────────
+    # Collect labels to show: y_obs, y_hat, sigma, y_kal, and "ctx N (N=...)" from the ctx panel
+    _LEGEND_KEEP = {'y_obs', 'y_hat (model pred)', 'std (model)', 'y_kal (KF pred)', 'std (KF)'}
+    handles, labels = [], []
+    for ax in ([ax_obs, ax_ctx] if use_ctx_panel else [ax_obs]):
+        if ax is None:
+            continue
+        h, l = ax.get_legend_handles_labels()
+        for handle, lbl in zip(h, l):
+            if lbl not in labels and (lbl in _LEGEND_KEEP or (lbl is not None and lbl.startswith('ctx') and '(N=' in lbl)):
+                handles.append(handle)
+                labels.append(lbl)
+    fig.legend(handles, labels, loc='center left', bbox_to_anchor=(0.92, 0.5), borderaxespad=0, frameon=True)
+    plot_title = title
+    if params is not None:
+        # Extract parameters for sample i, handling both dict and legacy array formats
+        tau_i = params['tau'][i] if params['tau'].ndim > 0 else params['tau']
+        lim_i = params['lim'][i] if params['lim'].ndim > 0 else params['lim']
+        si_stat_i = params['si_stat'][i] if np.asarray(params['si_stat']).ndim > 0 else params['si_stat']
+        si_q_i = params['si_q'][i] if params['si_q'].ndim > 0 else params['si_q']
+        si_r_i = params['si_r'][i] if np.asarray(params['si_r']).ndim > 0 else params['si_r']
+        
+        # Compute si_r/si_stat ratio
+        si_ratio = si_r_i / si_stat_i if si_stat_i != 0 else np.nan
+        
+        if n_ctx == 2:
+            # Two-context case: format like audit_gm with std/dvt labels
+            tau_str = f"std: {tau_i[0]:.2f}, dvt: {tau_i[1]:.2f}"
+            lim_str = f"std: {lim_i[0]:.2f}, dvt: {lim_i[1]:.2f}"
+            si_q_str = f"std: {si_q_i[0]:.2f}, dvt: {si_q_i[1]:.2f}"
+            
+            # Compute d and d_eff for two-context case
+            # d_eff = lim[1] - lim[0] (actual distance)
+            # d = d_eff / si_eff where si_eff = sqrt(si_stat**2 + si_r**2)
+            d_eff = lim_i[1] - lim_i[0]
+            si_eff = np.sqrt(si_stat_i**2 + si_r_i**2)
+            d = d_eff / si_eff if si_eff != 0 else np.nan
+            
+            title_line1 = f"tau: {tau_str}  |  lim: {lim_str}  | d: {d:.2f},  d_eff: {d_eff:.2f}"
+            title_line2 = f"si_stat: {si_stat_i:.2f}  |  si_q: {si_q_str}  |  si_r: {si_r_i:.2f}  |  si_r/si_stat: {si_ratio:.2f}"
+            plot_title = f"{title}\n{title_line1}\n{title_line2}"
+        else:
+            # Single-context case
+            title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat: {si_ratio:.2f}"
+            plot_title = f"{title}\n{title_line1}"
+
+    ax_obs.set_title(plot_title)
+    fig.savefig(f'{save_path}_s{id}.png', bbox_inches='tight')
+    plt.close(fig)
+
+
 def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_start=None, seq_end=None, data_config=None, hidden_states=None, contexts=None, min_obs_for_em=None, N_plots=8, shared_ylim=False, contexts_probs=None, contexts_preds=None):
     """
     Plot observation sequences with model and optional Kalman filter predictions.
@@ -1308,155 +1482,30 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
         y_margin = 0.05 * (global_ymax - global_ymin)
         ylim = (global_ymin - y_margin, global_ymax + y_margin)
 
-    # Labels to keep in the legend (all others are silently dropped)
-    _LEGEND_KEEP = {'y_obs', 'y_hat (model pred)'}
-
+    # Plot each selected sample using plot_sample
     for id, i in enumerate(selected_indices):
-        # Decide whether to use two subplots (context panel below) or a single axes
-        use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_probs is not None or contexts_preds is not None)
-        ctx_colors = {0: 'tab:blue', 1: 'tab:orange'}
-
-        if use_ctx_panel:
-            fig, (ax_obs, ax_ctx) = plt.subplots(
-                2, 1, figsize=(20, 8),
-                sharex=True,
-                gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.05}
-            )
-        else:
-            fig, ax_obs = plt.subplots(1, 1, figsize=(20, 6))
-            ax_ctx = None
-
-        # ── top subplot: observations + predictions ──────────────────────────
-        ax_obs.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
-
-        # When preds_aligned, predictions cover the same x-range as obs;
-        # otherwise they start one step later (no prediction for the first obs).
-        if preds_aligned:
-            estim_x = range(len(obs[i]))
-        else:
-            estim_x = range(1, len(obs[i]))
-        ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
-        ax_obs.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2)
-
-        if kalman_mu is not None and kalman_sigma is not None:
-            kal_x = range(kal_x_start, kal_x_start + len(kalman_mu[i]))
-            ax_obs.plot(kal_x, kalman_mu[i], label='y_kal_pred', color='green', alpha=0.8)
-            ax_obs.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
-
-        if hidden_states is not None:
-            ax_obs.plot(range(len(hidden_states[i])), hidden_states[i, :], label='hidden state', color='orange', alpha=0.8)
-
-        # context switch vertical lines on the obs panel
-        if n_ctx > 1 and contexts is not None:
-            context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1
-            for cc in context_changes:
-                ax_obs.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
-
-        if shared_ylim:
-            ax_obs.set_ylim(ylim)
-        if use_ctx_panel:
-            ax_obs.tick_params(labelbottom=False)  # x labels only on bottom panel
-        else:
-            ax_obs.set_xlabel('time step')
-
-        # ── bottom subplot: context lines ─────────────────────────────────────
-        if use_ctx_panel:
-            # Rows (top→bottom in visual order = decreasing y): probs, pred, true
-            # Use integer y positions; higher y = drawn higher
-            ROW_PROB_BASE = 2  # p(ctx_val) at ROW_PROB_BASE + ctx_val  (topmost)
-            ROW_PRED      = 1
-            ROW_TRUE      = 0
-
-            # x-offset for prediction-aligned arrays:
-            # When preds_aligned, probs/preds have the same length as obs → offset 0
-            # Otherwise they are 1 shorter → offset 1 (skip first obs timestep)
-            pred_x_off = 0 if preds_aligned else 1
-
-            if contexts_probs is not None:
-                probs_i = contexts_probs[i]  # shape (W, n_ctx) or (W-1, n_ctx)
-                for ctx_val in range(probs_i.shape[-1]):
-                    row = ROW_PROB_BASE + ctx_val
-                    label_prob = f'p(ctx {ctx_val}) inferred'
-                    for t in range(len(probs_i)):
-                        ax_ctx.hlines(row, t + pred_x_off, t + pred_x_off + 1,
-                                      colors=ctx_colors[ctx_val],
-                                      linewidth=6, alpha=float(probs_i[t, ctx_val]),
-                                      label=label_prob if t == 0 else None)
-
-            if contexts_preds is not None:
-                pred_boundaries = np.concatenate(([0], np.where(np.diff(contexts_preds[i]) != 0)[0] + 1, [len(contexts_preds[i])]))
-                pred_labels_placed = set()
-                for seg_start, seg_end in zip(pred_boundaries[:-1], pred_boundaries[1:]):
-                    ctx_val = int(contexts_preds[i][seg_start])
-                    label = f'ctx {ctx_val} pred' if ctx_val not in pred_labels_placed else None
-                    pred_labels_placed.add(ctx_val)
-                    ax_ctx.hlines(ROW_PRED, seg_start + pred_x_off, seg_end + pred_x_off,
-                                  colors=ctx_colors[ctx_val],
-                                  linewidth=6, alpha=0.8, label=label)
-
-            if contexts is not None:
-                ctx_counts = {0: int((contexts[i] == 0).sum()), 1: int((contexts[i] == 1).sum())}
-                boundaries = np.concatenate(([0], np.where(np.diff(contexts[i]) != 0)[0] + 1, [len(contexts[i])]))
-                ctx_labels_placed = set()
-                for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
-                    ctx_val = int(contexts[i][seg_start])
-                    label = f'ctx {ctx_val} (N={ctx_counts[ctx_val]})' if ctx_val not in ctx_labels_placed else None
-                    ctx_labels_placed.add(ctx_val)
-                    ax_ctx.hlines(ROW_TRUE, seg_start, seg_end, colors=ctx_colors[ctx_val], linewidth=6, alpha=0.8, label=label)
-
-            ax_ctx.set_ylim(-0.5, ROW_PROB_BASE + n_ctx - 0.5)
-            ax_ctx.set_yticks([ROW_TRUE, ROW_PRED] + [ROW_PROB_BASE + c for c in range(n_ctx)])
-            ax_ctx.set_yticklabels(['true', 'pred'] + [f'p(ctx {c})' for c in range(n_ctx)], fontsize=8)
-            ax_ctx.set_xlabel('time step')
-
-        # ── shared legend on the right (only selected labels) ────────────────
-        # Collect labels to show: y_obs, y_hat, and "ctx N (N=...)" from the ctx panel
-        handles, labels = [], []
-        for ax in ([ax_obs, ax_ctx] if use_ctx_panel else [ax_obs]):
-            if ax is None:
-                continue
-            h, l = ax.get_legend_handles_labels()
-            for handle, lbl in zip(h, l):
-                if lbl not in labels and (lbl in _LEGEND_KEEP or (lbl is not None and lbl.startswith('ctx') and '(N=' in lbl)):
-                    handles.append(handle)
-                    labels.append(lbl)
-        fig.legend(handles, labels, loc='center left', bbox_to_anchor=(0.92, 0.5), borderaxespad=0, frameon=True)
-        plot_title = title
-        if params is not None:
-            # Extract parameters for sample i, handling both dict and legacy array formats
-            tau_i = params['tau'][i] if params['tau'].ndim > 0 else params['tau']
-            lim_i = params['lim'][i] if params['lim'].ndim > 0 else params['lim']
-            si_stat_i = params['si_stat'][i] if np.asarray(params['si_stat']).ndim > 0 else params['si_stat']
-            si_q_i = params['si_q'][i] if params['si_q'].ndim > 0 else params['si_q']
-            si_r_i = params['si_r'][i] if np.asarray(params['si_r']).ndim > 0 else params['si_r']
-            
-            # Compute si_r/si_stat ratio
-            si_ratio = si_r_i / si_stat_i if si_stat_i != 0 else np.nan
-            
-            if n_ctx == 2:
-                # Two-context case: format like audit_gm with std/dvt labels
-                tau_str = f"std: {tau_i[0]:.2f}, dvt: {tau_i[1]:.2f}"
-                lim_str = f"std: {lim_i[0]:.2f}, dvt: {lim_i[1]:.2f}"
-                si_q_str = f"std: {si_q_i[0]:.2f}, dvt: {si_q_i[1]:.2f}"
-                
-                # Compute d and d_eff for two-context case
-                # d_eff = lim[1] - lim[0] (actual distance)
-                # d = d_eff / si_eff where si_eff = sqrt(si_stat**2 + si_r**2)
-                d_eff = lim_i[1] - lim_i[0]
-                si_eff = np.sqrt(si_stat_i**2 + si_r_i**2)
-                d = d_eff / si_eff if si_eff != 0 else np.nan
-                
-                title_line1 = f"tau: {tau_str}  |  lim: {lim_str}  | d: {d:.2f},  d_eff: {d_eff:.2f}"
-                title_line2 = f"si_stat: {si_stat_i:.2f}  |  si_q: {si_q_str}  |  si_r: {si_r_i:.2f}  |  si_r/si_stat: {si_ratio:.2f}"
-                plot_title = f"{title}\n{title_line1}\n{title_line2}"
-            else:
-                # Single-context case
-                title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat: {si_ratio:.2f}"
-                plot_title = f"{title}\n{title_line1}"
-
-        ax_obs.set_title(plot_title)
-        fig.savefig(f'{save_path}_s{id}.png', bbox_inches='tight')
-        plt.close(fig)
+        plot_sample(
+            id=id,
+            i=i,
+            obs=obs,
+            mu_estim=mu_estim,
+            sigma_estim=sigma_estim,
+            save_path=save_path,
+            n_ctx=n_ctx,
+            title=title,
+            params=params,
+            kalman_mu=kalman_mu,
+            kalman_sigma=kalman_sigma,
+            hidden_states=hidden_states,
+            contexts=contexts,
+            contexts_probs=contexts_probs,
+            contexts_preds=contexts_preds,
+            preds_aligned=preds_aligned,
+            shared_ylim=shared_ylim,
+            ylim=ylim if shared_ylim else None,
+            kal_x_start=kal_x_start,
+            data_config=data_config
+        )
 
 
 
