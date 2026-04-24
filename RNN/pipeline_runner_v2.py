@@ -50,11 +50,12 @@ from config_v2 import (
 )
 from pipeline_core_v2 import (
     run_single_config,
+    load_or_compute_benchmarks,
     create_generative_model,
 )
 
-# Import benchmark functions from original pipeline (reusing, not rewriting)
-from pipeline_next import load_or_compute_benchmarks, get_ctx_gm_subpath, compute_benchmarks, benchmarks_pars_viz
+# # Import benchmark functions from original pipeline (reusing, not rewriting)
+# from pipeline_next import get_ctx_gm_subpath, compute_benchmarks, benchmarks_pars_viz
 
 
 # =============================================================================

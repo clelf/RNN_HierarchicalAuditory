@@ -210,6 +210,12 @@ class Objective:
             loss = kappa * obs_loss + (1 - kappa) * ctx_loss
         
         return loss
+    
+
+    def _population_network_loss(self, module_type, target_obs, target_ctx, target_dpos, target_rule, model_output, learning_objective='all'):
+        
+        
+        pass
 
 
 # Standalone helper functions (kept for backward compatibility)

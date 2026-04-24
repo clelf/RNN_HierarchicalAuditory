@@ -268,15 +268,17 @@ class VRNN(VAE):
         return recon_loss + kl_loss # Eq. 11 : - KL divergence + log posterior
 
 
-class ModuleNetwork(nn.Module):
+class ObsCtxModuleNetwork(nn.Module):
+# class CtxObsModuleNetwork(nn.Module):
     """A multi-module neural network architecture with observation and context modules."""
     
     def __init__(self, config):
-        super(ModuleNetwork, self).__init__()
+        super(ObsCtxModuleNetwork, self).__init__()
+        # super(CtxObsModuleNetwork, self).__init__()
 
         self.name = 'module_network'  # For Objective class to identify model type
 
-        # Initialize modules (observation module, context module, rule module)
+        # Initialize modules (observation module, context module)
         self.observation_module = SimpleRNN({
             'input_dim': config['observation_module']['input_dim'],
             'output_dim': config['observation_module']['output_dim'],
@@ -291,9 +293,7 @@ class ModuleNetwork(nn.Module):
             'hidden_dim': config['context_module']['rnn_hidden_dim'],
             'n_layers': config['context_module']['rnn_n_layers'],
             'device': config.get('device', torch.device('cpu'))
-        })
-        # self.rule_module = ...
-        
+        })        
         
         self.readout_obs2ctx = self.inter_module_readout(
             in_dim=config['observation_module']['output_dim'],
@@ -336,18 +336,155 @@ class ModuleNetwork(nn.Module):
         # obs_output, obs_hx = self.observation_module(x, hx=obs_hx, return_hidden=True) # Example of "thinking"
         
         # Compress and send to context module
-        enc_output = self.readout_obs2ctx(obs_output)
-        context_output = self.context_module(enc_output)  # context module has its own independent hidden state
+        enc_obs2ctx_output = self.readout_obs2ctx(obs_output)
+        context_output = self.context_module(enc_obs2ctx_output)  # context module has its own independent hidden state
             
         # Feedback: compress context output
-        enc_feedback = self.readout_ctx2obs(context_output)
+        enc_ctx2obs_output = self.readout_ctx2obs(context_output)
         
         # Second pass: combine context feedback and previous hidden state
-        informed_obs_output = self.observation_module(enc_feedback, hx=obs_hx)
+        informed_obs_output = self.observation_module(enc_ctx2obs_output, hx=obs_hx)
         
         return informed_obs_output, context_output
     
 
+
+# class RuleCtxObsModuleNetwork(ObsCtxModuleNetwork):
+# # class RuleCtxObsModuleNetwork(CtxObsModuleNetwork):
+#     """A multi-module neural network architecture with observation, context and rules modules."""
+    
+#     def __init__(self, config):
+#         super(RuleCtxObsModuleNetwork, self).__init__(config)
+#         self.name = 'rule_module_network'  # For Objective class to identify model type
+
+#         self.dpos_module = SimpleRNN({
+#             'input_dim': config['rule_module']['input_dim'],
+#             'output_dim': config['rule_module']['output_dim'],
+#             'hidden_dim': config['rule_module']['rnn_hidden_dim'],
+#             'n_layers': config['rule_module']['rnn_n_layers'],
+#             'device': config.get('device', torch.device('cpu'))
+#         })
+
+#         self.readout_ctx2dpos = self.inter_module_readout(
+#             in_dim=config['context_module']['output_dim'],
+#             out_dim=config['rule_module']['input_dim'],
+#             bottleneck_dim=config['context_module']['bottleneck_dim']
+#         )
+
+#         self.readout_dpos2ctx = self.inter_module_readout(
+#             in_dim=config['rule_module']['output_dim'],
+#             out_dim=config['context_module']['input_dim'],
+#             bottleneck_dim=config['rule_module']['bottleneck_dim']
+#         )        
+
+
+#     def forward(self, x):
+#         # First pass: observation module processes input
+#         obs_output, obs_hx = self.observation_module(x, return_hidden=True)  # get hidden state
+#         # obs_output, obs_hx = self.observation_module(x, hx=obs_hx, return_hidden=True) # Example of "thinking"
+        
+#         # Compress and send to context module, save hidden states
+#         enc_obs2ctx_output = self.readout_obs2ctx(obs_output)
+#         context_output, ctx_hx = self.context_module(enc_obs2ctx_output, return_hidden=True)
+
+#         # Compress and send to dpos module
+#         enc_ctx2dpos_output = self.readout_ctx2dpos(context_output)
+#         dpos_output = self.rule_module(enc_ctx2dpos_output)
+
+#         # Feedback to context module - get dpos-informed context output: compress dpos output and send back to context module, 
+#         enc_dpos2ctx_output = self.readout_dpos2ctx(dpos_output)
+#         dpos_informed_context_output = self.context_module(enc_dpos2ctx_output, hx=ctx_hx)
+
+#         # Feedback to observation module - get dpos-and-ctx-informed observation output: compress context output and send back to context module, combine context feedback and previous hidden state
+#         enc_ctx2obs_output = self.readout_ctx2obs(dpos_informed_context_output)
+#         dpos_context_informed_obs_output = self.observation_module(enc_ctx2obs_output, hx=obs_hx)
+        
+#         return dpos_context_informed_obs_output, dpos_informed_context_output, dpos_output
+
+    
+
+class PopulationNetwork(ObsCtxModuleNetwork):
+# class RuleCtxObsModuleNetwork(CtxObsModuleNetwork):
+    """A multi-module neural network architecture with observation, context, deviant position and rule modules."""
+    
+    def __init__(self, config):
+        super(PopulationNetwork, self).__init__(config)
+        self.name = 'population_network'  # For Objective class to identify model type
+
+        # Initialize modules (obs and ctx module inherited from ObsCtxModuleNetwork)
+        self.dpos_module = SimpleRNN({
+            'input_dim': config['dpos_module']['input_dim'],
+            'output_dim': config['dpos_module']['output_dim'],
+            'hidden_dim': config['dpos_module']['rnn_hidden_dim'],
+            'n_layers': config['dpos_module']['rnn_n_layers'],
+            'device': config.get('device', torch.device('cpu'))
+        })
+
+        self.rule_module = SimpleRNN({
+            'input_dim': config['rule_module']['input_dim'],
+            'output_dim': config['rule_module']['output_dim'],
+            'hidden_dim': config['rule_module']['rnn_hidden_dim'],
+            'n_layers': config['rule_module']['rnn_n_layers'],
+            'device': config.get('device', torch.device('cpu'))
+        })
+
+        self.readout_ctx2dpos = self.inter_module_readout(
+            in_dim=config['context_module']['output_dim'],
+            out_dim=config['dpos_module']['input_dim'],
+            bottleneck_dim=config['context_module']['bottleneck_dim']  #TODO: decide on how to set bottleneck_dim
+        )
+
+        self.readout_dpos2rule = self.inter_module_readout(
+            in_dim=config['dpos_module']['output_dim'],
+            out_dim=config['context_module']['input_dim'],
+            bottleneck_dim=config['dpos_module']['bottleneck_dim']
+        )     
+
+        self.readout_rule2dpos = self.inter_module_readout(
+            in_dim=config['rule_module']['output_dim'],
+            out_dim=config['dpos_module']['input_dim'],
+            bottleneck_dim=config['rule_module']['bottleneck_dim']
+        )
+
+        self.readout_dpos2ctx = self.inter_module_readout(
+            in_dim=config['dpos_module']['output_dim'],
+            out_dim=config['context_module']['input_dim'],
+            bottleneck_dim=config['dpos_module']['bottleneck_dim']
+        )        
+
+
+    def forward(self, x, q):
+        # 1) Observe visual cue
+        rule_output, rule_hx = self.rule_module(q, return_hidden=True)
+
+        # 2) Compress and inform deviant position identifier module
+        enc_rule2dpos_output = self.readout_rule2dpos(rule_output)
+        dpos_output, dpos_hx = self.dpos_module(enc_rule2dpos_output, return_hidden=True)
+
+        # 3) Compress and inform context identifier module
+        enc_dpos2ctx_output = self.readout_dpos2ctx(dpos_output)
+        ctx_output, ctx_hx = self.context_module(enc_dpos2ctx_output, return_hidden=True)
+
+        # 4) Compress and inform pitch observation estimation module
+        enc_ctx2obs_output = self.readout_dpos2ctx(ctx_output)
+        ctx_output, obs_hx = self.observation_module(enc_ctx2obs_output, return_hidden=True)
+
+        # 5) Observe pitch (use prior-informed obs module)
+        posterior_obs_output = self.observation_module(x, hx=obs_hx)
+
+        # 6) Compress and pass back to context identifier
+        enc_obs2ctx_output = self.readout_obs2ctx(posterior_obs_output)
+        posterior_ctx_output = self.context_module(enc_obs2ctx_output, hx=ctx_hx)
+
+        # 7) Compress and pass back to deviant position identifier
+        enc_ctx2dpos_output = self.readout_ctx2dpos(posterior_ctx_output)
+        posterior_dpos_output = self.dpos_module(enc_ctx2dpos_output, hx=dpos_hx)
+
+        # 8) Compress and pass back to rule identifier module
+        enc_dpos2rule_output = self.readout_dpos2rule(posterior_dpos_output)
+        posterior_rule_output = self.rule_module(enc_dpos2rule_output, hx=rule_hx)
+
+        return posterior_obs_output, posterior_ctx_output, posterior_dpos_output, posterior_rule_output
 
 
 
