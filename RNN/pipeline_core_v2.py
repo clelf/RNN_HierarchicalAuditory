@@ -1349,145 +1349,196 @@ def plot_samples(sample_metrics, save_path, title=None, params=None, seq_start=N
     # Get N_ctx from data_config
     n_ctx = data_config["N_ctx"]
 
-    # For HierarchicalGM, plot only the last 8 blocks if sequence is long enough
+    # Define plotting passes: for HierarchicalGM with long sequences, plot both truncated and full
+    passes = []
     if data_config is not None and data_config["gm_name"] == "HierarchicalGM":
         N_tones = data_config["N_tones"]
         last_8_blocks_len = 8 * N_tones
         if obs.shape[1] > last_8_blocks_len:
-            seq_start = -last_8_blocks_len
-            seq_end = None
-
-    # ── Windowing ──────────────────────────────────────────────────────────────
-    # Resolve start/end to concrete obs indices so we can compute how many obs steps
-    # the window covers and slice all other arrays consistently from their ends.
-    #
-    # Alignment note:
-    #   mu_estim[k] predicts obs[k+1] (shape T-1). When the window starts past the
-    #   very first obs (start_idx > 0), we can include mu_estim[start_idx-1] which
-    #   predicts obs[start_idx], giving predictions the SAME length as the obs window.
-    #   In that case preds_aligned=True and predictions are plotted at x = 0..W-1
-    #   just like obs. When start_idx == 0 the first obs has no prediction, so
-    #   preds_aligned=False and predictions are plotted at x = 1..W-1 (one fewer).
-    preds_aligned = False  # default: predictions are 1 shorter than obs
-
-    if seq_start is not None or seq_end is not None:
-        T_obs = obs.shape[1]
-        # Resolve to non-negative indices
-        start_idx = (seq_start % T_obs) if seq_start is not None else 0
-        end_idx   = (seq_end   % T_obs) if seq_end   is not None else T_obs
-
-        # === Slice observation-aligned arrays (shape T) ===
-        obs = obs[:, start_idx:end_idx]
-        if contexts is not None:
-            contexts = contexts[:, start_idx:end_idx]
-        if dpos_true is not None:
-            dpos_true = dpos_true[:, start_idx:end_idx]
-        if rule_true is not None:
-            rule_true = rule_true[:, start_idx:end_idx]
-        if hidden_states is not None:
-            hidden_states = hidden_states[:, start_idx:end_idx, :]
-        if cues is not None:
-            cues = cues[:, start_idx:end_idx]
-
-        # === Slice prediction-aligned arrays (shape T-1) ===
-        # When start_idx > 0, we can include mu_estim[start_idx-1] which predicts obs[start_idx],
-        # so predictions have the same length as the windowed obs. Otherwise they're 1 shorter.
-        preds_aligned = start_idx > 0
-        
-        if preds_aligned:
-            # prediction arrays: slice [start_idx-1:end_idx-1]
-            pred_slice_start = start_idx - 1
-            pred_slice_end = end_idx - 1
+            passes = [
+                {'seq_start': -last_8_blocks_len, 'seq_end': None, 'suffix': '_last8blocks'},
+                {'seq_start': None, 'seq_end': None, 'suffix': '_full'}
+            ]
         else:
-            # prediction arrays: slice [:end_idx-1]
-            pred_slice_start = 0
-            pred_slice_end = end_idx - 1
-        
-        # Apply the same slice to all prediction-aligned arrays
-        mu_estim = mu_estim[:, pred_slice_start:pred_slice_end]
-        sigma_estim = sigma_estim[:, pred_slice_start:pred_slice_end]
-        if dpos_prob is not None:
-            dpos_prob = dpos_prob[:, pred_slice_start:pred_slice_end]
-        if dpos_pred is not None:
-            dpos_pred = dpos_pred[:, pred_slice_start:pred_slice_end]
-        if rule_prob is not None:
-            rule_prob = rule_prob[:, pred_slice_start:pred_slice_end]
-        if rule_pred is not None:
-            rule_pred = rule_pred[:, pred_slice_start:pred_slice_end]
-        if contexts_pred is not None:
-            contexts_pred = contexts_pred[:, pred_slice_start:pred_slice_end]
-        if contexts_prob is not None:
-            contexts_prob = contexts_prob[:, pred_slice_start:pred_slice_end]
-
-        # === Slice Kalman filter predictions ===
-        # KF predicts obs[min_obs_for_em:], so within window obs[start_idx:end_idx],
-        # KF covers obs[max(start_idx, min_obs_for_em):end_idx]
-        if kalman_mu is not None or kalman_sigma is not None:
-            kal_obs_start = max(start_idx, min_obs_for_em)
-            kal_slice_start = kal_obs_start - min_obs_for_em
-            kal_slice_end = end_idx - min_obs_for_em
-            if kalman_mu is not None:
-                kalman_mu = kalman_mu[:, kal_slice_start:kal_slice_end]
-            if kalman_sigma is not None:
-                kalman_sigma = kalman_sigma[:, kal_slice_start:kal_slice_end]
-            kal_x_start = kal_obs_start - start_idx
-        else:
-            kal_x_start = min_obs_for_em
+            passes = [{'seq_start': seq_start, 'seq_end': seq_end, 'suffix': ''}]
     else:
-        preds_aligned = False
-        kal_x_start = min_obs_for_em
+        passes = [{'seq_start': seq_start, 'seq_end': seq_end, 'suffix': ''}]
+    
+    # Save original arrays (will be restored for each pass)
+    obs_orig = obs.copy()
+    mu_estim_orig = mu_estim.copy()
+    sigma_estim_orig = sigma_estim.copy()
+    kalman_mu_orig = kalman_mu.copy() if kalman_mu is not None else None
+    kalman_sigma_orig = kalman_sigma.copy() if kalman_sigma is not None else None
+    hidden_states_orig = hidden_states.copy() if hidden_states is not None else None
+    contexts_orig = contexts.copy() if contexts is not None else None
+    contexts_prob_orig = contexts_prob.copy() if contexts_prob is not None else None
+    contexts_pred_orig = contexts_pred.copy() if contexts_pred is not None else None
+    dpos_true_orig = dpos_true.copy() if dpos_true is not None else None
+    dpos_prob_orig = dpos_prob.copy() if dpos_prob is not None else None
+    dpos_pred_orig = dpos_pred.copy() if dpos_pred is not None else None
+    rule_true_orig = rule_true.copy() if rule_true is not None else None
+    rule_prob_orig = rule_prob.copy() if rule_prob is not None else None
+    rule_pred_orig = rule_pred.copy() if rule_pred is not None else None
+    cues_orig = cues.copy() if cues is not None else None
 
-    # for some N randomly sampled sequences out of the whole batch
-    N = min(N_plots, obs.shape[0])
-    selected_indices = np.random.choice(obs.shape[0], size=N, replace=False)
-    # Debug prints removed to avoid index errors when plotting single samples
+    # For each pass (normally 1, or 2 for HierarchicalGM with long sequences)
+    for pass_info in passes:
+        # Restore arrays from originals for this pass
+        obs = obs_orig.copy()
+        mu_estim = mu_estim_orig.copy()
+        sigma_estim = sigma_estim_orig.copy()
+        kalman_mu = kalman_mu_orig.copy() if kalman_mu_orig is not None else None
+        kalman_sigma = kalman_sigma_orig.copy() if kalman_sigma_orig is not None else None
+        hidden_states = hidden_states_orig.copy() if hidden_states_orig is not None else None
+        contexts = contexts_orig.copy() if contexts_orig is not None else None
+        contexts_prob = contexts_prob_orig.copy() if contexts_prob_orig is not None else None
+        contexts_pred = contexts_pred_orig.copy() if contexts_pred_orig is not None else None
+        dpos_true = dpos_true_orig.copy() if dpos_true_orig is not None else None
+        dpos_prob = dpos_prob_orig.copy() if dpos_prob_orig is not None else None
+        dpos_pred = dpos_pred_orig.copy() if dpos_pred_orig is not None else None
+        rule_true = rule_true_orig.copy() if rule_true_orig is not None else None
+        rule_prob = rule_prob_orig.copy() if rule_prob_orig is not None else None
+        rule_pred = rule_pred_orig.copy() if rule_pred_orig is not None else None
+        cues = cues_orig.copy() if cues_orig is not None else None
+        
+        # Get parameters for this pass
+        pass_seq_start = pass_info['seq_start']
+        pass_seq_end = pass_info['seq_end']
+        pass_suffix = pass_info['suffix']
+        pass_save_path = str(save_path) + pass_suffix
 
-    # Compute shared y-axis limits across all selected samples if requested
-    if shared_ylim:
-        all_values = [obs[i] for i in selected_indices]
-        all_values += [mu_estim[i] for i in selected_indices]
-        all_values += [mu_estim[i] + sigma_estim[i] for i in selected_indices]
-        all_values += [mu_estim[i] - sigma_estim[i] for i in selected_indices]
-        if kalman_mu is not None:
-            all_values += [kalman_mu[i] for i in selected_indices]
-        if kalman_sigma is not None and kalman_mu is not None:
-            all_values += [kalman_mu[i] + kalman_sigma[i] for i in selected_indices]
-            all_values += [kalman_mu[i] - kalman_sigma[i] for i in selected_indices]
-        global_ymin = min(np.min(v) for v in all_values)
-        global_ymax = max(np.max(v) for v in all_values)
-        y_margin = 0.05 * (global_ymax - global_ymin)
-        ylim = (global_ymin - y_margin, global_ymax + y_margin)
+        # ── Windowing ──────────────────────────────────────────────────────────────
+        # Resolve start/end to concrete obs indices so we can compute how many obs steps
+        # the window covers and slice all other arrays consistently from their ends.
+        #
+        # Alignment note:
+        #   mu_estim[k] predicts obs[k+1] (shape T-1). When the window starts past the
+        #   very first obs (start_idx > 0), we can include mu_estim[start_idx-1] which
+        #   predicts obs[start_idx], giving predictions the SAME length as the obs window.
+        #   In that case preds_aligned=True and predictions are plotted at x = 0..W-1
+        #   just like obs. When start_idx == 0 the first obs has no prediction, so
+        #   preds_aligned=False and predictions are plotted at x = 1..W-1 (one fewer).
+        preds_aligned = False  # default: predictions are 1 shorter than obs
 
-    # Plot each selected sample using plot_sample
-    for id, i in enumerate(selected_indices):
-        plot_sample(
-            id=id,
-            i=i,
-            obs=obs,
-            mu_estim=mu_estim,
-            sigma_estim=sigma_estim,
-            save_path=save_path,
-            n_ctx=n_ctx,
-            title=title,
-            params=params,
-            kalman_mu=kalman_mu,
-            kalman_sigma=kalman_sigma,
-            hidden_states=hidden_states,
-            contexts=contexts,
-            contexts_prob=contexts_prob,
-            contexts_pred=contexts_pred,
-            preds_aligned=preds_aligned,
-            shared_ylim=shared_ylim,
-            ylim=ylim if shared_ylim else None,
-            kal_x_start=kal_x_start,
-            dpos_true=dpos_true,
-            dpos_prob=dpos_prob,
-            dpos_pred=dpos_pred,
-            rule_true=rule_true,
-            rule_prob=rule_prob,
-            rule_pred=rule_pred,
-            cues=cues
-        )
+        if pass_seq_start is not None or pass_seq_end is not None:
+            T_obs = obs.shape[1]
+            # Resolve to non-negative indices
+            start_idx = (pass_seq_start % T_obs) if pass_seq_start is not None else 0
+            end_idx   = (pass_seq_end   % T_obs) if pass_seq_end   is not None else T_obs
+
+            # === Slice observation-aligned arrays (shape T) ===
+            obs = obs[:, start_idx:end_idx]
+            if contexts is not None:
+                contexts = contexts[:, start_idx:end_idx]
+            if dpos_true is not None:
+                dpos_true = dpos_true[:, start_idx:end_idx]
+            if rule_true is not None:
+                rule_true = rule_true[:, start_idx:end_idx]
+            if hidden_states is not None:
+                hidden_states = hidden_states[:, start_idx:end_idx, :]
+            if cues is not None:
+                cues = cues[:, start_idx:end_idx]
+
+            # === Slice prediction-aligned arrays (shape T-1) ===
+            # When start_idx > 0, we can include mu_estim[start_idx-1] which predicts obs[start_idx],
+            # so predictions have the same length as the windowed obs. Otherwise they're 1 shorter.
+            preds_aligned = start_idx > 0
+            
+            if preds_aligned:
+                # prediction arrays: slice [start_idx-1:end_idx-1]
+                pred_slice_start = start_idx - 1
+                pred_slice_end = end_idx - 1
+            else:
+                # prediction arrays: slice [:end_idx-1]
+                pred_slice_start = 0
+                pred_slice_end = end_idx - 1
+            
+            # Apply the same slice to all prediction-aligned arrays
+            mu_estim = mu_estim[:, pred_slice_start:pred_slice_end]
+            sigma_estim = sigma_estim[:, pred_slice_start:pred_slice_end]
+            if dpos_prob is not None:
+                dpos_prob = dpos_prob[:, pred_slice_start:pred_slice_end]
+            if dpos_pred is not None:
+                dpos_pred = dpos_pred[:, pred_slice_start:pred_slice_end]
+            if rule_prob is not None:
+                rule_prob = rule_prob[:, pred_slice_start:pred_slice_end]
+            if rule_pred is not None:
+                rule_pred = rule_pred[:, pred_slice_start:pred_slice_end]
+            if contexts_pred is not None:
+                contexts_pred = contexts_pred[:, pred_slice_start:pred_slice_end]
+            if contexts_prob is not None:
+                contexts_prob = contexts_prob[:, pred_slice_start:pred_slice_end]
+
+            # === Slice Kalman filter predictions ===
+            # KF predicts obs[min_obs_for_em:], so within window obs[start_idx:end_idx],
+            # KF covers obs[max(start_idx, min_obs_for_em):end_idx]
+            if kalman_mu is not None or kalman_sigma is not None:
+                kal_obs_start = max(start_idx, min_obs_for_em)
+                kal_slice_start = kal_obs_start - min_obs_for_em
+                kal_slice_end = end_idx - min_obs_for_em
+                if kalman_mu is not None:
+                    kalman_mu = kalman_mu[:, kal_slice_start:kal_slice_end]
+                if kalman_sigma is not None:
+                    kalman_sigma = kalman_sigma[:, kal_slice_start:kal_slice_end]
+                kal_x_start = kal_obs_start - start_idx
+            else:
+                kal_x_start = min_obs_for_em
+        else:
+            preds_aligned = False
+            kal_x_start = min_obs_for_em
+
+        # for some N randomly sampled sequences out of the whole batch
+        N = min(N_plots, obs.shape[0])
+        selected_indices = np.random.choice(obs.shape[0], size=N, replace=False)
+        # Debug prints removed to avoid index errors when plotting single samples
+
+        # Compute shared y-axis limits across all selected samples if requested
+        if shared_ylim:
+            all_values = [obs[i] for i in selected_indices]
+            all_values += [mu_estim[i] for i in selected_indices]
+            all_values += [mu_estim[i] + sigma_estim[i] for i in selected_indices]
+            all_values += [mu_estim[i] - sigma_estim[i] for i in selected_indices]
+            if kalman_mu is not None:
+                all_values += [kalman_mu[i] for i in selected_indices]
+            if kalman_sigma is not None and kalman_mu is not None:
+                all_values += [kalman_mu[i] + kalman_sigma[i] for i in selected_indices]
+                all_values += [kalman_mu[i] - kalman_sigma[i] for i in selected_indices]
+            global_ymin = min(np.min(v) for v in all_values)
+            global_ymax = max(np.max(v) for v in all_values)
+            y_margin = 0.05 * (global_ymax - global_ymin)
+            ylim = (global_ymin - y_margin, global_ymax + y_margin)
+
+        # Plot each selected sample using plot_sample
+        for id, i in enumerate(selected_indices):
+            plot_sample(
+                id=id,
+                i=i,
+                obs=obs,
+                mu_estim=mu_estim,
+                sigma_estim=sigma_estim,
+                save_path=pass_save_path,
+                n_ctx=n_ctx,
+                title=title,
+                params=params,
+                kalman_mu=kalman_mu,
+                kalman_sigma=kalman_sigma,
+                hidden_states=hidden_states,
+                contexts=contexts,
+                contexts_prob=contexts_prob,
+                contexts_pred=contexts_pred,
+                preds_aligned=preds_aligned,
+                shared_ylim=shared_ylim,
+                ylim=ylim if shared_ylim else None,
+                kal_x_start=kal_x_start,
+                dpos_true=dpos_true,
+                dpos_prob=dpos_prob,
+                dpos_pred=dpos_pred,
+                rule_true=rule_true,
+                rule_prob=rule_prob,
+                rule_pred=rule_pred,
+                cues=cues
+            )
 
 
 
