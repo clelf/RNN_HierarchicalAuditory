@@ -29,6 +29,8 @@ from torch.nn import functional as F
 from tqdm import tqdm
 import pickle
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
 import warnings
 warnings.filterwarnings('error')
 from multiprocessing import cpu_count
@@ -43,12 +45,12 @@ except ImportError:
 
 # Local imports - reuse existing code (files are now in the same directory)
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from model import SimpleRNN, VRNN, ObsCtxModuleNetwork
+from model import SimpleRNN, VRNN, ObsCtxModuleNetwork, PopulationNetwork
 from objectives import Objective
 
 
 # Generative models (PreProParadigm is one level up from RNN/)
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from PreProParadigm.audit_gm import NonHierarchicalAuditGM, HierarchicalAuditGM
 
 # Local config (config_v2 is now in the same directory)
@@ -114,36 +116,38 @@ def prepare_batch_data(gm, gm_name, data_mode, device, return_pars=False):
         - 'contexts': Context tensor of shape (batch, seq_len) if data_mode='multi_ctx', else None
         - 'pars': Parameters dict if return_pars=True, else None
     """
-    if gm_name == 'NonHierarchicalGM':
-        if return_pars:
-            contexts, _, y, pars = gm.generate_batch(return_pars=True)
-        else:
-            contexts, _, y = gm.generate_batch(return_pars=False)
-            pars = None
-    elif gm_name == 'HierarchicalGM':
-        if return_pars:
-            _, _, _, _, _, contexts, _, y, pars = gm.generate_batch(return_pars=True)
-        else:
-            _, _, _, _, _, contexts, _, y = gm.generate_batch(return_pars=False)
-            pars = None
-    else:
-        raise ValueError(f"Invalid GM name: {gm_name}")
+    batch = gm.generate_batch(return_pars=return_pars)
     
     # Convert observations to tensor
-    y_tensor = torch.tensor(y, dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
+    y_tensor = torch.tensor(batch['obs'], dtype=torch.float, requires_grad=False).unsqueeze(2).to(device)
     
+    batch_data = {
+        'y': y_tensor,
+        'pars': batch['pars'] if return_pars else None
+    }
+
     # Prepare context tensor if in multi-context mode
     if data_mode == 'multi_ctx':
         # contexts is a numpy array of shape (batch, seq_len) with integer context labels
-        contexts_tensor = torch.tensor(contexts, dtype=torch.long, requires_grad=False).to(device)
-    else:
-        contexts_tensor = None
+        batch_data.update({
+        'contexts': torch.tensor(batch['contexts'], dtype=torch.long, requires_grad=False).to(device)
+        })
+        if gm_name == 'HierarchicalGM':
+            # Assuming here HGM would always have cues
+            batch_data.update({
+                'rules': torch.tensor(batch['rules_long'], dtype=torch.long, requires_grad=False).unsqueeze(2).to(device),
+                'dpos': torch.tensor(batch['dpos_long'], dtype=torch.long, requires_grad=False).unsqueeze(2).to(device),
+            })
+            # Transform cues to one-hot encoding for rule module input (shape: batch, seq_len, N_cues)
+            q_onehot = torch.nn.functional.one_hot(
+                    torch.tensor(batch['cues_long'], dtype=torch.long, requires_grad=False), 
+                    num_classes=gm.N_cues
+                ).float().to(device)
+            batch_data.update({
+                'q': q_onehot # Now (T, N, N_cat)
+            })
     
-    return {
-        'y': y_tensor,
-        'contexts': contexts_tensor,
-        'pars': pars
-    }
+    return batch_data
 
 def prepare_benchmark_data(benchmarks, data_mode, device):
     """
@@ -176,7 +180,7 @@ def prepare_benchmark_data(benchmarks, data_mode, device):
     }
     
     if data_mode == 'multi_ctx':
-        contexts = benchmarks.get('contexts')
+        contexts = benchmarks['contexts']
         if contexts is not None:
             result['contexts'] = torch.tensor(contexts, dtype=torch.long, requires_grad=False).to(device)
         else:
@@ -205,7 +209,9 @@ def get_ctx_gm_subpath(N_ctx, gm_name):
 # Loss and prediction extraction
 # =============================================================================
 
-def compute_model_loss(model, objective, y_tensor, model_output, data_mode, learning_objective='obs_ctx', contexts_tensor=None, kappa=0.5):
+def compute_model_loss(model, objective, y_tensor, model_output, data_mode, 
+                       learning_objective='obs_ctx', contexts_tensor=None, 
+                       dpos_tensor=None, rules_tensor=None, kappa=0.5):
     """
     Compute loss based on model type, data mode, and learning objective.
     
@@ -241,40 +247,97 @@ def compute_model_loss(model, objective, y_tensor, model_output, data_mode, lear
         return objective.loss(model, y_tensor[:, 1:, :], model_output, 
                              target_ctx=contexts_tensor[:, 1:],
                              kappa=kappa, learning_objective=learning_objective)
+    elif model.name == 'population_network':
+        return objective.loss(model, y_tensor[:, 1:, :], model_output,
+                              target_ctx=contexts_tensor[:, 1:],
+                              target_dpos=dpos_tensor[:, 1:], target_rule=rules_tensor[:, 1:],
+                              learning_objective=learning_objective)
     else:
         # Standard RNN/VRNN loss
         return objective.loss(model, y_tensor[:, 1:, :], model_output)
 
 def get_model_predictions(model, model_output):
     """
-    Extract mu and variance estimates from model output based on model type.
+    Extract and process all model predictions from output based on model type.
+    
+    Handles extraction of observation estimates (mu, var, sigma) and optional
+    categorical outputs (contexts, dpos, rules) with softmax probabilities and
+    argmax predictions already computed.
     
     Parameters
     ----------
     model : nn.Module
-        The model (SimpleRNN, VRNN, or ModuleNetwork)
+        The model (SimpleRNN, VRNN, ModuleNetwork, or PopulationNetwork)
     model_output : tuple or torch.Tensor
         Output from model forward pass
     
     Returns
     -------
-    tuple
-        (mu_estim, var_estim, context_output) where context_output is None for non-ModuleNetwork models
+    dict
+        Dictionary containing:
+        - mu_estim: Mean observation estimates (numpy)
+        - var_estim: Variance estimates (numpy)
+        - sigma_estim: Standard deviation estimates (numpy)
+        - ctx_prob: Context probabilities (N, T, N_ctx) or None
+        - ctx_pred: Context predictions (N, T) or None
+        - dpos_prob: Dpos probabilities (N, T-1, N_dpos) or None
+        - dpos_pred: Dpos predictions (N, T-1) or None
+        - rule_prob: Rule probabilities (N, T-1, N_rules) or None
+        - rule_pred: Rule predictions (N, T-1) or None
+        - output: Raw output dict for backward compatibility
     """
+    # Parse model output based on model type
     if model.name == 'module_network':
         obs_output, context_output = model_output
-        model_output_dist = obs_output
+        output = {'obs_dist': obs_output, 'ctx': context_output}
+    elif model.name == 'population_network':
+        obs_output, context_output, dpos_output, rule_output = model_output
+        output = {'obs_dist': obs_output, 'ctx': context_output, 'dpos': dpos_output, 'rule': rule_output}
     elif model.name == 'vrnn':
-        model_output_dist = model_output[0]
-        context_output = None
+        output = {'obs_dist': model_output[0]}
     else:
-        model_output_dist = model_output
-        context_output = None
+        output = {'obs_dist': model_output}
     
-    mu_estim = model_output_dist[..., 0].detach().cpu().numpy()
-    var_estim = (F.softplus(model_output_dist[..., 1]) + 1e-6).detach().cpu().numpy()
+    # Extract and process observation estimates
+    mu_estim = output['obs_dist'][..., 0].detach().cpu().numpy()
+    var_estim = (F.softplus(output['obs_dist'][..., 1]) + 1e-6).detach().cpu().numpy()
+    sigma_estim = np.sqrt(var_estim)
     
-    return mu_estim, var_estim, context_output
+    # Initialize optional output fields
+    ctx_prob = None
+    ctx_pred = None
+    dpos_prob = None
+    dpos_pred = None
+    rule_prob = None
+    rule_pred = None
+    
+    # Process context outputs (if present)
+    if 'ctx' in output and output['ctx'] is not None:
+        ctx_prob = torch.softmax(output['ctx'], dim=-1).detach().cpu().numpy()
+        ctx_pred = np.argmax(ctx_prob, axis=-1).squeeze()
+    
+    # Process dpos outputs (if present)
+    if 'dpos' in output and output['dpos'] is not None:
+        dpos_prob = torch.softmax(output['dpos'], dim=-1).detach().cpu().numpy()
+        dpos_pred = np.argmax(dpos_prob, axis=-1).squeeze()
+    
+    # Process rule outputs (if present)
+    if 'rule' in output and output['rule'] is not None:
+        rule_prob = torch.softmax(output['rule'], dim=-1).detach().cpu().numpy()
+        rule_pred = np.argmax(rule_prob, axis=-1).squeeze()
+    
+    return {
+        'mu_estim': mu_estim,
+        'var_estim': var_estim,
+        'sigma_estim': sigma_estim,
+        'ctx_prob': ctx_prob,
+        'ctx_pred': ctx_pred,
+        'dpos_prob': dpos_prob,
+        'dpos_pred': dpos_pred,
+        'rule_prob': rule_prob,
+        'rule_pred': rule_pred,
+        'output': output,  # Keep raw output for backward compatibility
+    }
 
 # =============================================================================
 # Kalman filter usage
@@ -549,20 +612,20 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
         else:
             # Fresh start: generate and persist input data for potential future resume
             print(f"  Generating {N_samples} samples...")
-            if gm_name == 'NonHierarchicalGM':
-                contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
-            elif gm_name == 'HierarchicalGM':
-                _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
+            batch = gm.generate_batch(N_samples, return_pars=True)
+            y_batch = batch['obs']
+            contexts_batch = batch['contexts']
+            pars_batch = batch['pars']
             with open(input_data_file, 'wb') as f:
                 pickle.dump({'y': y_batch, 'contexts': contexts_batch, 'pars': pars_batch}, f)
             print(f"  Input data saved to {input_data_file}")
     else:
         start_sample = 0
         print(f"  Generating {N_samples} samples...")
-        if gm_name == 'NonHierarchicalGM':
-            contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
-        elif gm_name == 'HierarchicalGM':
-            _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
+        batch = gm.generate_batch(N_samples, return_pars=True)
+        y_batch = batch['obs']
+        contexts_batch = batch['contexts']
+        pars_batch = batch['pars']
 
     # --- KF fitting (sample-by-sample, sequential or parallel) ---
     samples_to_process = [i for i in range(N_samples) if i not in existing_samples]
@@ -833,11 +896,11 @@ def map_binned_params_2_metrics(param_bins, y, mu_estim, pars, mu_kal=None):
 def plot_weights(train_steps, weights_updates, names, title, save_path):
     plt.figure(figsize=(10, 5))
     for param in range(weights_updates.shape[0]):
-        plt.plot(train_steps, weights_updates[param], label=names[param], alpha=0.8)
+        plt.plot(train_steps, weights_updates[param].numpy(), alpha=0.8) # , label=names[param]
     plt.yscale('log')
     plt.xlabel("Training steps")
     plt.ylabel("Weights updates (MSE between steps)")
-    plt.legend()
+    # plt.legend()
     plt.title(title)
     plt.savefig(save_path)
     plt.close()
@@ -884,7 +947,59 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.savefig(save_path)
     plt.close()
 
-def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None, params=None, kalman_mu=None, kalman_sigma=None, hidden_states=None, contexts=None, contexts_probs=None, contexts_preds=None, preds_aligned=False, shared_ylim=False, ylim=None, kal_x_start=None, data_config=None):
+def _get_dpos_color_map(n_dpos_classes=5):
+    """
+    Create a color mapping for deviant positions using jet colormap.
+    Maps min value -> light, max value -> dark.
+    Creates mappings for all possible dpos classes (default 5).
+    
+    Args:
+        dpos_true: True deviant positions array of shape (N, T) or None
+        dpos_prob: Predicted probabilities array of shape (N, T, N_classes) or None
+        n_dpos_classes: Expected number of dpos classes (default 5). Used to create
+                       complete color map even if not all classes appear in data.
+    
+    Returns:
+        dict: Mapping from dpos class index to color (as hex string) for all classes
+    """
+
+    # Create mapping for all classes (0 to n_dpos_classes-1)
+    dpos_cmap = plt.get_cmap('rainbow')
+    if n_dpos_classes == 1:
+        rgba = dpos_cmap(0.5)
+        return {0: mcolors.rgb2hex(rgba[:3])}
+    return {val: mcolors.rgb2hex(dpos_cmap(val / (n_dpos_classes - 1))[:3]) for val in range(n_dpos_classes)}
+
+
+def _get_rule_color_map(n_rule_classes=2):
+    """
+    Create a color mapping for rules using jet colormap.
+    Maps min value -> light, max value -> dark.
+    Creates mappings for all possible rule classes (default 2).
+    
+    Args:
+        rule_true: True rules array of shape (N, T) or None
+        rule_prob: Predicted probabilities array of shape (N, T, N_classes) or None
+        n_rule_classes: Expected number of rule classes (default 2). Used to create
+                       complete color map even if not all classes appear in data.
+    
+    Returns:
+        dict: Mapping from rule class index to color (as hex string) for all classes
+    """
+    
+    # Create mapping for all classes (0 to n_rule_classes-1)
+    rule_cmap = plt.get_cmap('plasma')
+    if n_rule_classes == 1:
+        rgba = rule_cmap(0.5)
+        return {0: mcolors.rgb2hex(rgba[:3])}
+    return {val: mcolors.rgb2hex(rule_cmap((val + 1) / (n_rule_classes + 1))[:3]) for val in range(n_rule_classes)}
+
+
+def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None, 
+                params=None, kalman_mu=None, kalman_sigma=None, hidden_states=None,
+                contexts=None, contexts_prob=None, contexts_pred=None,
+                preds_aligned=False, shared_ylim=False, ylim=None, kal_x_start=None,
+                dpos_true=None, dpos_pred=None, dpos_prob=None, rule_true=None, rule_pred=None, rule_prob=None, cues=None):
     """
     Plot a single observation sequence with model and optional Kalman filter predictions.
     
@@ -902,23 +1017,54 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         kalman_sigma: Kalman filter uncertainties
         hidden_states: Hidden state values
         contexts: True context assignments
-        contexts_probs: Inferred context probabilities
-        contexts_preds: Predicted contexts
+        contexts_prob: Inferred context probabilities, shape (N, T, n_ctx)
+        contexts_pred: Predicted contexts, shape (N, T)
         preds_aligned: Whether model predictions align with obs x-axis
         shared_ylim: Whether to use pre-computed shared y-limits
         ylim: Pre-computed shared y-axis limits (required if shared_ylim=True)
         kal_x_start: Starting x-position for Kalman filter predictions
         data_config: Data configuration dictionary
+        dpos_true: True deviant positions, shape (N, T)
+        dpos_prob: Predicted deviant position probabilities, shape (N, T, N_dpos)
+        rule_true: True rules, shape (N, T)
+        rule_prob: Predicted rule probabilities, shape (N, T, N_rules)
     """
-    # Decide whether to use two subplots (context panel below) or a single axes
-    use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_probs is not None or contexts_preds is not None)
-    ctx_colors = {0: 'tab:blue', 1: 'tab:orange'}
+    # Decide whether to use context panel (with optional dpos and rule tracks)
+    use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_prob is not None or contexts_pred is not None or dpos_true is not None or dpos_prob is not None or rule_true is not None or rule_prob is not None or cues is not None)
+    
+    # Context colors: use reversed Spectral colormap (0 -> min, 1 -> max)
+    ctx_cmap = plt.get_cmap('tab10')
+    ctx_colors = {i: ctx_cmap(i) for i in range(n_ctx)}
+    
+    # Get color mappings for dpos and rule
+    dpos_colors = _get_dpos_color_map()
+    rule_colors = _get_rule_color_map()
+    
+    # Get color mapping for cues (Accent colormap, starting from index 1)
+    cue_colors = {}
+    if cues is not None:
+        # cues has shape (N, T, N_cues) - need to find which cue is active at each timestep
+        n_cues = 2 # cues.shape[2]
+        cue_cmap = plt.get_cmap('tab10')
+        cue_colors = {i: cue_cmap((i+1)*5-1) for i in range(n_cues)}
 
     if use_ctx_panel:
+        # Calculate number of rows needed in context panel
+        n_context_rows = 0
+        if contexts is not None or contexts_pred is not None:
+            n_context_rows = 2  # ROW_TRUE, ROW_PRED only (no probabilities)
+        n_cues_rows = 1 if cues is not None else 0
+        n_dpos_rows = 2 if (dpos_true is not None or dpos_prob is not None) else 0
+        n_rule_rows = 2 if (rule_true is not None or rule_prob is not None) else 0
+        total_ctx_rows = n_cues_rows + n_context_rows + n_dpos_rows + n_rule_rows
+        
+        # Adjust height ratios based on content
+        height_ratio_ctx = max(1, total_ctx_rows / 4) if total_ctx_rows > 0 else 1
+        
         fig, (ax_obs, ax_ctx) = plt.subplots(
             2, 1, figsize=(20, 8),
             sharex=True,
-            gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.05}
+            gridspec_kw={'height_ratios': [4, height_ratio_ctx], 'hspace': 0.05}
         )
     else:
         fig, ax_obs = plt.subplots(1, 1, figsize=(20, 6))
@@ -957,40 +1103,61 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
     else:
         ax_obs.set_xlabel('time step')
 
-    # ── bottom subplot: context lines ─────────────────────────────────────
+    # ── bottom subplot: context lines (and optionally dpos, rule) ──────────────────
     if use_ctx_panel:
-        # Rows (top→bottom in visual order = decreasing y): probs, pred, true
-        # Use integer y positions; higher y = drawn higher
-        ROW_PROB_BASE = 2  # p(ctx_val) at ROW_PROB_BASE + ctx_val  (topmost)
-        ROW_PRED      = 1
-        ROW_TRUE      = 0
+        # Row layout: cues (if available), rule (true/pred), dpos (true/pred), then context (true/pred)
+        # Calculate base row numbers
+        ROW_CUES = 0 if n_cues_rows > 0 else None
+        
+        # Then rule rows after cues
+        row_offset = n_cues_rows
+        ROW_RULE_TRUE = row_offset if n_rule_rows > 0 else None
+        ROW_RULE_PRED = row_offset + 1 if n_rule_rows > 0 else None
+        
+        # Then dpos rows after rule
+        row_offset += n_rule_rows
+        ROW_DPOS_TRUE = row_offset if n_dpos_rows > 0 else None
+        ROW_DPOS_PRED = row_offset + 1 if n_dpos_rows > 0 else None
+        
+        # Finally context rows after dpos
+        row_offset += n_dpos_rows
+        ROW_TRUE = row_offset if n_context_rows > 0 else None
+        ROW_PRED = row_offset + 1 if n_context_rows > 0 else None
 
         # x-offset for prediction-aligned arrays:
-        # When preds_aligned, probs/preds have the same length as obs → offset 0
+        # When preds_aligned, preds have the same length as obs → offset 0
         # Otherwise they are 1 shorter → offset 1 (skip first obs timestep)
         pred_x_off = 0 if preds_aligned else 1
+        
+        # Plot cues track
+        if cues is not None and ROW_CUES is not None:
+            if cues.ndim > 2:
+                # cues has shape (N, T, N_cues) - argmax to get active cue per timestep
+                cue_indices = np.argmax(cues[i], axis=-1)
+            else:
+                # cues has shape (N, T) with integer cue indices
+                cue_indices = cues[i]
+            
+            # Plot cues as continuous segments with changes
+            boundaries = np.concatenate(([0], np.where(np.diff(cue_indices) != 0)[0] + 1, [len(cue_indices)]))
+            cue_labels_placed = set()
+            for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+                cue_val = int(cue_indices[seg_start])
+                label = f'cue {cue_val}' if cue_val not in cue_labels_placed else None
+                cue_labels_placed.add(cue_val)
+                ax_ctx.hlines(ROW_CUES, seg_start, seg_end, colors=cue_colors[cue_val], linewidth=6, label=label)
 
-        if contexts_probs is not None:
-            probs_i = contexts_probs[i]  # shape (W, n_ctx) or (W-1, n_ctx)
-            for ctx_val in range(probs_i.shape[-1]):
-                row = ROW_PROB_BASE + ctx_val
-                label_prob = f'p(ctx {ctx_val}) inferred'
-                for t in range(len(probs_i)):
-                    ax_ctx.hlines(row, t + pred_x_off, t + pred_x_off + 1,
-                                  colors=ctx_colors[ctx_val],
-                                  linewidth=6, alpha=float(probs_i[t, ctx_val]),
-                                  label=label_prob if t == 0 else None)
-
-        if contexts_preds is not None:
-            pred_boundaries = np.concatenate(([0], np.where(np.diff(contexts_preds[i]) != 0)[0] + 1, [len(contexts_preds[i])]))
+        if contexts_pred is not None:
             pred_labels_placed = set()
-            for seg_start, seg_end in zip(pred_boundaries[:-1], pred_boundaries[1:]):
-                ctx_val = int(contexts_preds[i][seg_start])
+            for t in range(len(contexts_pred[i])):
+                ctx_val = int(contexts_pred[i][t])
+                # Determine alpha from probability if available, otherwise use 0.8
+                alpha = float(contexts_prob[i][t, ctx_val])
                 label = f'ctx {ctx_val} pred' if ctx_val not in pred_labels_placed else None
                 pred_labels_placed.add(ctx_val)
-                ax_ctx.hlines(ROW_PRED, seg_start + pred_x_off, seg_end + pred_x_off,
+                ax_ctx.hlines(ROW_PRED, t + pred_x_off, t + pred_x_off + 1,
                               colors=ctx_colors[ctx_val],
-                              linewidth=6, alpha=0.8, label=label)
+                              linewidth=6, alpha=alpha, label=label)
 
         if contexts is not None:
             ctx_counts = {0: int((contexts[i] == 0).sum()), 1: int((contexts[i] == 1).sum())}
@@ -1000,11 +1167,69 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 ctx_val = int(contexts[i][seg_start])
                 label = f'ctx {ctx_val} (N={ctx_counts[ctx_val]})' if ctx_val not in ctx_labels_placed else None
                 ctx_labels_placed.add(ctx_val)
-                ax_ctx.hlines(ROW_TRUE, seg_start, seg_end, colors=ctx_colors[ctx_val], linewidth=6, alpha=0.8, label=label)
+                ax_ctx.hlines(ROW_TRUE, seg_start, seg_end, colors=ctx_colors[ctx_val], linewidth=6, label=label) # alpha=0.8, 
 
-        ax_ctx.set_ylim(-0.5, ROW_PROB_BASE + n_ctx - 0.5)
-        ax_ctx.set_yticks([ROW_TRUE, ROW_PRED] + [ROW_PROB_BASE + c for c in range(n_ctx)])
-        ax_ctx.set_yticklabels(['true', 'pred'] + [f'p(ctx {c})' for c in range(n_ctx)], fontsize=8)
+        # Plot dpos tracks
+        if dpos_true is not None and dpos_pred is not None and dpos_prob is not None:
+            dpos_pred_classes = dpos_pred[i]
+            dpos_pred_probs = np.max(dpos_prob[i], axis=1)  # max probability for each timestep
+            dpos_labels_placed = set()
+            for t in range(len(dpos_pred_classes)):
+                dpos_val = int(dpos_pred_classes[t])
+                alpha = float(dpos_pred_probs[t])
+                label = f'dpos {dpos_val} pred' if dpos_val not in dpos_labels_placed else None
+                dpos_labels_placed.add(dpos_val)
+                ax_ctx.hlines(ROW_DPOS_PRED, t + pred_x_off, t + pred_x_off + 1,
+                              colors=dpos_colors[dpos_val], linewidth=6, alpha=alpha, label=label)
+            
+            true_dpos = dpos_true[i]
+            boundaries = np.concatenate(([0], np.where(np.diff(true_dpos) != 0)[0] + 1, [len(true_dpos)]))
+            dpos_labels_placed = set()
+            for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+                dpos_val = int(true_dpos[seg_start])
+                label = f'dpos {dpos_val}' if dpos_val not in dpos_labels_placed else None
+                dpos_labels_placed.add(dpos_val)
+                ax_ctx.hlines(ROW_DPOS_TRUE, seg_start, seg_end, colors=dpos_colors[dpos_val], 
+                              linewidth=6, label=label) # alpha=0.8, 
+
+        # Plot rule tracks
+        if rule_true is not None and rule_pred is not None and rule_prob is not None:
+            rule_pred_classes = rule_pred[i]
+            rule_pred_probs = np.max(rule_prob[i], axis=1)  # max probability for each timestep
+            rule_labels_placed = set()
+            for t in range(len(rule_pred_classes)):
+                rule_val = int(rule_pred_classes[t])
+                alpha = float(rule_pred_probs[t])
+                label = f'rule {rule_val} pred' if rule_val not in rule_labels_placed else None
+                rule_labels_placed.add(rule_val)
+                ax_ctx.hlines(ROW_RULE_PRED, t + pred_x_off, t + pred_x_off + 1,
+                              colors=rule_colors[rule_val], linewidth=6, alpha=alpha, label=label)
+            
+            true_rule = rule_true[i]
+            boundaries = np.concatenate(([0], np.where(np.diff(true_rule) != 0)[0] + 1, [len(true_rule)]))
+            rule_labels_placed = set()
+            for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+                rule_val = int(true_rule[seg_start])
+                label = f'rule {rule_val}' if rule_val not in rule_labels_placed else None
+                rule_labels_placed.add(rule_val)
+                ax_ctx.hlines(ROW_RULE_TRUE, seg_start, seg_end, colors=rule_colors[rule_val], 
+                              linewidth=6, label=label) # alpha=0.8, 
+
+        # Adjust y-axis to fit all rows
+        ytick_positions = [r for r in ([ROW_CUES] if ROW_CUES is not None else []) +
+                                ([ROW_RULE_TRUE, ROW_RULE_PRED] if n_rule_rows > 0 else []) +
+                                ([ROW_DPOS_TRUE, ROW_DPOS_PRED] if n_dpos_rows > 0 else []) +
+                                ([ROW_TRUE, ROW_PRED] if n_context_rows > 0 else [])
+                          if r is not None]
+        yticklabels = (['cues'] if ROW_CUES is not None else []) +\
+                      (['rule true', 'rule pred'] if n_rule_rows > 0 else []) +\
+                      (['dpos true', 'dpos pred'] if n_dpos_rows > 0 else []) +\
+                      (['ctx_true', 'ctx_pred'] if n_context_rows > 0 else [])
+        
+        ax_ctx.set_ylim(-0.5, total_ctx_rows - 0.5)
+        ax_ctx.set_yticks(ytick_positions)
+        ax_ctx.set_yticklabels(yticklabels, fontsize=8)
+        ax_ctx.invert_yaxis()  # Invert to show cues at the top
         ax_ctx.set_xlabel('time step')
 
     # ── shared legend on the right (only selected labels) ────────────────
@@ -1019,6 +1244,19 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
             if lbl not in labels and (lbl in _LEGEND_KEEP or (lbl is not None and lbl.startswith('ctx') and '(N=' in lbl)):
                 handles.append(handle)
                 labels.append(lbl)
+    # Add legend patches for all possible dpos and rule classes
+    for dpos_val in sorted(dpos_colors.keys()):
+        dpos_patch = mpatches.Patch(color=dpos_colors[dpos_val], label=f'dpos {dpos_val}')
+        if dpos_patch.get_label() not in labels:
+            handles.append(dpos_patch)
+            labels.append(dpos_patch.get_label())
+    
+    for rule_val in sorted(rule_colors.keys()):
+        rule_patch = mpatches.Patch(color=rule_colors[rule_val], label=f'rule {rule_val}')
+        if rule_patch.get_label() not in labels:
+            handles.append(rule_patch)
+            labels.append(rule_patch.get_label())
+    
     fig.legend(handles, labels, loc='center left', bbox_to_anchor=(0.92, 0.5), borderaxespad=0, frameon=True)
     plot_title = title
     if params is not None:
@@ -1057,7 +1295,9 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
     fig.savefig(f'{save_path}_s{id}.png', bbox_inches='tight')
     plt.close(fig)
 
-def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_start=None, seq_end=None, data_config=None, hidden_states=None, contexts=None, min_obs_for_em=None, N_plots=8, shared_ylim=False, contexts_probs=None, contexts_preds=None):
+
+# def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_start=None, seq_end=None, data_config=None, hidden_states=None, contexts=None, min_obs_for_em=None, N_plots=8, shared_ylim=False, contexts_prob=None, contexts_pred=None, dpos_true=None, dpos_pred=None, rule_true=None, rule_pred=None):
+def plot_samples(sample_metrics, save_path, title=None, params=None, seq_start=None, seq_end=None, data_config=None, min_obs_for_em=None, N_plots=8, shared_ylim=False):
     """
     Plot observation sequences with model and optional Kalman filter predictions.
     
@@ -1065,7 +1305,7 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
     - obs has shape (N, T)
     - mu_estim has shape (N, T-1): mu_estim[:, k] predicts obs[:, k+1], so their ends are aligned
     - kalman_mu has shape (N, T-MIN_OBS_FOR_EM): predicts obs[:, MIN_OBS_FOR_EM:], ends also aligned
-    - contexts_preds / contexts_probs have shape (N, T-1): aligned with mu_estim
+    - contexts_pred / contexts_prob have shape (N, T-1): aligned with mu_estim
     - contexts has shape (N, T): aligned with obs
 
     Windowing via seq_start / seq_end (both refer to obs indices, negative = from end):
@@ -1079,6 +1319,24 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
         min_obs_for_em: Minimum observations needed for KF EM (default: MIN_OBS_FOR_EM constant)
         shared_ylim: If True, use the same y-axis limits across all plotted samples (default: False)
     """
+    # Extract variables from sample_metrics
+    obs = sample_metrics['y']
+    mu_estim = sample_metrics['mu_estim']
+    sigma_estim = sample_metrics['sigma_estim']
+    kalman_mu = sample_metrics['kalman_mu']         if 'kalman_mu' in sample_metrics else None
+    kalman_sigma = sample_metrics['kalman_sigma']   if 'kalman_sigma' in sample_metrics else None
+    hidden_states = sample_metrics['hidden_states'] if 'hidden_states' in sample_metrics else None
+    contexts = sample_metrics['contexts']           if 'contexts' in sample_metrics else None
+    contexts_prob = sample_metrics['ctx_prob'] if 'ctx_prob' in sample_metrics else None
+    contexts_pred = sample_metrics['ctx_pred'] if 'ctx_pred' in sample_metrics else None
+    dpos_true = sample_metrics['dpos_true'] if 'dpos_true' in sample_metrics else None
+    dpos_prob = sample_metrics['dpos_prob'] if 'dpos_prob' in sample_metrics else None
+    dpos_pred = sample_metrics['dpos_pred'] if 'dpos_pred' in sample_metrics else None
+    rule_true = sample_metrics['rule_true'] if 'rule_true' in sample_metrics else None
+    rule_prob = sample_metrics['rule_prob'] if 'rule_prob' in sample_metrics else None
+    rule_pred = sample_metrics['rule_pred'] if 'rule_pred' in sample_metrics else None
+    cues = sample_metrics['cues'] if 'cues' in sample_metrics else None
+
     # Set default for min_obs_for_em
     if min_obs_for_em is None:
         min_obs_for_em = MIN_OBS_FOR_EM
@@ -1089,7 +1347,7 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
     obs = obs.squeeze() # for safety
     
     # Get N_ctx from data_config
-    n_ctx = data_config.get("N_ctx", 1) if data_config is not None else 1
+    n_ctx = data_config["N_ctx"]
 
     # For HierarchicalGM, plot only the last 8 blocks if sequence is long enough
     if data_config is not None and data_config["gm_name"] == "HierarchicalGM":
@@ -1118,49 +1376,65 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
         start_idx = (seq_start % T_obs) if seq_start is not None else 0
         end_idx   = (seq_end   % T_obs) if seq_end   is not None else T_obs
 
+        # === Slice observation-aligned arrays (shape T) ===
         obs = obs[:, start_idx:end_idx]
-
-        if start_idx > 0:
-            # We can grab the prediction for obs[start_idx] from mu_estim[start_idx-1],
-            # so predictions have the same length as the obs window.
-            preds_aligned = True
-            mu_estim    = mu_estim[:, start_idx - 1:end_idx - 1]
-            sigma_estim = sigma_estim[:, start_idx - 1:end_idx - 1]
-        else:
-            mu_estim    = mu_estim[:, :end_idx - 1]
-            sigma_estim = sigma_estim[:, :end_idx - 1]
-
         if contexts is not None:
             contexts = contexts[:, start_idx:end_idx]
-        if contexts_preds is not None:
-            if start_idx > 0:
-                contexts_preds = contexts_preds[:, start_idx - 1:end_idx - 1]
-            else:
-                contexts_preds = contexts_preds[:, :end_idx - 1]
-        if contexts_probs is not None:
-            if start_idx > 0:
-                contexts_probs = contexts_probs[:, start_idx - 1:end_idx - 1]
-            else:
-                contexts_probs = contexts_probs[:, :end_idx - 1]
+        if dpos_true is not None:
+            dpos_true = dpos_true[:, start_idx:end_idx]
+        if rule_true is not None:
+            rule_true = rule_true[:, start_idx:end_idx]
         if hidden_states is not None:
             hidden_states = hidden_states[:, start_idx:end_idx, :]
+        if cues is not None:
+            cues = cues[:, start_idx:end_idx]
 
-        # KF predicts obs[min_obs_for_em:], so its index k corresponds to obs[min_obs_for_em + k].
-        # Within the window obs[start_idx:end_idx], the KF predictions that fall inside are
-        # those for obs[max(start_idx, min_obs_for_em) : end_idx].
+        # === Slice prediction-aligned arrays (shape T-1) ===
+        # When start_idx > 0, we can include mu_estim[start_idx-1] which predicts obs[start_idx],
+        # so predictions have the same length as the windowed obs. Otherwise they're 1 shorter.
+        preds_aligned = start_idx > 0
+        
+        if preds_aligned:
+            # prediction arrays: slice [start_idx-1:end_idx-1]
+            pred_slice_start = start_idx - 1
+            pred_slice_end = end_idx - 1
+        else:
+            # prediction arrays: slice [:end_idx-1]
+            pred_slice_start = 0
+            pred_slice_end = end_idx - 1
+        
+        # Apply the same slice to all prediction-aligned arrays
+        mu_estim = mu_estim[:, pred_slice_start:pred_slice_end]
+        sigma_estim = sigma_estim[:, pred_slice_start:pred_slice_end]
+        if dpos_prob is not None:
+            dpos_prob = dpos_prob[:, pred_slice_start:pred_slice_end]
+        if dpos_pred is not None:
+            dpos_pred = dpos_pred[:, pred_slice_start:pred_slice_end]
+        if rule_prob is not None:
+            rule_prob = rule_prob[:, pred_slice_start:pred_slice_end]
+        if rule_pred is not None:
+            rule_pred = rule_pred[:, pred_slice_start:pred_slice_end]
+        if contexts_pred is not None:
+            contexts_pred = contexts_pred[:, pred_slice_start:pred_slice_end]
+        if contexts_prob is not None:
+            contexts_prob = contexts_prob[:, pred_slice_start:pred_slice_end]
+
+        # === Slice Kalman filter predictions ===
+        # KF predicts obs[min_obs_for_em:], so within window obs[start_idx:end_idx],
+        # KF covers obs[max(start_idx, min_obs_for_em):end_idx]
         if kalman_mu is not None or kalman_sigma is not None:
-            kal_obs_start = max(start_idx, min_obs_for_em)  # first obs index KF predicts inside window
-            kal_slice_start = kal_obs_start - min_obs_for_em  # corresponding index into kalman_mu
-            kal_slice_end   = end_idx - min_obs_for_em
+            kal_obs_start = max(start_idx, min_obs_for_em)
+            kal_slice_start = kal_obs_start - min_obs_for_em
+            kal_slice_end = end_idx - min_obs_for_em
             if kalman_mu is not None:
                 kalman_mu = kalman_mu[:, kal_slice_start:kal_slice_end]
             if kalman_sigma is not None:
                 kalman_sigma = kalman_sigma[:, kal_slice_start:kal_slice_end]
-            # x-offset where KF predictions start within the windowed obs axis
             kal_x_start = kal_obs_start - start_idx
         else:
             kal_x_start = min_obs_for_em
     else:
+        preds_aligned = False
         kal_x_start = min_obs_for_em
 
     # for some N randomly sampled sequences out of the whole batch
@@ -1200,13 +1474,19 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
             kalman_sigma=kalman_sigma,
             hidden_states=hidden_states,
             contexts=contexts,
-            contexts_probs=contexts_probs,
-            contexts_preds=contexts_preds,
+            contexts_prob=contexts_prob,
+            contexts_pred=contexts_pred,
             preds_aligned=preds_aligned,
             shared_ylim=shared_ylim,
             ylim=ylim if shared_ylim else None,
             kal_x_start=kal_x_start,
-            data_config=data_config
+            dpos_true=dpos_true,
+            dpos_prob=dpos_prob,
+            dpos_pred=dpos_pred,
+            rule_true=rule_true,
+            rule_prob=rule_prob,
+            rule_pred=rule_pred,
+            cues=cues
         )
 
 
@@ -1218,9 +1498,6 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
 def create_model(config: RunConfig) -> nn.Module:
     """
     Create a model instance from a RunConfig.
-    
-    This is the SINGLE place where model instantiation happens.
-    No more scattered conditionals across the codebase.
     """
     model_dict = run_config_to_model_dict(config)
     
@@ -1232,8 +1509,13 @@ def create_model(config: RunConfig) -> nn.Module:
         
     elif config.model_type == 'module_network':
         # ModuleNetwork needs the full config with module sub-configs
-        module_config = _build_module_network_config(config)
+        module_config = _create_module_network_config(config)
         model = ObsCtxModuleNetwork(module_config)
+    
+    elif config.model_type == 'population_network':
+        # PopulationNetwork needs the full config with module sub-configs
+        module_config = _create_population_network_config(config)
+        model = PopulationNetwork(module_config)
         
     else:
         raise ValueError(f"Unknown model type: {config.model_type}")
@@ -1241,25 +1523,119 @@ def create_model(config: RunConfig) -> nn.Module:
     return model.to(config.device)
 
 
-def _build_module_network_config(config: RunConfig) -> dict:
-    """Build the specialized config dict for ModuleNetwork."""
-    return {
+def _create_module_network_config(config: RunConfig) -> dict:
+    """
+    Build the specialized config dict for ModuleNetwork (obs + ctx modules).
+    
+    Reads per-module hidden dimensions from config.module_hidden_dims,
+    which is a dict like {'obs': 64, 'ctx': 32}.
+    Falls back to defaults if not provided.
+    
+    ModuleNetwork typically uses just observation and context modules.
+    """
+    # Default module dimensions for ModuleNetwork
+    default_dims = {'obs': 64, 'ctx': 32}
+    module_dims = config.module_hidden_dims or {}
+    # Ensure we have at least the defaults for obs and ctx
+    module_dims = {**default_dims, **module_dims}
+    
+    module_config = {
         'kappa': config.kappa,
-        'observation_module': {
+    }
+    
+    # Build observation module config (always present for ModuleNetwork)
+    if 'obs' in module_dims:
+        module_config['observation_module'] = {
             'input_dim': config.model_arch.input_dim,
             'output_dim': config.model_arch.output_dim,
-            'rnn_hidden_dim': 64,
+            'rnn_hidden_dim': module_dims['obs'],
             'rnn_n_layers': config.model_arch.rnn_n_layers,
             'bottleneck_dim': config.bottleneck_dim or 16,
-        },
-        'context_module': {
-            'input_dim': 2,
+        }
+    
+    # Build context module config (always present for ModuleNetwork)
+    if 'ctx' in module_dims:
+        module_config['context_module'] = {
+            'input_dim': 2, # NOTE: one for each context? (TODO: verify)
             'output_dim': config.data.N_ctx,
-            'rnn_hidden_dim': 32,
+            'rnn_hidden_dim': module_dims['ctx'],
             'rnn_n_layers': config.model_arch.rnn_n_layers,
             'bottleneck_dim': config.bottleneck_dim or 16,
-        },
+        }
+    
+    return module_config
+
+
+def _create_population_network_config(config: RunConfig) -> dict:
+    """
+    Build the specialized config dict for PopulationNetwork (obs + ctx + dpos + rule modules).
+    
+    Reads per-module hidden dimensions from config.module_hidden_dims,
+    which is a dict like {'obs': 64, 'ctx': 32, 'dpos': 16, 'rule': 8}.
+    Falls back to defaults if not provided.
+    
+    PopulationNetwork uses observation, context, dpos (for HierarchicalGM), 
+    and rule modules for richer multi-module architecture.
+    """
+    # Default module dimensions for PopulationNetwork
+    default_dims = {'obs': 64, 'ctx': 32, 'dpos': 16, 'rule': 8} # TOOD: modify this!
+    module_dims = config.module_hidden_dims or {}
+    # Merge with defaults, preserving user-provided values
+    module_dims = {**default_dims, **module_dims}
+    
+    module_config = {
+        'kappa': config.kappa,
     }
+    
+    # Build rule module config (processes visual cues q)
+    # rule receives q (1D) in forward pass and enc_dpos2rule (2D) in feedback pass
+    # So input_dim = 1, output_dim = N_rules (asymmetric)
+    module_config['rule_module'] = {
+        'input_dim': config.data.N_cues,  # Matches q dimension
+        'output_dim': config.data.N_rules,
+        'output_ext_dim': config.data.N_rules,
+        'rnn_hidden_dim': module_dims['rule'],
+        'rnn_n_layers': config.model_arch.rnn_n_layers,
+        'bottleneck_dim': config.bottleneck_dim,
+    }
+    
+    # Build dpos module config (deviant position identifier)
+    # dpos receives enc_rule2dpos (N_dpos) in forward pass and enc_ctx2dpos (N_dpos) in feedback pass
+    # So input_dim = output_dim = N_dpos (symmetric)
+    module_config['dpos_module'] = {
+        'input_dim': config.data.N_dpos,
+        'output_dim': config.data.N_dpos,
+        'output_ext_dim': config.data.N_dpos,
+        'rnn_hidden_dim': module_dims['dpos'],
+        'rnn_n_layers': config.model_arch.rnn_n_layers,
+        'bottleneck_dim': config.bottleneck_dim,
+    }
+    
+    # Build context module config (context identifier)
+    # ctx receives enc_dpos2ctx (N_ctx) in forward pass and enc_obs2ctx (N_ctx) in feedback pass
+    # So input_dim = output_dim = N_ctx (symmetric)
+    module_config['context_module'] = {
+        'input_dim': config.data.N_ctx,
+        'output_dim': config.data.N_ctx,
+        'output_ext_dim': config.data.N_ctx,
+        'rnn_hidden_dim': module_dims['ctx'],
+        'rnn_n_layers': config.model_arch.rnn_n_layers,
+        'bottleneck_dim': config.bottleneck_dim,
+    }
+    
+    # Build observation module config (pitch/observation estimator)
+    # obs receives x (input_dim) in second forward pass and enc_ctx2obs (input_dim) in forward step 4
+    # So input_dim = model_arch.input_dim, output_dim = 2 (asymmetric)
+    module_config['observation_module'] = {
+        'input_dim': config.model_arch.input_dim,  # 1D
+        'output_dim': config.model_arch.output_dim,  # 2D (mu, sigma)
+        'output_ext_dim': config.model_arch.output_dim,
+        'rnn_hidden_dim': module_dims['obs'],
+        'rnn_n_layers': config.model_arch.rnn_n_layers,
+        'bottleneck_dim': config.bottleneck_dim,
+    }
+    
+    return module_config
 
 
 # =============================================================================
@@ -1277,10 +1653,58 @@ def create_generative_model(config: RunConfig, batch_size: Optional[int] = None)
     else:
         raise ValueError(f"Unknown GM name: {config.data.gm_name}")
 
-
 # =============================================================================
 # Training Loop
 # =============================================================================
+
+def _compute_forward_and_loss(
+    model: nn.Module,
+    batch_data: Dict,
+    config: RunConfig,
+    objective: Objective,
+    data_mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Shared forward pass and loss computation for both training and validation.
+    Ensures consistent logic across both training (grad on) and validation (grad off) phases.
+    
+    Args:
+        model: The model to run forward pass on
+        batch_data: Dictionary with 'y', 'contexts', and optionally 'q', 'dpos', 'rules'
+        config: Run configuration
+        objective: Loss objective with loss functions
+        data_mode: Data mode string ('single_ctx' or 'multi_ctx')
+    
+    Returns:
+        Tuple of (model_output, loss_tensor)
+    """
+    y = batch_data['y']
+    contexts = batch_data['contexts']
+    
+    # Forward pass and loss computation (single source of truth)
+    if config.data.gm_name == 'HierarchicalGM':
+        q = batch_data['q']
+        dpos = batch_data['dpos']
+        rules = batch_data['rules']
+        model_output = model(y[:, :-1, :], q[:, :-1, :])
+        loss = compute_model_loss(
+            model, objective, y, model_output, data_mode,
+            learning_objective=config.learning_objective,
+            contexts_tensor=contexts,
+            dpos_tensor=dpos,
+            rules_tensor=rules
+        )
+    else:
+        model_output = model(y[:, :-1, :])
+        loss = compute_model_loss(
+            model, objective, y, model_output, data_mode,
+            learning_objective=config.learning_objective,
+            contexts_tensor=contexts,
+            kappa=config.kappa
+        )
+    
+    return model_output, loss
+
 
 def train_model(
     model: nn.Module,
@@ -1319,12 +1743,12 @@ def train_model(
     )
     
     # Loss function
-    loss_fn = torch.nn.GaussianNLLLoss(reduction='mean')
-    if config.data.data_mode == 'multi_ctx' and config.learning_objective in ['ctx', 'obs_ctx']:
+    loss_fn_obs = torch.nn.GaussianNLLLoss(reduction='mean')
+    if config.data.data_mode == 'multi_ctx' and config.learning_objective in ['ctx', 'obs_ctx', 'all']:
         loss_fn_ctx = torch.nn.CrossEntropyLoss(reduction='mean')
-        objective = Objective(loss_fn, loss_func_ctx=loss_fn_ctx)
     else:
-        objective = Objective(loss_fn)
+        loss_fn_ctx = None
+    objective = Objective(loss_fn_obs, loss_func_ctx=loss_fn_ctx)
     
     # Data generator
     gm = create_generative_model(config)
@@ -1350,7 +1774,11 @@ def train_model(
     param_names = list(model.state_dict().keys())
     
     # Logging setup
-    lr_title = f"Model: {config.model_type} | LR: {config.learning_rate:>6.0e} | #units: {config.hidden_dim}"
+    if config.hidden_dim is not None:
+        lr_title = f"Model: {config.model_type} | LR: {config.learning_rate:>6.0e} | hidden_dim: {config.hidden_dim}"
+    else:
+        dims_str = ', '.join(f"{k}={v}" for k, v in sorted(config.module_hidden_dims.items())) if config.module_hidden_dims else 'default'
+        lr_title = f"Model: {config.model_type} | LR: {config.learning_rate:>6.0e} | modules: {dims_str}"
     
     print(f"\n{'='*60}")
     print(f"TRAINING: {config.name}")
@@ -1368,23 +1796,15 @@ def train_model(
             
             # Generate batch
             batch_data = prepare_batch_data(gm, config.data.gm_name, data_mode, device)
-            y = batch_data['y']
-            contexts = batch_data['contexts']
-            
-            # Forward pass (predict y[1:T] from y[0:T-1])
-            model_output = model(y[:, :-1, :])
-            
-            # Compute loss
-            loss = compute_model_loss(
-                model, objective, y, model_output, data_mode,
-                learning_objective=config.learning_objective,
-                contexts_tensor=contexts,
-                kappa=config.kappa
-            )
             
             # Track weights before update (for logging)
             if batch_idx % batch_res == batch_res - 1:
                 weights_before = [w.detach().clone() for w in model.parameters()]
+            
+            # Forward pass and compute loss (shared logic)
+            model_output, loss = _compute_forward_and_loss(
+                model, batch_data, config, objective, data_mode
+            )
             
             # Backward pass
             loss.backward()
@@ -1425,7 +1845,7 @@ def train_model(
         # Store validation metrics
         history['valid_losses'].append(valid_metrics['loss'])
         history['valid_mse'].append(valid_metrics['mse'])
-        history['valid_sigma'].append(valid_metrics['sigma'])
+        history['valid_sigma'].append(valid_metrics['sigma_mean'])
         history['valid_steps'].append((epoch + 1) * n_batches)
         
         if benchmarks and 'mse_model2kal' in valid_metrics:
@@ -1487,40 +1907,58 @@ def _validate_epoch(
         mu_kal = None
         min_obs = None
     
-    # Forward pass
-    model_output = model(y[:, :-1, :])
+    # Forward pass and compute loss (shared logic)
+    model_output, loss = _compute_forward_and_loss(
+        model, batch_data, config, objective, data_mode
+    )
+    loss = loss.item()
     
-    # Compute loss
-    loss = compute_model_loss(
-        model, objective, y, model_output, data_mode,
-        learning_objective=config.learning_objective,
-        contexts_tensor=contexts,
-        kappa=config.kappa
-    ).item()
-    
-    # Extract predictions
-    mu_estim, var_estim, context_output = get_model_predictions(model, model_output)
-    sigma_estim = np.sqrt(var_estim)
+    # Extract all predictions from model (already processed: softmax, argmax, sigma computed)
+    predictions = get_model_predictions(model, model_output)
+    mu_estim = predictions['mu_estim']
+    sigma_estim = predictions['sigma_estim']
     
     # Compute MSE
     y_np = y.detach().cpu().numpy().squeeze()
     mse = ((mu_estim - y_np[:, 1:])**2).mean()
-    
-    # Convert context tensors to numpy for visualization
-    contexts_np = contexts.detach().cpu().numpy() if contexts is not None else None
-    context_output_np = context_output.detach().cpu().numpy() if context_output is not None else None
-    
+
+    # Initialize metrics with core measurements
     metrics = {
         'loss': loss,
         'mse': mse,
-        'sigma': sigma_estim.mean(),
-        'mu_estim': mu_estim,
-        'sigma_estim': sigma_estim,
+        'sigma_mean': sigma_estim.mean(),
         'y': y_np,
-        'pars': pars,
-        'contexts': contexts_np,
-        'context_output': context_output_np,
+        'pars': pars
     }
+    
+    # Add all model predictions (obs mu_estim and sigma_estim, contexts, dpos, rule probabilities and predictions)
+    metrics.update(predictions)
+    
+    # Process true labels from batch data
+    contexts_np = None
+    if contexts is not None and predictions['ctx_prob'] is not None:
+        contexts_np = contexts.detach().cpu().numpy().squeeze()
+
+    # Extract dpos and rule true labels (for HierarchicalGM)
+    dpos_true = None
+    rule_true = None
+    if 'dpos' in batch_data and batch_data['dpos'] is not None:
+        dpos_true = batch_data['dpos'].detach().cpu().numpy().squeeze()  # shape (N, T)
+    if 'rules' in batch_data and batch_data['rules'] is not None:
+        rule_true = batch_data['rules'].detach().cpu().numpy().squeeze()  # shape (N, T)
+
+    # Extract cues (for HierarchicalGM)
+    cues = None
+    if 'q' in batch_data and batch_data['q'] is not None:
+        cues = batch_data['q'].detach().cpu().numpy().squeeze()  # shape (N, T, N_cues)
+
+    # Add true labels to metrics
+    metrics.update({
+        'contexts': contexts_np,
+        'dpos_true': dpos_true,
+        'rule_true': rule_true,
+        'cues': cues,
+    })
     
     # Compare with Kalman filter if available
     if mu_kal is not None:
@@ -1592,8 +2030,9 @@ def test_model(
     # Forward pass
     with torch.no_grad():
         model_output = model(y[:, :-1, :])
-        mu_estim, var_estim, _ = get_model_predictions(model, model_output)
-        sigma_estim = np.sqrt(var_estim)
+        predictions = get_model_predictions(model, model_output)
+        mu_estim = predictions['mu_estim']
+        sigma_estim = predictions['sigma_estim']
     
     # Compute metrics
     y_np = y.detach().cpu().numpy().squeeze()
@@ -1640,7 +2079,7 @@ def _log_batch(save_path, lr_id, lr, epoch, batch, loss, batch_loss, elapsed, st
 
 def _log_epoch(save_path, lr_id, lr, epoch, metrics, elapsed, step, has_benchmarks):
     """Log epoch-level validation info."""
-    msg = f"LR: {lr:>6.0e}; epoch: {epoch:>3}; mean var: {metrics['sigma']:>7.2f}; mean MSE: {metrics['mse']:>7.2f}; time: {elapsed:>.2f}; step: {step}"
+    msg = f"LR: {lr:>6.0e}; epoch: {epoch:>3}; mean var: {metrics['sigma_mean']:>7.2f}; mean MSE: {metrics['mse']:>7.2f}; time: {elapsed:>.2f}; step: {step}"
     if has_benchmarks and 'mse_model2kal' in metrics:
         msg += f"; Model-KF MSE: {metrics['mse_model2kal']:>7.2f}"
     with open(save_path / f'training_log_lr{lr_id}.txt', 'a') as f:
@@ -1654,30 +2093,13 @@ def _save_validation_samples(metrics, config, epoch, title, benchmarks):
     kwargs = {
         'params': metrics['pars'],
         'title': title,
-        'data_config': config.data.to_gm_dict(config.training.batch_size),
         'seq_start': -config.seq_len_viz if config.seq_len_viz is not None else None,
         'N_plots': 4,
+        'data_config': config.data.to_gm_dict(config.training.batch_size),
     }
     
-    if benchmarks and 'mu_kal' in metrics:
-        kwargs['kalman_mu'] = metrics['mu_kal']
-        kwargs['min_obs_for_em'] = metrics['min_obs']
     
-    # Pass true contexts if available
-    if metrics.get('contexts') is not None:
-        kwargs['contexts'] = metrics['contexts']
-    
-    # Derive predicted context probabilities and hard predictions from context module output
-    context_output_np = metrics.get('context_output')
-    if context_output_np is not None:
-        # context_output_np: (N, T-1, N_ctx) logits
-        ctx_tensor = torch.from_numpy(context_output_np)
-        contexts_probs = torch.softmax(ctx_tensor, dim=-1).numpy()  # (N, T-1, N_ctx)
-        contexts_preds = np.argmax(context_output_np, axis=-1)       # (N, T-1)
-        kwargs['contexts_probs'] = contexts_probs
-        kwargs['contexts_preds'] = contexts_preds
-    
-    plot_samples(metrics['y'], metrics['mu_estim'], metrics['sigma_estim'], save_path, **kwargs)
+    plot_samples(metrics, save_path, **kwargs)
 
 
 def _save_training_plots(history, config, title, benchmarks):
@@ -1699,7 +2121,7 @@ def _save_training_plots(history, config, title, benchmarks):
     
     # MSE over epochs
     if benchmarks and history['model_kf_mse']:
-        mse_kal = benchmarks.get('perf', None)
+        mse_kal = benchmarks['perf']
         if hasattr(mse_kal, 'mean'):
             mse_kal = mse_kal.mean()
         plot_mse(epoch_steps, history['valid_mse'], title, 
@@ -1711,7 +2133,6 @@ def _save_training_plots(history, config, title, benchmarks):
     # Weight updates
     if history['weights_updates']:
         weights_updates = torch.stack(history['weights_updates'], dim=1)
-        param_names = list(config.model_type)  # Simplified
         plot_weights(
             history['train_steps'][:len(history['weights_updates'])],
             weights_updates,

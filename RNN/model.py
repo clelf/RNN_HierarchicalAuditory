@@ -15,13 +15,19 @@ class SimpleRNN(nn.Module):
         self.name = 'rnn'
         self.input_dim = config['input_dim']
         self.output_dim = config['output_dim']
+        # Extra optional readout
+        self.ext=False
+        if 'output_ext_dim' in config.keys():
+            self.ext=True
+            self.output_ext_dim = config['output_ext_dim']
         self.hidden_dim = config['hidden_dim']
         self.n_layers = config['n_layers']
         self.device = config.get('device', torch.device('cpu'))
 
         self.rnn = nn.GRU(self.input_dim, self.hidden_dim, self.n_layers, batch_first=True, device=self.device) # expect x of size (batch_size, seq_len, input_dim)
         self.output_layer = nn.Linear(self.hidden_dim, self.output_dim, device=self.device)
-
+        if self.ext:
+            self.output_layer_ext = nn.Linear(self.hidden_dim, self.output_ext_dim, device=self.device)
 
     def init_hidden(self, batch_size):
         return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
@@ -33,10 +39,15 @@ class SimpleRNN(nn.Module):
 
         output_last, hx_new = self.rnn(x, hx)  # output_last is the sequence of final hidden states after the last layer / hx_new is the final hidden state of each layer
         output_seq = self.output_layer(output_last)
-
+        if self.ext:
+            output_seq_ext = self.output_layer_ext(output_last)  
+        
+        result = [output_seq]
+        if self.ext:
+            result.append(output_seq_ext)
         if return_hidden:
-            return output_seq, hx_new
-        return output_seq
+            result.append(hx_new)
+        return tuple(result)
     
     def loss(self, target, x_output, loss_func): # torch.nn.GaussianNLLLoss()
         out_estim_mu    = x_output[..., [0]]
@@ -282,6 +293,7 @@ class ObsCtxModuleNetwork(nn.Module):
         self.observation_module = SimpleRNN({
             'input_dim': config['observation_module']['input_dim'],
             'output_dim': config['observation_module']['output_dim'],
+            'output_ext_dim': config['observation_module']['output_ext_dim'],
             'hidden_dim': config['observation_module']['rnn_hidden_dim'],
             'n_layers': config['observation_module']['rnn_n_layers'],
             'device': config.get('device', torch.device('cpu'))
@@ -290,6 +302,7 @@ class ObsCtxModuleNetwork(nn.Module):
         self.context_module = SimpleRNN({
             'input_dim': config['context_module']['input_dim'],
             'output_dim': config['context_module']['output_dim'],
+            'output_ext_dim': config['context_module']['output_ext_dim'],
             'hidden_dim': config['context_module']['rnn_hidden_dim'],
             'n_layers': config['context_module']['rnn_n_layers'],
             'device': config.get('device', torch.device('cpu'))
@@ -307,20 +320,6 @@ class ObsCtxModuleNetwork(nn.Module):
             bottleneck_dim=config['context_module']['bottleneck_dim']
         )
 
-        # self.readout_obs2ctx = nn.Sequential(
-        #     nn.Linear(config['observation_module']['output_dim'],
-        #               config['observation_module']['bottleneck_dim']),
-        #     nn.ReLU(),
-        #     nn.Linear(config['observation_module']['bottleneck_dim'],
-        #               config['context_module']['input_dim']),
-        # )
-        # self.readout_ctx2obs = nn.Sequential(
-        #     nn.Linear(config['context_module']['output_dim'],
-        #               config['context_module']['bottleneck_dim']),
-        #     nn.ReLU(),
-        #     nn.Linear(config['context_module']['bottleneck_dim'],
-        #               config['observation_module']['input_dim']),
-        # )
 
     def inter_module_readout(self, in_dim, out_dim, bottleneck_dim):
         return nn.Sequential(
@@ -332,76 +331,23 @@ class ObsCtxModuleNetwork(nn.Module):
 
     def forward(self, x):
         # First pass: observation module processes input
-        obs_output, obs_hx = self.observation_module(x, return_hidden=True)  # get hidden state
+        obs_output, obs_output_ext, obs_hx = self.observation_module(x, return_hidden=True)  # get hidden state
         # obs_output, obs_hx = self.observation_module(x, hx=obs_hx, return_hidden=True) # Example of "thinking"
         
         # Compress and send to context module
         enc_obs2ctx_output = self.readout_obs2ctx(obs_output)
-        context_output = self.context_module(enc_obs2ctx_output)  # context module has its own independent hidden state
+        ctx_output, ctx_output_ext = self.context_module(enc_obs2ctx_output)  # context module has its own independent hidden state
             
         # Feedback: compress context output
-        enc_ctx2obs_output = self.readout_ctx2obs(context_output)
+        enc_ctx2obs_output = self.readout_ctx2obs(ctx_output)
         
         # Second pass: combine context feedback and previous hidden state
-        informed_obs_output = self.observation_module(enc_ctx2obs_output, hx=obs_hx)
+        informed_obs_output, informed_obs_output_ext = self.observation_module(enc_ctx2obs_output, hx=obs_hx)
         
-        return informed_obs_output, context_output
+        return informed_obs_output_ext, ctx_output_ext
     
 
 
-# class RuleCtxObsModuleNetwork(ObsCtxModuleNetwork):
-# # class RuleCtxObsModuleNetwork(CtxObsModuleNetwork):
-#     """A multi-module neural network architecture with observation, context and rules modules."""
-    
-#     def __init__(self, config):
-#         super(RuleCtxObsModuleNetwork, self).__init__(config)
-#         self.name = 'rule_module_network'  # For Objective class to identify model type
-
-#         self.dpos_module = SimpleRNN({
-#             'input_dim': config['rule_module']['input_dim'],
-#             'output_dim': config['rule_module']['output_dim'],
-#             'hidden_dim': config['rule_module']['rnn_hidden_dim'],
-#             'n_layers': config['rule_module']['rnn_n_layers'],
-#             'device': config.get('device', torch.device('cpu'))
-#         })
-
-#         self.readout_ctx2dpos = self.inter_module_readout(
-#             in_dim=config['context_module']['output_dim'],
-#             out_dim=config['rule_module']['input_dim'],
-#             bottleneck_dim=config['context_module']['bottleneck_dim']
-#         )
-
-#         self.readout_dpos2ctx = self.inter_module_readout(
-#             in_dim=config['rule_module']['output_dim'],
-#             out_dim=config['context_module']['input_dim'],
-#             bottleneck_dim=config['rule_module']['bottleneck_dim']
-#         )        
-
-
-#     def forward(self, x):
-#         # First pass: observation module processes input
-#         obs_output, obs_hx = self.observation_module(x, return_hidden=True)  # get hidden state
-#         # obs_output, obs_hx = self.observation_module(x, hx=obs_hx, return_hidden=True) # Example of "thinking"
-        
-#         # Compress and send to context module, save hidden states
-#         enc_obs2ctx_output = self.readout_obs2ctx(obs_output)
-#         context_output, ctx_hx = self.context_module(enc_obs2ctx_output, return_hidden=True)
-
-#         # Compress and send to dpos module
-#         enc_ctx2dpos_output = self.readout_ctx2dpos(context_output)
-#         dpos_output = self.rule_module(enc_ctx2dpos_output)
-
-#         # Feedback to context module - get dpos-informed context output: compress dpos output and send back to context module, 
-#         enc_dpos2ctx_output = self.readout_dpos2ctx(dpos_output)
-#         dpos_informed_context_output = self.context_module(enc_dpos2ctx_output, hx=ctx_hx)
-
-#         # Feedback to observation module - get dpos-and-ctx-informed observation output: compress context output and send back to context module, combine context feedback and previous hidden state
-#         enc_ctx2obs_output = self.readout_ctx2obs(dpos_informed_context_output)
-#         dpos_context_informed_obs_output = self.observation_module(enc_ctx2obs_output, hx=obs_hx)
-        
-#         return dpos_context_informed_obs_output, dpos_informed_context_output, dpos_output
-
-    
 
 class PopulationNetwork(ObsCtxModuleNetwork):
 # class RuleCtxObsModuleNetwork(CtxObsModuleNetwork):
@@ -415,6 +361,7 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         self.dpos_module = SimpleRNN({
             'input_dim': config['dpos_module']['input_dim'],
             'output_dim': config['dpos_module']['output_dim'],
+            'output_ext_dim': config['dpos_module']['output_ext_dim'],
             'hidden_dim': config['dpos_module']['rnn_hidden_dim'],
             'n_layers': config['dpos_module']['rnn_n_layers'],
             'device': config.get('device', torch.device('cpu'))
@@ -423,6 +370,7 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         self.rule_module = SimpleRNN({
             'input_dim': config['rule_module']['input_dim'],
             'output_dim': config['rule_module']['output_dim'],
+            'output_ext_dim': config['rule_module']['output_ext_dim'],
             'hidden_dim': config['rule_module']['rnn_hidden_dim'],
             'n_layers': config['rule_module']['rnn_n_layers'],
             'device': config.get('device', torch.device('cpu'))
@@ -436,7 +384,7 @@ class PopulationNetwork(ObsCtxModuleNetwork):
 
         self.readout_dpos2rule = self.inter_module_readout(
             in_dim=config['dpos_module']['output_dim'],
-            out_dim=config['context_module']['input_dim'],
+            out_dim=config['rule_module']['input_dim'],
             bottleneck_dim=config['dpos_module']['bottleneck_dim']
         )     
 
@@ -454,37 +402,51 @@ class PopulationNetwork(ObsCtxModuleNetwork):
 
 
     def forward(self, x, q):
-        # 1) Observe visual cue
-        rule_output, rule_hx = self.rule_module(q, return_hidden=True)
-
-        # 2) Compress and inform deviant position identifier module
-        enc_rule2dpos_output = self.readout_rule2dpos(rule_output)
-        dpos_output, dpos_hx = self.dpos_module(enc_rule2dpos_output, return_hidden=True)
-
-        # 3) Compress and inform context identifier module
-        enc_dpos2ctx_output = self.readout_dpos2ctx(dpos_output)
-        ctx_output, ctx_hx = self.context_module(enc_dpos2ctx_output, return_hidden=True)
-
-        # 4) Compress and inform pitch observation estimation module
-        enc_ctx2obs_output = self.readout_dpos2ctx(ctx_output)
-        ctx_output, obs_hx = self.observation_module(enc_ctx2obs_output, return_hidden=True)
-
-        # 5) Observe pitch (use prior-informed obs module)
-        posterior_obs_output = self.observation_module(x, hx=obs_hx)
-
-        # 6) Compress and pass back to context identifier
-        enc_obs2ctx_output = self.readout_obs2ctx(posterior_obs_output)
-        posterior_ctx_output = self.context_module(enc_obs2ctx_output, hx=ctx_hx)
-
-        # 7) Compress and pass back to deviant position identifier
-        enc_ctx2dpos_output = self.readout_ctx2dpos(posterior_ctx_output)
-        posterior_dpos_output = self.dpos_module(enc_ctx2dpos_output, hx=dpos_hx)
-
-        # 8) Compress and pass back to rule identifier module
-        enc_dpos2rule_output = self.readout_dpos2rule(posterior_dpos_output)
-        posterior_rule_output = self.rule_module(enc_dpos2rule_output, hx=rule_hx)
-
-        return posterior_obs_output, posterior_ctx_output, posterior_dpos_output, posterior_rule_output
+        """
+        Two-pass forward computation with bidirectional information flow.
+        
+        Module dimensions:
+        - rule:       input_dim=cue_dim,        output_dim=N_rules
+        - dpos:       input_dim=N_dpos,   output_dim=N_dpos
+        - ctx:        input_dim=N_ctx,      output_dim=N_ctx
+        - obs:        input_dim=obs_dim,    output_dim=2
+        
+        Readout gates handle all dimensional transformations between modules.
+        """
+        # FORWARD PASS (bottom-up)
+        
+        # 1) Process visual cues through rule module (ignore external readout needed at this stage)
+        rule_output, _, rule_hx = self.rule_module(q, return_hidden=True)  # 1D → N_rules
+        
+        # 2) Compress rule output and inform dpos module
+        enc_rule2dpos_output = self.readout_rule2dpos(rule_output)  # N_rules → N_dpos
+        dpos_output, _, dpos_hx = self.dpos_module(enc_rule2dpos_output, return_hidden=True)  # N_dpos → N_dpos
+        
+        # 3) Compress dpos output and inform context module
+        enc_dpos2ctx_output = self.readout_dpos2ctx(dpos_output)  # N_dpos → N_ctx
+        ctx_output, _, ctx_hx = self.context_module(enc_dpos2ctx_output, return_hidden=True)  # N_ctx → N_ctx
+        
+        # 4) Compress context output to prime observation module with prior information (ignore both internal and external readout, priming only with hidden states)
+        enc_ctx2obs_output = self.readout_ctx2obs(ctx_output)  # N_ctx → input_dim
+        _, _, obs_hx = self.observation_module(enc_ctx2obs_output, return_hidden=True)  # input_dim, stores hidden state → 2
+        
+        # 5) Process actual observation with prior-informed hidden state
+        posterior_obs_output, posterior_obs_output_ext = self.observation_module(x, hx=obs_hx)  # input_dim + prior hx → 2
+        
+        # FEEDBACK PASS (top-down) -- Save external readouts for training
+        # 6) Compress obs output and send feedback to context module
+        enc_obs2ctx_output = self.readout_obs2ctx(posterior_obs_output)  # 2 → N_ctx
+        posterior_ctx_output, posterior_ctx_output_ext = self.context_module(enc_obs2ctx_output, hx=ctx_hx)  # N_ctx + prior hx → N_ctx
+        
+        # 7) Compress context output and send feedback to dpos module
+        enc_ctx2dpos_output = self.readout_ctx2dpos(posterior_ctx_output)  # N_ctx → N_dpos
+        posterior_dpos_output, posterior_dpos_output_ext = self.dpos_module(enc_ctx2dpos_output, hx=dpos_hx)  # N_dpos + prior hx → N_dpos
+        
+        # 8) Compress dpos output and send feedback to rule module
+        enc_dpos2rule_output = self.readout_dpos2rule(posterior_dpos_output)  # N_dpos → 1
+        _, posterior_rule_output_ext = self.rule_module(enc_dpos2rule_output, hx=rule_hx)  # 1 + prior hx → N_rules
+        
+        return posterior_obs_output_ext, posterior_ctx_output_ext, posterior_dpos_output_ext, posterior_rule_output_ext
 
 
 

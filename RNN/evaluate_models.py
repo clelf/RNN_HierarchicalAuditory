@@ -60,7 +60,7 @@ from tqdm import tqdm
 
 # Local imports (files are now in the same directory)
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from model import SimpleRNN, VRNN, ModuleNetwork
+from model import SimpleRNN, VRNN, ObsCtxModuleNetwork
 from pipeline_next import extract_model_predictions, prepare_batch_data
 
 # Local config (for loading saved configs)
@@ -68,7 +68,7 @@ from config_v2 import RunConfig, TrainingConfig, ModelArchConfig, DataConfig as 
 
 # Generative models (PreProParadigm is one level up from RNN/)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from PreProParadigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
+from PreProParadigm.audit_gm import NonHierarchicalAuditGM, HierarchicalAuditGM
 
 
 # =============================================================================
@@ -478,7 +478,7 @@ def load_model(info: ModelInfo, device: str = 'cpu') -> nn.Module:
             },
             'device': device,
         }
-        model = ModuleNetwork(config)
+        model = ObsCtxModuleNetwork(config)
     
     else:
         raise ValueError(f"Unknown model type: {info.model_type}")
@@ -580,13 +580,16 @@ def generate_test_data(config: TestDataConfig, device: str = 'cpu') -> Dict[str,
     gm_dict = config.to_gm_dict()
     
     if config.gm_name == 'NonHierarchicalGM':
-        gm = NonHierachicalAuditGM(gm_dict)
-        contexts, _, y, pars = gm.generate_batch(return_pars=True)
+        gm = NonHierarchicalAuditGM(gm_dict)
     elif config.gm_name == 'HierarchicalGM':
         gm = HierarchicalAuditGM(gm_dict)
-        _, _, _, _, _, contexts, _, y, pars = gm.generate_batch(return_pars=True)
     else:
         raise ValueError(f"Unknown GM: {config.gm_name}")
+    
+    batch = gm.generate_batch(return_pars=True)
+    y = batch['obs']
+    contexts = batch['contexts']
+    pars = batch.get('pars', None)
     
     # Convert to tensors
     y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(-1).to(device)
