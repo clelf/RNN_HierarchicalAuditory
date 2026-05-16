@@ -35,9 +35,9 @@ from PreProParadigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
 base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 if os.path.exists(os.path.join(base_path, 'Kalman')):
-    from Kalman.kalman import kalman_fit_predict_batch, kalman_fit_predict_multicontext_batch, MIN_OBS_FOR_EM, kalman_fit_predict, kalman_fit_predict_multicontext
+    from Kalman.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext, contexts_to_probabilities
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
-    from KalmanFilterViz1D.kalman import kalman_fit_predict_batch, kalman_fit_predict_multicontext_batch, MIN_OBS_FOR_EM, kalman_fit_predict, kalman_fit_predict_multicontext
+    from KalmanFilterViz1D.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext, contexts_to_probabilities
 else:
     raise ImportError("Neither 'Kalman' nor 'KalmanFilterViz1D' folder found.")
 
@@ -47,41 +47,8 @@ FREQ_MIN = 1400
 FREQ_MAX = 1650
 
 
-def contexts_to_responsibilities(contexts, n_ctx):
-    """
-    Convert hard context labels to one-hot responsibilities (soft assignments).
-    
-    This function bridges the gap between generative models that produce hard
-    context labels and Kalman filter functions that expect soft responsibilities.
-    
-    Parameters
-    ----------
-    contexts : np.array
-        1D integer array of shape (T,) with values in [0, n_ctx-1]
-    n_ctx : int
-        Number of contexts
-    
-    Returns
-    -------
-    responsibilities : np.array
-        One-hot encoded array of shape (T, n_ctx) where each row sums to 1.0
-    """
-    T = len(contexts)
-    responsibilities = np.zeros((T, n_ctx))
-    responsibilities[np.arange(T), contexts.astype(int)] = 1.0
-    return responsibilities
 
 
-# TODO CHECK-LIST
-# - a loss tolerance?
-# - an early stopping in case of overfitting (ABSOLUTELY according to Seyma) --> include IF i observe overfitting
-# - dropout?
-# - assess need to change activation function or not (hand in hand with changing the models' inner layers' architecture)
-# - set requires_grad / autograd
-
-
-# TODO:
-# - load params
 
 
 class MinMaxScaler():
@@ -526,11 +493,11 @@ def _process_single_kf_sample(args):
     
     # Fit Kalman filter for this single sample
     if n_ctx == 1:
-        mu_pred_i, sigma_pred_i, _ = kalman_fit_predict(y_i, n_iter=n_iter)
+        mu_pred_i, sigma_pred_i, _ = kalman_online_fit_predict(y_i, n_iter=n_iter)
     else:
         # Convert context labels to responsibilities for multicontext KF
-        responsibilities_i = contexts_to_responsibilities(ctx_i, n_ctx)
-        mu_pred_i, sigma_pred_i, _ = kalman_fit_predict_multicontext(
+        responsibilities_i = contexts_to_probabilities(ctx_i, n_ctx)
+        mu_pred_i, sigma_pred_i, _ = kalman_online_fit_predict_multicontext(
             y_i, responsibilities_i, n_iter=n_iter
         )
     
@@ -572,11 +539,11 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
     Args:
         data_config (dict): Configuration parameters for the data generative model.
         N_samples (int, optional): Number of samples to generate. If None, uses data_config["N_samples"].
-        n_iter (int): Number of iterations for kalman_fit_batch.
+        n_iter (int): Number of iterations for kalman_fit_predict.
         benchmarkpath (Path or None): Path to save the benchmark file. If None, benchmarks are not saved.
         save (bool): Whether to save the benchmark data.
         suffix (str): Suffix for the benchmark filename.
-        individual (bool): If True, save each sample individually to avoid losing progress on crash.
+        individual (bool): If True, save each sample individually to allow resuming on crash.
                            The samples are aggregated at the end. Default: True.
         max_cores (int, optional): Number of parallel cores for KF fitting.
                                      None or 1 = sequential processing (default).
@@ -587,143 +554,110 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
         dict: A dictionary containing observations, contexts (if N_ctx>1), Kalman estimates, 
               parameters, and performance metrics.
     """
-    
+
     # Define data generative model
     if gm_name == 'NonHierarchicalGM': gm = NonHierachicalAuditGM(data_config)
     elif gm_name == 'HierarchicalGM': gm = HierarchicalAuditGM(data_config)
     else: raise ValueError("Invalid GM name")
-    
+
     # Determine number of samples
     if N_samples is None:
         N_samples = data_config["N_samples"]
-    
+
     # Determine parallelization settings
     if max_cores == -1:
         max_cores = cpu_count()
     use_parallel = HAS_PATHOS and max_cores is not None and max_cores > 1 and N_samples > 1
     if use_parallel:
         print(f"  Parallel processing enabled with {max_cores} cores (pathos available: {HAS_PATHOS})")
-    
-    # Set up individual directory if needed
-    if save and individual and benchmarkpath is not None:
+
+    use_individual = individual and save and benchmarkpath is not None
+
+    # --- Data generation (with optional resume from a previous run) ---
+    existing_samples = set()
+    incr_dir = None
+
+    if use_individual:
         incr_dir = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, N_samples, suffix)
         os.makedirs(incr_dir, exist_ok=True)
-        
-        # Check if we have saved input data from a previous run (for reproducibility on resume)
-        input_data_file = incr_dir / "input_data.pkl"
-        
-        # Check which samples already exist (for resuming)
         existing_samples = set(int(f.stem.split('_')[1]) for f in incr_dir.glob("sample_*.pkl"))
         start_sample = len(existing_samples)
-        
+        input_data_file = incr_dir / "input_data.pkl"
+
         if input_data_file.exists() and start_sample > 0:
-            # Resume: load the original input data to ensure consistency
+            # Resume: reload original input data to guarantee consistency
             print(f"  Resuming from sample {start_sample}/{N_samples} (found {start_sample} existing samples)")
-            print(f"  Loading original input data for consistency...")
             with open(input_data_file, 'rb') as f:
                 input_data = pickle.load(f)
-            y_batch = input_data['y']
-            contexts_batch = input_data['contexts']
-            pars_batch = input_data['pars']
+            y_batch, contexts_batch, pars_batch = input_data['y'], input_data['contexts'], input_data['pars']
         else:
-            # Fresh start: generate new samples and save input data
+            # Fresh start: generate and persist input data for potential future resume
             print(f"  Generating {N_samples} samples...")
             if gm_name == 'NonHierarchicalGM':
                 contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
             elif gm_name == 'HierarchicalGM':
                 _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
-            
-            # Save input data for potential resume
-            input_data = {'y': y_batch, 'contexts': contexts_batch, 'pars': pars_batch}
             with open(input_data_file, 'wb') as f:
-                pickle.dump(input_data, f)
-            print(f"  Input data saved")
+                pickle.dump({'y': y_batch, 'contexts': contexts_batch, 'pars': pars_batch}, f)
+            print(f"  Input data saved to {input_data_file}")
     else:
-        existing_samples = set()
         start_sample = 0
-        incr_dir = None  # No saving in non-individual mode
-        # Generate samples (non-individual mode)
         print(f"  Generating {N_samples} samples...")
         if gm_name == 'NonHierarchicalGM':
             contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
         elif gm_name == 'HierarchicalGM':
             _, _, _, _, _, contexts_batch, _, y_batch, pars_batch = gm.generate_batch(N_samples, return_pars=True)
-    
-    # Process sample-by-sample with individual saving (supports parallel processing)
-    if individual and save and benchmarkpath is not None:
-        # Build list of samples to process (skip already-processed ones)
-        samples_to_process = [i for i in range(N_samples) if i not in existing_samples]
-        
-        if len(samples_to_process) == 0:
-            print(f"  All {N_samples} samples already processed.")
+
+    # --- KF fitting (sample-by-sample, sequential or parallel) ---
+    samples_to_process = [i for i in range(N_samples) if i not in existing_samples]
+
+    if len(samples_to_process) == 0:
+        print(f"  All {N_samples} samples already processed.")
+        results = []
+    else:
+        print(f"  Processing {len(samples_to_process)} samples...")
+        args_list = [
+            (i,
+             y_batch[i],
+             contexts_batch[i] if contexts_batch is not None else None,
+             {key: val[i] for key, val in pars_batch.items()},
+             N_ctx, n_iter, incr_dir)
+            for i in samples_to_process
+        ]
+
+        if use_parallel:
+            print(f"  Using {max_cores} parallel cores...")
+            with ProcessingPool(nodes=max_cores) as pool:
+                results = list(tqdm(
+                    pool.imap(_process_single_kf_sample, args_list),
+                    total=N_samples, desc="KF fitting (parallel)", initial=start_sample
+                ))
         else:
-            print(f"  Processing {len(samples_to_process)} samples with individual saving...")
-            
-            # Prepare arguments for each sample
-            args_list = [
-                (i, 
-                 y_batch[i], 
-                 contexts_batch[i] if contexts_batch is not None else None,
-                 {key: val[i] for key, val in pars_batch.items()},
-                 N_ctx,
-                 n_iter,
-                 incr_dir)
-                for i in samples_to_process
+            results = [
+                _process_single_kf_sample(args)
+                for args in tqdm(args_list, desc="KF fitting", total=N_samples, initial=start_sample)
             ]
-            
-            if use_parallel:
-                # Parallel processing with pathos
-                print(f"  Using {max_cores} parallel cores...")
-                with ProcessingPool(nodes=max_cores) as pool:
-                    # Use imap for progress tracking
-                    results = list(tqdm(
-                        pool.imap(_process_single_kf_sample, args_list),
-                        total=N_samples,
-                        desc="KF fitting (parallel)",
-                        initial=start_sample
-                    ))
-            else:
-                # Sequential processing with progress bar
-                for args in tqdm(args_list, desc="KF fitting", total=N_samples, initial=start_sample):
-                    _process_single_kf_sample(args)
-        
-        # Aggregate all individual files into final benchmark file
+
+    # --- Assemble benchmark_kit ---
+    if use_individual:
+        # Aggregate from individually saved files (handles both fresh and resumed runs)
         print(f"  Aggregating individual files...")
         benchmark_kit = aggregate_individual_benchmarks(benchmarkpath, N_ctx, gm_name, N_samples, suffix)
-        
     else:
-        # Original batch processing (faster but no crash recovery)
-        print(f"  Fitting Kalman filters (batch mode)...")
-        if N_ctx == 1:
-            kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_batch(y_batch, n_iter=n_iter)
-        else:
-            # Convert context labels to responsibilities for multicontext KF
-            responsibilities_batch = np.array([
-                contexts_to_responsibilities(contexts_batch[i], N_ctx) 
-                for i in range(len(contexts_batch))
-            ])  # Shape: (N_samples, T, N_ctx)
-            kalman_mu_pred, kalman_sigma_pred = kalman_fit_predict_multicontext_batch(
-                y_batch, responsibilities_batch, n_iter=n_iter
-            )
-        
-        # Compute MSE
-        mses = ((kalman_mu_pred - y_batch[:, MIN_OBS_FOR_EM:]) ** 2).mean(axis=1)
-
+        # Build from in-memory results
         benchmark_kit = {
-            'y': y_batch,
-            'contexts': contexts_batch,
-            'mu_kal_pred': kalman_mu_pred,
-            'sigma_kal_pred': kalman_sigma_pred,
-            'pars': pars_batch, 
-            'perf': mses,
+            'y': np.stack([s['y'] for s in results]),
+            'contexts': np.stack([s['contexts'] for s in results]) if results[0]['contexts'] is not None else None,
+            'mu_kal_pred': np.stack([s['mu_kal_pred'] for s in results]),
+            'sigma_kal_pred': np.stack([s['sigma_kal_pred'] for s in results]),
+            'pars': {key: np.stack([s['pars'][key] for s in results]) for key in results[0]['pars'].keys()},
+            'perf': np.array([s['perf'] for s in results]),
             'n_ctx': N_ctx,
-            'min_obs_for_em': MIN_OBS_FOR_EM
+            'min_obs_for_em': MIN_OBS_FOR_EM,
         }
-
-        if save:
+        if save and benchmarkpath is not None:
             benchmark_file = benchmark_filename(benchmarkpath, N_ctx, gm_name, N_samples, suffix=suffix)
-            if benchmarkpath is not None and not benchmark_file.parent.exists():
-                os.makedirs(benchmark_file.parent)
+            os.makedirs(benchmark_file.parent, exist_ok=True)
             with open(benchmark_file, 'wb') as f:
                 pickle.dump(benchmark_kit, f)
 
@@ -1247,6 +1181,180 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
 
 
 
+def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None, params=None, kalman_mu=None, kalman_sigma=None, hidden_states=None, contexts=None, contexts_probs=None, contexts_preds=None, preds_aligned=False, shared_ylim=False, ylim=None, kal_x_start=None, data_config=None):
+    """
+    Plot a single observation sequence with model and optional Kalman filter predictions.
+    
+    Args:
+        id: Figure index for naming
+        i: Sample index (index into all arrays)
+        obs: Observation sequences array with shape (N, T)
+        mu_estim: Model estimates with shape (N, T-1)
+        sigma_estim: Model uncertainties with shape (N, T-1)
+        save_path: Path/prefix for saving the figure
+        n_ctx: Number of contexts
+        title: Base title for the plot
+        params: Parameter dictionary for display in title
+        kalman_mu: Kalman filter predictions
+        kalman_sigma: Kalman filter uncertainties
+        hidden_states: Hidden state values
+        contexts: True context assignments
+        contexts_probs: Inferred context probabilities
+        contexts_preds: Predicted contexts
+        preds_aligned: Whether model predictions align with obs x-axis
+        shared_ylim: Whether to use pre-computed shared y-limits
+        ylim: Pre-computed shared y-axis limits (required if shared_ylim=True)
+        kal_x_start: Starting x-position for Kalman filter predictions
+        data_config: Data configuration dictionary
+    """
+    # Decide whether to use two subplots (context panel below) or a single axes
+    use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_probs is not None or contexts_preds is not None)
+    ctx_colors = {0: 'tab:blue', 1: 'tab:orange'}
+
+    if use_ctx_panel:
+        fig, (ax_obs, ax_ctx) = plt.subplots(
+            2, 1, figsize=(20, 8),
+            sharex=True,
+            gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.05}
+        )
+    else:
+        fig, ax_obs = plt.subplots(1, 1, figsize=(20, 6))
+        ax_ctx = None
+
+    # ── top subplot: observations + predictions ──────────────────────────
+    ax_obs.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
+
+    # When preds_aligned, predictions cover the same x-range as obs;
+    # otherwise they start one step later (no prediction for the first obs).
+    if preds_aligned:
+        estim_x = range(len(obs[i]))
+    else:
+        estim_x = range(1, len(obs[i]))
+    ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
+    ax_obs.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2, label='std (model)')
+
+    if kalman_mu is not None and kalman_sigma is not None:
+        kal_x = range(kal_x_start, kal_x_start + len(kalman_mu[i]))
+        ax_obs.plot(kal_x, kalman_mu[i], label='y_kal (KF pred)', color='green', alpha=0.8)
+        ax_obs.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2, label='std (KF)')
+    
+    if hidden_states is not None:
+        ax_obs.plot(range(len(hidden_states[i])), hidden_states[i, :], label='hidden state', color='orange', alpha=0.8)
+
+    # context switch vertical lines on the obs panel
+    if n_ctx > 1 and contexts is not None:
+        context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1
+        for cc in context_changes:
+            ax_obs.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
+
+    if shared_ylim:
+        ax_obs.set_ylim(ylim)
+    if use_ctx_panel:
+        ax_obs.tick_params(labelbottom=False)  # x labels only on bottom panel
+    else:
+        ax_obs.set_xlabel('time step')
+
+    # ── bottom subplot: context lines ─────────────────────────────────────
+    if use_ctx_panel:
+        # Rows (top→bottom in visual order = decreasing y): probs, pred, true
+        # Use integer y positions; higher y = drawn higher
+        ROW_PROB_BASE = 2  # p(ctx_val) at ROW_PROB_BASE + ctx_val  (topmost)
+        ROW_PRED      = 1
+        ROW_TRUE      = 0
+
+        # x-offset for prediction-aligned arrays:
+        # When preds_aligned, probs/preds have the same length as obs → offset 0
+        # Otherwise they are 1 shorter → offset 1 (skip first obs timestep)
+        pred_x_off = 0 if preds_aligned else 1
+
+        if contexts_probs is not None:
+            probs_i = contexts_probs[i]  # shape (W, n_ctx) or (W-1, n_ctx)
+            for ctx_val in range(probs_i.shape[-1]):
+                row = ROW_PROB_BASE + ctx_val
+                label_prob = f'p(ctx {ctx_val}) inferred'
+                for t in range(len(probs_i)):
+                    ax_ctx.hlines(row, t + pred_x_off, t + pred_x_off + 1,
+                                  colors=ctx_colors[ctx_val],
+                                  linewidth=6, alpha=float(probs_i[t, ctx_val]),
+                                  label=label_prob if t == 0 else None)
+
+        if contexts_preds is not None:
+            pred_boundaries = np.concatenate(([0], np.where(np.diff(contexts_preds[i]) != 0)[0] + 1, [len(contexts_preds[i])]))
+            pred_labels_placed = set()
+            for seg_start, seg_end in zip(pred_boundaries[:-1], pred_boundaries[1:]):
+                ctx_val = int(contexts_preds[i][seg_start])
+                label = f'ctx {ctx_val} pred' if ctx_val not in pred_labels_placed else None
+                pred_labels_placed.add(ctx_val)
+                ax_ctx.hlines(ROW_PRED, seg_start + pred_x_off, seg_end + pred_x_off,
+                              colors=ctx_colors[ctx_val],
+                              linewidth=6, alpha=0.8, label=label)
+
+        if contexts is not None:
+            ctx_counts = {0: int((contexts[i] == 0).sum()), 1: int((contexts[i] == 1).sum())}
+            boundaries = np.concatenate(([0], np.where(np.diff(contexts[i]) != 0)[0] + 1, [len(contexts[i])]))
+            ctx_labels_placed = set()
+            for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+                ctx_val = int(contexts[i][seg_start])
+                label = f'ctx {ctx_val} (N={ctx_counts[ctx_val]})' if ctx_val not in ctx_labels_placed else None
+                ctx_labels_placed.add(ctx_val)
+                ax_ctx.hlines(ROW_TRUE, seg_start, seg_end, colors=ctx_colors[ctx_val], linewidth=6, alpha=0.8, label=label)
+
+        ax_ctx.set_ylim(-0.5, ROW_PROB_BASE + n_ctx - 0.5)
+        ax_ctx.set_yticks([ROW_TRUE, ROW_PRED] + [ROW_PROB_BASE + c for c in range(n_ctx)])
+        ax_ctx.set_yticklabels(['true', 'pred'] + [f'p(ctx {c})' for c in range(n_ctx)], fontsize=8)
+        ax_ctx.set_xlabel('time step')
+
+    # ── shared legend on the right (only selected labels) ────────────────
+    # Collect labels to show: y_obs, y_hat, sigma, y_kal, and "ctx N (N=...)" from the ctx panel
+    _LEGEND_KEEP = {'y_obs', 'y_hat (model pred)', 'std (model)', 'y_kal (KF pred)', 'std (KF)'}
+    handles, labels = [], []
+    for ax in ([ax_obs, ax_ctx] if use_ctx_panel else [ax_obs]):
+        if ax is None:
+            continue
+        h, l = ax.get_legend_handles_labels()
+        for handle, lbl in zip(h, l):
+            if lbl not in labels and (lbl in _LEGEND_KEEP or (lbl is not None and lbl.startswith('ctx') and '(N=' in lbl)):
+                handles.append(handle)
+                labels.append(lbl)
+    fig.legend(handles, labels, loc='center left', bbox_to_anchor=(0.92, 0.5), borderaxespad=0, frameon=True)
+    plot_title = title
+    if params is not None:
+        # Extract parameters for sample i, handling both dict and legacy array formats
+        tau_i = params['tau'][i] if params['tau'].ndim > 0 else params['tau']
+        lim_i = params['lim'][i] if params['lim'].ndim > 0 else params['lim']
+        si_stat_i = params['si_stat'][i] if np.asarray(params['si_stat']).ndim > 0 else params['si_stat']
+        si_q_i = params['si_q'][i] if params['si_q'].ndim > 0 else params['si_q']
+        si_r_i = params['si_r'][i] if np.asarray(params['si_r']).ndim > 0 else params['si_r']
+        
+        # Compute si_r/si_stat ratio
+        si_ratio = si_r_i / si_stat_i if si_stat_i != 0 else np.nan
+        
+        if n_ctx == 2:
+            # Two-context case: format like audit_gm with std/dvt labels
+            tau_str = f"std: {tau_i[0]:.2f}, dvt: {tau_i[1]:.2f}"
+            lim_str = f"std: {lim_i[0]:.2f}, dvt: {lim_i[1]:.2f}"
+            si_q_str = f"std: {si_q_i[0]:.2f}, dvt: {si_q_i[1]:.2f}"
+            
+            # Compute d and d_eff for two-context case
+            # d_eff = lim[1] - lim[0] (actual distance)
+            # d = d_eff / si_eff where si_eff = sqrt(si_stat**2 + si_r**2)
+            d_eff = lim_i[1] - lim_i[0]
+            si_eff = np.sqrt(si_stat_i**2 + si_r_i**2)
+            d = d_eff / si_eff if si_eff != 0 else np.nan
+            
+            title_line1 = f"tau: {tau_str}  |  lim: {lim_str}  | d: {d:.2f},  d_eff: {d_eff:.2f}"
+            title_line2 = f"si_stat: {si_stat_i:.2f}  |  si_q: {si_q_str}  |  si_r: {si_r_i:.2f}  |  si_r/si_stat: {si_ratio:.2f}"
+            plot_title = f"{title}\n{title_line1}\n{title_line2}"
+        else:
+            # Single-context case
+            title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat: {si_ratio:.2f}"
+            plot_title = f"{title}\n{title_line1}"
+
+    ax_obs.set_title(plot_title)
+    fig.savefig(f'{save_path}_s{id}.png', bbox_inches='tight')
+    plt.close(fig)
+
+
 def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None, kalman_mu=None, kalman_sigma=None, seq_start=None, seq_end=None, data_config=None, hidden_states=None, contexts=None, min_obs_for_em=None, N_plots=8, shared_ylim=False, contexts_probs=None, contexts_preds=None):
     """
     Plot observation sequences with model and optional Kalman filter predictions.
@@ -1374,159 +1482,34 @@ def plot_samples(obs, mu_estim, sigma_estim, save_path, title=None, params=None,
         y_margin = 0.05 * (global_ymax - global_ymin)
         ylim = (global_ymin - y_margin, global_ymax + y_margin)
 
-    # Labels to keep in the legend (all others are silently dropped)
-    _LEGEND_KEEP = {'y_obs', 'y_hat (model pred)'}
-
+    # Plot each selected sample using plot_sample
     for id, i in enumerate(selected_indices):
-        # Decide whether to use two subplots (context panel below) or a single axes
-        use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_probs is not None or contexts_preds is not None)
-        ctx_colors = {0: 'tab:blue', 1: 'tab:orange'}
-
-        if use_ctx_panel:
-            fig, (ax_obs, ax_ctx) = plt.subplots(
-                2, 1, figsize=(20, 8),
-                sharex=True,
-                gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.05}
-            )
-        else:
-            fig, ax_obs = plt.subplots(1, 1, figsize=(20, 6))
-            ax_ctx = None
-
-        # ── top subplot: observations + predictions ──────────────────────────
-        ax_obs.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
-
-        # When preds_aligned, predictions cover the same x-range as obs;
-        # otherwise they start one step later (no prediction for the first obs).
-        if preds_aligned:
-            estim_x = range(len(obs[i]))
-        else:
-            estim_x = range(1, len(obs[i]))
-        ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
-        ax_obs.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2)
-
-        if kalman_mu is not None and kalman_sigma is not None:
-            kal_x = range(kal_x_start, kal_x_start + len(kalman_mu[i]))
-            ax_obs.plot(kal_x, kalman_mu[i], label='y_kal_pred', color='green', alpha=0.8)
-            ax_obs.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2)
-
-        if hidden_states is not None:
-            ax_obs.plot(range(len(hidden_states[i])), hidden_states[i, :], label='hidden state', color='orange', alpha=0.8)
-
-        # context switch vertical lines on the obs panel
-        if n_ctx > 1 and contexts is not None:
-            context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1
-            for cc in context_changes:
-                ax_obs.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
-
-        if shared_ylim:
-            ax_obs.set_ylim(ylim)
-        if use_ctx_panel:
-            ax_obs.tick_params(labelbottom=False)  # x labels only on bottom panel
-        else:
-            ax_obs.set_xlabel('time step')
-
-        # ── bottom subplot: context lines ─────────────────────────────────────
-        if use_ctx_panel:
-            # Rows (top→bottom in visual order = decreasing y): probs, pred, true
-            # Use integer y positions; higher y = drawn higher
-            ROW_PROB_BASE = 2  # p(ctx_val) at ROW_PROB_BASE + ctx_val  (topmost)
-            ROW_PRED      = 1
-            ROW_TRUE      = 0
-
-            # x-offset for prediction-aligned arrays:
-            # When preds_aligned, probs/preds have the same length as obs → offset 0
-            # Otherwise they are 1 shorter → offset 1 (skip first obs timestep)
-            pred_x_off = 0 if preds_aligned else 1
-
-            if contexts_probs is not None:
-                probs_i = contexts_probs[i]  # shape (W, n_ctx) or (W-1, n_ctx)
-                for ctx_val in range(probs_i.shape[-1]):
-                    row = ROW_PROB_BASE + ctx_val
-                    label_prob = f'p(ctx {ctx_val}) inferred'
-                    for t in range(len(probs_i)):
-                        ax_ctx.hlines(row, t + pred_x_off, t + pred_x_off + 1,
-                                      colors=ctx_colors[ctx_val],
-                                      linewidth=6, alpha=float(probs_i[t, ctx_val]),
-                                      label=label_prob if t == 0 else None)
-
-            if contexts_preds is not None:
-                pred_boundaries = np.concatenate(([0], np.where(np.diff(contexts_preds[i]) != 0)[0] + 1, [len(contexts_preds[i])]))
-                pred_labels_placed = set()
-                for seg_start, seg_end in zip(pred_boundaries[:-1], pred_boundaries[1:]):
-                    ctx_val = int(contexts_preds[i][seg_start])
-                    label = f'ctx {ctx_val} pred' if ctx_val not in pred_labels_placed else None
-                    pred_labels_placed.add(ctx_val)
-                    ax_ctx.hlines(ROW_PRED, seg_start + pred_x_off, seg_end + pred_x_off,
-                                  colors=ctx_colors[ctx_val],
-                                  linewidth=6, alpha=0.8, label=label)
-
-            if contexts is not None:
-                ctx_counts = {0: int((contexts[i] == 0).sum()), 1: int((contexts[i] == 1).sum())}
-                boundaries = np.concatenate(([0], np.where(np.diff(contexts[i]) != 0)[0] + 1, [len(contexts[i])]))
-                ctx_labels_placed = set()
-                for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
-                    ctx_val = int(contexts[i][seg_start])
-                    label = f'ctx {ctx_val} (N={ctx_counts[ctx_val]})' if ctx_val not in ctx_labels_placed else None
-                    ctx_labels_placed.add(ctx_val)
-                    ax_ctx.hlines(ROW_TRUE, seg_start, seg_end, colors=ctx_colors[ctx_val], linewidth=6, alpha=0.8, label=label)
-
-            ax_ctx.set_ylim(-0.5, ROW_PROB_BASE + n_ctx - 0.5)
-            ax_ctx.set_yticks([ROW_TRUE, ROW_PRED] + [ROW_PROB_BASE + c for c in range(n_ctx)])
-            ax_ctx.set_yticklabels(['true', 'pred'] + [f'p(ctx {c})' for c in range(n_ctx)], fontsize=8)
-            ax_ctx.set_xlabel('time step')
-
-        # ── shared legend on the right (only selected labels) ────────────────
-        # Collect labels to show: y_obs, y_hat, and "ctx N (N=...)" from the ctx panel
-        handles, labels = [], []
-        for ax in ([ax_obs, ax_ctx] if use_ctx_panel else [ax_obs]):
-            if ax is None:
-                continue
-            h, l = ax.get_legend_handles_labels()
-            for handle, lbl in zip(h, l):
-                if lbl not in labels and (lbl in _LEGEND_KEEP or (lbl is not None and lbl.startswith('ctx') and '(N=' in lbl)):
-                    handles.append(handle)
-                    labels.append(lbl)
-        fig.legend(handles, labels, loc='center left', bbox_to_anchor=(0.92, 0.5), borderaxespad=0, frameon=True)
-        plot_title = title
-        if params is not None:
-            # Extract parameters for sample i, handling both dict and legacy array formats
-            tau_i = params['tau'][i] if params['tau'].ndim > 0 else params['tau']
-            lim_i = params['lim'][i] if params['lim'].ndim > 0 else params['lim']
-            si_stat_i = params['si_stat'][i] if np.asarray(params['si_stat']).ndim > 0 else params['si_stat']
-            si_q_i = params['si_q'][i] if params['si_q'].ndim > 0 else params['si_q']
-            si_r_i = params['si_r'][i] if np.asarray(params['si_r']).ndim > 0 else params['si_r']
-            
-            # Compute si_r/si_stat ratio
-            si_ratio = si_r_i / si_stat_i if si_stat_i != 0 else np.nan
-            
-            if n_ctx == 2:
-                # Two-context case: format like audit_gm with std/dvt labels
-                tau_str = f"std: {tau_i[0]:.2f}, dvt: {tau_i[1]:.2f}"
-                lim_str = f"std: {lim_i[0]:.2f}, dvt: {lim_i[1]:.2f}"
-                si_q_str = f"std: {si_q_i[0]:.2f}, dvt: {si_q_i[1]:.2f}"
-                
-                # Compute d and d_eff for two-context case
-                # d_eff = lim[1] - lim[0] (actual distance)
-                # d = d_eff / si_eff where si_eff = sqrt(si_stat**2 + si_r**2)
-                d_eff = lim_i[1] - lim_i[0]
-                si_eff = np.sqrt(si_stat_i**2 + si_r_i**2)
-                d = d_eff / si_eff if si_eff != 0 else np.nan
-                
-                title_line1 = f"tau: {tau_str}  |  lim: {lim_str}  | d: {d:.2f},  d_eff: {d_eff:.2f}"
-                title_line2 = f"si_stat: {si_stat_i:.2f}  |  si_q: {si_q_str}  |  si_r: {si_r_i:.2f}  |  si_r/si_stat: {si_ratio:.2f}"
-                plot_title = f"{title}\n{title_line1}\n{title_line2}"
-            else:
-                # Single-context case
-                title_line1 = f"tau: {tau_i:.2f}, lim: {lim_i:.2f}, si_stat: {si_stat_i:.2f}, si_q: {si_q_i:.2f}, si_r: {si_r_i:.2f}, si_r/si_stat: {si_ratio:.2f}"
-                plot_title = f"{title}\n{title_line1}"
-
-        ax_obs.set_title(plot_title)
-        fig.savefig(f'{save_path}_s{id}.png', bbox_inches='tight')
-        plt.close(fig)
+        plot_sample(
+            id=id,
+            i=i,
+            obs=obs,
+            mu_estim=mu_estim,
+            sigma_estim=sigma_estim,
+            save_path=save_path,
+            n_ctx=n_ctx,
+            title=title,
+            params=params,
+            kalman_mu=kalman_mu,
+            kalman_sigma=kalman_sigma,
+            hidden_states=hidden_states,
+            contexts=contexts,
+            contexts_probs=contexts_probs,
+            contexts_preds=contexts_preds,
+            preds_aligned=preds_aligned,
+            shared_ylim=shared_ylim,
+            ylim=ylim if shared_ylim else None,
+            kal_x_start=kal_x_start,
+            data_config=data_config
+        )
 
 
 
-def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_cores=None, benchmark_mode='both'):
+def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_cores=None, benchmark_mode='both', suffix_tag=''):
     """
     Load precomputed benchmarks if available, otherwise compute and save them.
     
@@ -1544,17 +1527,22 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
                        'both' (default): Compute/load both train and test benchmarks
                        'test_only': Compute/load only test benchmarks (train=None)
                        'train_only': Compute/load only train benchmarks (test=None)
+        suffix_tag: Optional string appended to file/dir suffixes (e.g. 'unit_test')
+                    to produce distinct benchmark files without overwriting existing ones.
     
     Returns:
         tuple: (benchmarks_train, benchmarks_test) - either may be None based on benchmark_mode
     """
     benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
-    benchmarkfile_train = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='train')
-    benchmarkfile_test = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='test')
+    tag = f'_{suffix_tag}' if suffix_tag else ''
+    suffix_train = f'train{tag}'
+    suffix_test = f'test{tag}'
+    benchmarkfile_train = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_train)
+    benchmarkfile_test = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_test)
     
     # Check for individual directories (partial computation from previous interrupted run)
-    incr_dir_train = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix='train')
-    incr_dir_test = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, model_config['batch_size_test'], suffix='test')
+    incr_dir_train = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_train)
+    incr_dir_test = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, model_config['batch_size_test'], suffix=suffix_test)
 
     # Determine which benchmarks to compute based on mode
     compute_train = benchmark_mode in ['both', 'train_only']
@@ -1576,9 +1564,9 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
             else:
                 print(f"Computing training benchmarks (will save to {benchmarkfile_train})...")
             print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-            benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='train', individual=True, max_cores=max_cores)
+            benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix=suffix_train, individual=True, max_cores=max_cores)
             if visualize:
-                benchmarks_pars_viz(benchmarks_train, data_config, N_ctx, gm_name, suffix='train')
+                benchmarks_pars_viz(benchmarks_train, data_config, N_ctx, gm_name, suffix=suffix_train)
     
     # Handle test benchmarks
     if compute_test:
@@ -1593,9 +1581,9 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
             else:
                 print(f"Computing test benchmarks (will save to {benchmarkfile_test})...")
             print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-            benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix='test', individual=True, max_cores=max_cores)
+            benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix=suffix_test, individual=True, max_cores=max_cores)
             if visualize:
-                benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix='test')
+                benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix=suffix_test)
     
     return benchmarks_train, benchmarks_test
 

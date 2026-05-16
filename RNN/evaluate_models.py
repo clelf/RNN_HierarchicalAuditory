@@ -60,7 +60,7 @@ from tqdm import tqdm
 
 # Local imports (files are now in the same directory)
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from model import SimpleRNN, VRNN, ModuleNetwork
+from model import SimpleRNN, VRNN, ObsCtxModuleNetwork
 from pipeline_next import extract_model_predictions, prepare_batch_data
 
 # Local config (for loading saved configs)
@@ -68,7 +68,7 @@ from config_v2 import RunConfig, TrainingConfig, ModelArchConfig, DataConfig as 
 
 # Generative models (PreProParadigm is one level up from RNN/)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from PreProParadigm.audit_gm import NonHierachicalAuditGM, HierarchicalAuditGM
+from PreProParadigm.audit_gm import NonHierarchicalAuditGM, HierarchicalAuditGM
 
 
 # =============================================================================
@@ -478,7 +478,7 @@ def load_model(info: ModelInfo, device: str = 'cpu') -> nn.Module:
             },
             'device': device,
         }
-        model = ModuleNetwork(config)
+        model = ObsCtxModuleNetwork(config)
     
     else:
         raise ValueError(f"Unknown model type: {info.model_type}")
@@ -580,13 +580,16 @@ def generate_test_data(config: TestDataConfig, device: str = 'cpu') -> Dict[str,
     gm_dict = config.to_gm_dict()
     
     if config.gm_name == 'NonHierarchicalGM':
-        gm = NonHierachicalAuditGM(gm_dict)
-        contexts, _, y, pars = gm.generate_batch(return_pars=True)
+        gm = NonHierarchicalAuditGM(gm_dict)
     elif config.gm_name == 'HierarchicalGM':
         gm = HierarchicalAuditGM(gm_dict)
-        _, _, _, _, _, contexts, _, y, pars = gm.generate_batch(return_pars=True)
     else:
         raise ValueError(f"Unknown GM: {config.gm_name}")
+    
+    batch = gm.generate_batch(return_pars=True)
+    y = batch['obs']
+    contexts = batch['contexts']
+    pars = batch.get('pars', None)
     
     # Convert to tensors
     y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(-1).to(device)
@@ -799,6 +802,7 @@ def evaluate_model(
     test_data: Dict[str, Any],
     device: str = 'cpu',
     reduce: bool = True,
+    min_obs_for_em: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate a single model on the test data.
@@ -812,6 +816,12 @@ def evaluate_model(
                 If False, return per-sample metric distributions as arrays (n_samples,).
                 For calibration: reduce=True gives global KS test with p-value,
                 reduce=False gives per-sample KS statistics (for mean ± SEM reporting).
+        min_obs_for_em: If provided, restrict evaluation to the same timestep window
+                        as the KF benchmark, i.e. y[min_obs_for_em:] only.
+                        Model pred at index t predicts y[t+1], so we slice from
+                        index min_obs_for_em-1 to get predictions for y[min_obs_for_em:].
+                        Pass benchmark_data.min_obs_for_em when comparing against a KF
+                        benchmark so that per-sample metrics are truly comparable.
     
     Returns:
         Dictionary with all computed metrics.
@@ -829,6 +839,25 @@ def evaluate_model(
     
     # Target is y[1:] (predicting next observation)
     y_target = y_np[:, 1:]
+
+    # Optionally restrict to the KF evaluation window (y[min_obs_for_em:]) so that
+    # per-sample model metrics and KF metrics cover exactly the same timesteps.
+    # mu_pred[:, t] predicts y[t+1], so slicing from (min_obs_for_em-1) gives
+    # predictions aligned with y[min_obs_for_em:].
+    if min_obs_for_em is not None:
+        start = min_obs_for_em - 1  # model-prediction index → targets y[min_obs_for_em:]
+        mu_pred   = mu_pred[:, start:]
+        var_pred  = var_pred[:, start:]
+        y_target  = y_target[:, start:]   # y_target[:,start:] == y_np[:,min_obs_for_em:]
+        if context_output is not None:
+            # context_output shape: (N, T-1, n_ctx); same slicing as predictions
+            context_output_np = context_output.detach().cpu().numpy()[:, start:, :]
+        # contexts_np[:,1:] aligned; slice the same way for context targets
+        contexts_np_aligned = contexts_np[:, min_obs_for_em:] if contexts_np is not None else None
+    else:
+        if context_output is not None:
+            context_output_np = context_output.detach().cpu().numpy()
+        contexts_np_aligned = contexts_np[:, 1:] if contexts_np is not None else None
     
     # Compute observation metrics
     results = {
@@ -861,9 +890,9 @@ def evaluate_model(
         results['kappa'] = info.kappa
         results['bottleneck_dim'] = info.bottleneck_dim
         
-        # Context predictions (aligned with y[1:])
-        context_logits = context_output.detach().cpu().numpy()
-        contexts_target = contexts_np[:, 1:]  # Align with predictions
+        # Context predictions – use pre-sliced arrays so timestep window matches y_target
+        context_logits = context_output_np
+        contexts_target = contexts_np_aligned
         
         # Context accuracy
         results['context_accuracy'] = compute_context_accuracy(contexts_target, context_logits, reduce=reduce)

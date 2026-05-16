@@ -50,11 +50,12 @@ from config_v2 import (
 )
 from pipeline_core_v2 import (
     run_single_config,
+    load_or_compute_benchmarks,
     create_generative_model,
 )
 
-# Import benchmark functions from original pipeline (reusing, not rewriting)
-from pipeline_next import load_or_compute_benchmarks, get_ctx_gm_subpath, compute_benchmarks, benchmarks_pars_viz
+# # Import benchmark functions from original pipeline (reusing, not rewriting)
+# from pipeline_next import get_ctx_gm_subpath, compute_benchmarks, benchmarks_pars_viz
 
 
 # =============================================================================
@@ -66,6 +67,7 @@ def run_benchmarks(
     benchmark_mode: str = 'both',
     visualize: bool = True,
     verbose: bool = True,
+    suffix_tag: str = '',
 ):
     """
     Compute Kalman filter benchmarks only (no model training/testing).
@@ -110,6 +112,7 @@ def run_benchmarks(
         visualize=visualize,
         max_cores=grid.data.max_cores,
         benchmark_mode=benchmark_mode,
+        suffix_tag=suffix_tag,
     )
     
     if verbose:
@@ -131,7 +134,7 @@ def run_benchmarks(
 # =============================================================================
 
 def run_pipeline(
-    grid: HyperparameterGrid,
+    hp_grid: HyperparameterGrid,
     skip_benchmarks: bool = False,
     train_only: bool = False,
     test_only: bool = False,
@@ -153,19 +156,19 @@ def run_pipeline(
         verbose: If True, print progress information
     """
     # ========== STEP 1: EXPAND GRID ==========
-    configs = grid.expand()
+    configs = hp_grid.expand()
     
     if verbose:
         print("\n" + "=" * 70)
         print("PIPELINE RUNNER")
         print("=" * 70)
         print(f"Total configurations to run: {len(configs)}")
-        print(f"Models: {grid.model_types}")
-        print(f"Learning rates: {grid.learning_rates}")
-        print(f"Hidden dims: {grid.hidden_dims}")
-        print(f"N_ctx: {grid.data.N_ctx}, GM: {grid.data.gm_name}")
-        if grid.run_id:
-            print(f"Run ID: {grid.run_id}")
+        print(f"Models: {hp_grid.model_types}")
+        print(f"Learning rates: {hp_grid.learning_rates}")
+        print(f"Hidden dims: {hp_grid.hidden_dims}")
+        print(f"N_ctx: {hp_grid.data.N_ctx}, GM: {hp_grid.data.gm_name}")
+        if hp_grid.run_id:
+            print(f"Run ID: {hp_grid.run_id}")
         print("=" * 70)
     
     # ========== STEP 2: COMPUTE BENCHMARKS ==========
@@ -183,18 +186,18 @@ def run_pipeline(
         # Build model_config and data_config dicts for backward compatibility
         # with load_or_compute_benchmarks
         model_config = {
-            'batch_size': grid.training.batch_size,
-            'batch_size_test': grid.training.batch_size_test,
+            'batch_size': hp_grid.training.batch_size,
+            'batch_size_test': hp_grid.training.batch_size_test,
         }
-        data_config = grid.data.to_gm_dict(grid.training.batch_size)
+        data_config = hp_grid.data.to_gm_dict(hp_grid.training.batch_size)
         
         benchmarks_train, benchmarks_test = load_or_compute_benchmarks(
             data_config,
             model_config,
-            grid.data.N_ctx,
-            grid.data.gm_name,
+            hp_grid.data.N_ctx,
+            hp_grid.data.gm_name,
             visualize=True,
-            max_cores=grid.data.max_cores,
+            max_cores=hp_grid.data.max_cores,
             benchmark_mode='both',
         )
     
@@ -210,25 +213,15 @@ def run_pipeline(
             print(f"\n[{i}/{len(configs)}] Running: {config.name}")
             print(f"         Save dir: {config.save_dir}")
         
-        try:
-            result = run_single_config(
-                config,
-                benchmarks_train=benchmarks_train,
-                benchmarks_test=benchmarks_test,
-                train_only=train_only,
-                test_only=test_only,
-            )
-            results[config.name] = result
+        result = run_single_config(
+            config,
+            benchmarks_train=benchmarks_train,
+            benchmarks_test=benchmarks_test,
+            train_only=train_only,
+            test_only=test_only,
+        )
+        results[config.name] = result
             
-        except Exception as e:
-            print(f"ERROR running {config.name}: {e}")
-            results[config.name] = {'error': str(e)}
-            
-            # Continue with other configs
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    
     if verbose:
         print("\n" + "=" * 70)
         print("PIPELINE COMPLETE")
@@ -275,6 +268,9 @@ Examples:
     parser.add_argument('--benchmark_mode', type=str, default='both',
                         choices=['both', 'train_only', 'test_only'],
                         help='Which benchmarks to compute (default: both)')
+    parser.add_argument('--benchmark_tag', type=str, default='',
+                        help='Optional tag appended to benchmark file/dir names to avoid '
+                             'overwriting existing files (e.g. "unit_test")')
     parser.add_argument('--train_only', action='store_true',
                         help='Only train, skip testing')
     parser.add_argument('--test_only', action='store_true',
@@ -287,7 +283,7 @@ Examples:
     # Model selection
     parser.add_argument('--models', type=str, nargs='+',
                         default=['rnn', 'vrnn'],
-                        choices=['rnn', 'vrnn', 'module_network'],
+                        choices=['rnn', 'vrnn', 'module_network', 'population_network'],
                         help='Models to train (default: rnn vrnn)')
     
     # Hyperparameters
@@ -301,7 +297,7 @@ Examples:
     # ModuleNetwork specific
     parser.add_argument('--objectives', type=str, nargs='+',
                         default=['obs'],
-                        choices=['obs', 'ctx', 'obs_ctx'],
+                        choices=['obs', 'ctx', 'all'],
                         help='Learning objectives for ModuleNetwork')
     parser.add_argument('--bottleneck_dims', type=int, nargs='+',
                         default=[8, 16],
@@ -354,7 +350,7 @@ def main():
         default_hdims = [16, 32, 64]
     
     # Build hyperparameter grid
-    grid = HyperparameterGrid(
+    hp_grid = HyperparameterGrid(
         model_types=args.models,
         learning_rates=args.learning_rates or default_lrs,
         hidden_dims=args.hidden_dims or default_hdims,
@@ -370,15 +366,16 @@ def main():
     # Handle benchmark_only mode
     if args.benchmark_only:
         run_benchmarks(
-            grid,
+            hp_grid,
             benchmark_mode=args.benchmark_mode,
             visualize=True,
+            suffix_tag=args.benchmark_tag,
         )
         return
     
     # Run full pipeline
     run_pipeline(
-        grid,
+        hp_grid,
         skip_benchmarks=args.skip_benchmarks,
         train_only=args.train_only,
         test_only=args.test_only,
