@@ -256,7 +256,7 @@ def compute_model_loss(model, objective, y_tensor, model_output, data_mode,
         # Standard RNN/VRNN loss
         return objective.loss(model, y_tensor[:, 1:, :], model_output)
 
-def get_model_predictions(model, model_output):
+def get_model_predictions(model, model_output, dpos_min=0):
     """
     Extract and process all model predictions from output based on model type.
     
@@ -319,7 +319,7 @@ def get_model_predictions(model, model_output):
     # Process dpos outputs (if present)
     if 'dpos' in output and output['dpos'] is not None:
         dpos_prob = torch.softmax(output['dpos'], dim=-1).detach().cpu().numpy()
-        dpos_pred = np.argmax(dpos_prob, axis=-1).squeeze()
+        dpos_pred = np.argmax(dpos_prob, axis=-1).squeeze() + dpos_min
     
     # Process rule outputs (if present)
     if 'rule' in output and output['rule'] is not None:
@@ -947,7 +947,7 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.savefig(save_path)
     plt.close()
 
-def _get_dpos_color_map(n_dpos_classes=5):
+def _get_dpos_color_map(n_dpos_classes=5, id_min=3):
     """
     Create a color mapping for deviant positions using jet colormap.
     Maps min value -> light, max value -> dark.
@@ -964,11 +964,11 @@ def _get_dpos_color_map(n_dpos_classes=5):
     """
 
     # Create mapping for all classes (0 to n_dpos_classes-1)
-    dpos_cmap = plt.get_cmap('rainbow')
+    dpos_cmap = plt.get_cmap('gist_rainbow')
     if n_dpos_classes == 1:
         rgba = dpos_cmap(0.5)
         return {0: mcolors.rgb2hex(rgba[:3])}
-    return {val: mcolors.rgb2hex(dpos_cmap(val / (n_dpos_classes - 1))[:3]) for val in range(n_dpos_classes)}
+    return {val+id_min: mcolors.rgb2hex(dpos_cmap(val / (n_dpos_classes - 1))[:3]) for val in range(n_dpos_classes)}
 
 
 def _get_rule_color_map(n_rule_classes=2):
@@ -999,7 +999,8 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 params=None, kalman_mu=None, kalman_sigma=None, hidden_states=None,
                 contexts=None, contexts_prob=None, contexts_pred=None,
                 preds_aligned=False, shared_ylim=False, ylim=None, kal_x_start=None,
-                dpos_true=None, dpos_pred=None, dpos_prob=None, rule_true=None, rule_pred=None, rule_prob=None, cues=None):
+                dpos_true=None, dpos_pred=None, dpos_prob=None, rule_true=None, rule_pred=None, rule_prob=None, cues=None,
+                ctx_colors=None, dpos_colors=None, rule_colors=None, cue_colors=None):
     """
     Plot a single observation sequence with model and optional Kalman filter predictions.
     
@@ -1031,22 +1032,6 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
     """
     # Decide whether to use context panel (with optional dpos and rule tracks)
     use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_prob is not None or contexts_pred is not None or dpos_true is not None or dpos_prob is not None or rule_true is not None or rule_prob is not None or cues is not None)
-    
-    # Context colors: use reversed Spectral colormap (0 -> min, 1 -> max)
-    ctx_cmap = plt.get_cmap('tab10')
-    ctx_colors = {i: ctx_cmap(i) for i in range(n_ctx)}
-    
-    # Get color mappings for dpos and rule
-    dpos_colors = _get_dpos_color_map()
-    rule_colors = _get_rule_color_map()
-    
-    # Get color mapping for cues (Accent colormap, starting from index 1)
-    cue_colors = {}
-    if cues is not None:
-        # cues has shape (N, T, N_cues) - need to find which cue is active at each timestep
-        n_cues = 2 # cues.shape[2]
-        cue_cmap = plt.get_cmap('tab10')
-        cue_colors = {i: cue_cmap((i+1)*5-1) for i in range(n_cues)}
 
     if use_ctx_panel:
         # Calculate number of rows needed in context panel
@@ -1256,6 +1241,14 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         if rule_patch.get_label() not in labels:
             handles.append(rule_patch)
             labels.append(rule_patch.get_label())
+    
+    # Add legend patches for all possible cue classes
+    if cue_colors is not None:
+        for cue_val in sorted(cue_colors.keys()):
+            cue_patch = mpatches.Patch(color=cue_colors[cue_val], label=f'cue {cue_val}')
+            if cue_patch.get_label() not in labels:
+                handles.append(cue_patch)
+                labels.append(cue_patch.get_label())
     
     fig.legend(handles, labels, loc='center left', bbox_to_anchor=(0.92, 0.5), borderaxespad=0, frameon=True)
     plot_title = title
@@ -1509,6 +1502,32 @@ def plot_samples(sample_metrics, save_path, title=None, params=None, seq_start=N
             y_margin = 0.05 * (global_ymax - global_ymin)
             ylim = (global_ymin - y_margin, global_ymax + y_margin)
 
+        # Define color maps
+        if n_ctx > 0 and contexts is not None:
+            # Context colors: use reversed Spectral colormap (0 -> min, 1 -> max)
+            ctx_cmap = plt.get_cmap('tab10')
+            ctx_colors = {i: ctx_cmap(i) for i in range(n_ctx)}
+        else:
+            ctx_colors=None
+
+        # Get color mappings for dpos and rule
+        if dpos_true is not None or dpos_pred is not None:
+            dpos_colors = _get_dpos_color_map()
+        else: dpos_colors = None
+        if rule_true is not None or rule_pred is not None:
+            rule_colors = _get_rule_color_map()
+        else: rule_colors = None
+
+        # Get color mapping for cues (Accent colormap, starting from index 1)
+        if cues is not None:
+            cue_colors = {}
+            if cues is not None:
+                # cues has shape (N, T, N_cues) - need to find which cue is active at each timestep
+                n_cues = 2 # cues.shape[2]
+                cue_cmap = plt.get_cmap('tab10')
+                cue_colors = {i: cue_cmap((i*4)+2) for i in range(n_cues)}
+        else: cue_colors = None
+
         # Plot each selected sample using plot_sample
         for id, i in enumerate(selected_indices):
             plot_sample(
@@ -1537,7 +1556,11 @@ def plot_samples(sample_metrics, save_path, title=None, params=None, seq_start=N
                 rule_true=rule_true,
                 rule_prob=rule_prob,
                 rule_pred=rule_pred,
-                cues=cues
+                cues=cues,
+                ctx_colors=ctx_colors,
+                dpos_colors=dpos_colors,
+                rule_colors=rule_colors,
+                cue_colors=cue_colors,
             )
 
 
@@ -1735,7 +1758,7 @@ def _compute_forward_and_loss(
     # Forward pass and loss computation (single source of truth)
     if config.data.gm_name == 'HierarchicalGM':
         q = batch_data['q']
-        dpos = batch_data['dpos']
+        dpos = batch_data['dpos'] - batch_data['dpos'].min().item() # NOTE: converting dpos values to indices
         rules = batch_data['rules']
         model_output = model(y[:, :-1, :], q[:, :-1, :])
         loss = compute_model_loss(
@@ -1957,6 +1980,28 @@ def _validate_epoch(
         pars = batch_data['pars']
         mu_kal = None
         min_obs = None
+
+    # Process true labels from batch data
+    contexts_np = None
+    if contexts is not None:
+        contexts_np = contexts.detach().cpu().numpy().squeeze()
+
+    # Extract dpos and rule true labels (for HierarchicalGM)
+    dpos_true = None
+    rule_true = None
+    if 'dpos' in batch_data and batch_data['dpos'] is not None:
+        dpos_true = batch_data['dpos'].detach().cpu().numpy().squeeze()  # shape (N, T)
+        dpos_min = dpos_true.min()
+    else:
+        dpos_min = 0  # default to 0 if dpos not available
+    if 'rules' in batch_data and batch_data['rules'] is not None:
+        rule_true = batch_data['rules'].detach().cpu().numpy().squeeze()  # shape (N, T)
+
+    # Extract cues (for HierarchicalGM)
+    cues = None
+    if 'q' in batch_data and batch_data['q'] is not None:
+        cues = batch_data['q'].detach().cpu().numpy().squeeze()  # shape (N, T, N_cues)
+
     
     # Forward pass and compute loss (shared logic)
     model_output, loss = _compute_forward_and_loss(
@@ -1965,7 +2010,7 @@ def _validate_epoch(
     loss = loss.item()
     
     # Extract all predictions from model (already processed: softmax, argmax, sigma computed)
-    predictions = get_model_predictions(model, model_output)
+    predictions = get_model_predictions(model, model_output, dpos_min)
     mu_estim = predictions['mu_estim']
     sigma_estim = predictions['sigma_estim']
     
@@ -1985,24 +2030,7 @@ def _validate_epoch(
     # Add all model predictions (obs mu_estim and sigma_estim, contexts, dpos, rule probabilities and predictions)
     metrics.update(predictions)
     
-    # Process true labels from batch data
-    contexts_np = None
-    if contexts is not None and predictions['ctx_prob'] is not None:
-        contexts_np = contexts.detach().cpu().numpy().squeeze()
-
-    # Extract dpos and rule true labels (for HierarchicalGM)
-    dpos_true = None
-    rule_true = None
-    if 'dpos' in batch_data and batch_data['dpos'] is not None:
-        dpos_true = batch_data['dpos'].detach().cpu().numpy().squeeze()  # shape (N, T)
-    if 'rules' in batch_data and batch_data['rules'] is not None:
-        rule_true = batch_data['rules'].detach().cpu().numpy().squeeze()  # shape (N, T)
-
-    # Extract cues (for HierarchicalGM)
-    cues = None
-    if 'q' in batch_data and batch_data['q'] is not None:
-        cues = batch_data['q'].detach().cpu().numpy().squeeze()  # shape (N, T, N_cues)
-
+    
     # Add true labels to metrics
     metrics.update({
         'contexts': contexts_np,
