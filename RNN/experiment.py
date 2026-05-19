@@ -60,7 +60,7 @@ data = DataConfig(
 # Custom hyperparameter grid
 param_grid = HyperparameterGrid(
     model_types=['population_network'], # population_network , module_network
-    learning_rates=[0.01],
+    learning_rates=[0.05, 0.005, 0.01, 0.1, 0.001] if not UNIT_TEST else [0.01], # 0.05, 0.001, 0.01
     # hidden_dims=[64],  # Fixed for ModuleNetwork anyway # TODO: look into this
     hidden_dims={'obs': [64], 'ctx': [64], 'dpos': [64], 'rule': [64]}, # TODO: look into this, possibly no need to decrease hidden dims...
     # learning_objectives=['all'], # 'obs', 'ctx', 'all'

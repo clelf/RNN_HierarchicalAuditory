@@ -65,8 +65,7 @@ if USE_BENCHMARK_DATA:
     N_plots_short = min(N_plots_short, benchmark_data.n_samples)
 else:
     # Generate fresh test data from the generative model
-    data_info = models_info[0].data_config_dict
-    test_data_config = eval.TestDataConfig.from_saved_config(data_info, n_samples=N_samples)
+    data_config_dict = models_info[0].data_config_dict
     kalman_mu = None
     kalman_sigma = None
     min_obs_for_em = None
@@ -84,8 +83,7 @@ for info in models_info: # [3:4]
 
     if not USE_BENCHMARK_DATA:
         # Generate fresh test data for this model
-        test_data = eval.generate_test_data(test_data_config)
-        data_config = test_data_config.to_gm_dict()
+        test_data = eval.generate_test_data(data_config_dict, n_samples=N_samples)
         y = test_data['y']
         y_np = test_data['y_np']
         pars = test_data['pars']

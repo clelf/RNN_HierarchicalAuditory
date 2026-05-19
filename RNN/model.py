@@ -413,9 +413,9 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         
         Readout gates handle all dimensional transformations between modules.
         """
-        # FORWARD PASS (bottom-up)
+        # FORWARD PASS
         
-        # 1) Process visual cues through rule module (ignore external readout needed at this stage)
+        # 1) Process visual cues through rule module (ignoring external readout needed at this stage)
         rule_output, _, rule_hx = self.rule_module(q, return_hidden=True)  # 1D → N_rules
         
         # 2) Compress rule output and inform dpos module
@@ -426,14 +426,14 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         enc_dpos2ctx_output = self.readout_dpos2ctx(dpos_output)  # N_dpos → N_ctx
         ctx_output, _, ctx_hx = self.context_module(enc_dpos2ctx_output, return_hidden=True)  # N_ctx → N_ctx
         
-        # 4) Compress context output to prime observation module with prior information (ignore both internal and external readout, priming only with hidden states)
+        # 4) Compress context output to prime observation module with prior information (ignoring both internal and external readout, priming only with hidden states)
         enc_ctx2obs_output = self.readout_ctx2obs(ctx_output)  # N_ctx → input_dim
         _, _, obs_hx = self.observation_module(enc_ctx2obs_output, return_hidden=True)  # input_dim, stores hidden state → 2
         
         # 5) Process actual observation with prior-informed hidden state
         posterior_obs_output, posterior_obs_output_ext = self.observation_module(x, hx=obs_hx)  # input_dim + prior hx → 2
         
-        # FEEDBACK PASS (top-down) -- Save external readouts for training
+        # FEEDBACK PASS -- Saving external readouts for training
         # 6) Compress obs output and send feedback to context module
         enc_obs2ctx_output = self.readout_obs2ctx(posterior_obs_output)  # 2 → N_ctx
         posterior_ctx_output, posterior_ctx_output_ext = self.context_module(enc_obs2ctx_output, hx=ctx_hx)  # N_ctx + prior hx → N_ctx

@@ -12,144 +12,17 @@ from scipy.stats import norm as sp_norm
 
 
 
-def plot_calibration_curve(
-    y_true: np.ndarray,
-    mu_pred: np.ndarray,
-    var_pred: np.ndarray,
-    save_path: Path = None,
-    title: str = "KS Calibration Plot",
-    ax: plt.Axes = None,
-    color: str = "#1f77b4",
-    label: str = None,
-    alpha_band: float = 0.05,
-):
-    """
-    Plot the empirical CDF of the Probability Integral Transform (PIT) values
-    against the ideal uniform diagonal.
-
-    For a perfectly calibrated model the PIT values are Uniform(0,1), so the
-    empirical CDF should lie on the diagonal.  The maximum vertical distance
-    from the diagonal is the Kolmogorov–Smirnov D-statistic.
-
-    Parameters
-    ----------
-    y_true : np.ndarray, shape (n_samples, seq_len)
-        True observations.
-    mu_pred : np.ndarray, shape (n_samples, seq_len)
-        Predicted means.
-    var_pred : np.ndarray, shape (n_samples, seq_len)
-        Predicted variances.
-    save_path : Path, optional
-        If given, save the figure to this path.
-    title : str
-        Plot title.
-    ax : matplotlib Axes, optional
-        If provided, draw on this axes (useful for multi-panel figures).
-    color : str
-        Line colour for the empirical CDF.
-    label : str, optional
-        Legend label for the empirical CDF curve.
-    alpha_band : float
-        Significance level for the KS confidence band (default 0.05 → 95 %).
-
-    Returns
-    -------
-    fig : matplotlib Figure or None
-        The figure object (None when an external *ax* was supplied).
-    ks_stat : float
-        The pooled KS D-statistic.
-    """
-
-    # --- Compute PIT values (pooled across samples & time) ---
-    sigma_pred = np.sqrt(var_pred)
-    pit = sp_norm.cdf((y_true - mu_pred) / sigma_pred)
-    pit_flat = pit.ravel()
-    pit_flat = pit_flat[~np.isnan(pit_flat)]
-    pit_flat.sort()
-
-    n = len(pit_flat)
-    ecdf = np.arange(1, n + 1) / n          # empirical CDF values
-    F    = pit_flat                           # theoretical quantiles (sorted PITs)
-
-    # KS statistic = max |ECDF(f) - f|
-    ks_stat = np.max(np.abs(ecdf - F))
-
-    # --- KS confidence band width ---
-    # c(alpha) for two-sided KS test: 1.36 (alpha=0.05), 1.22 (0.10), 1.63 (0.01)
-    c_alpha = {0.01: 1.63, 0.05: 1.36, 0.10: 1.22}.get(alpha_band, 1.36)
-    band_half = c_alpha / np.sqrt(n)
-
-    # --- Plot ---
-    own_fig = ax is None
-    if own_fig:
-        fig, ax = plt.subplots(figsize=(6, 6))
-    else:
-        fig = None
-
-    # Confidence band around the diagonal
-    F_grid = np.linspace(0, 1, 500)
-    ax.fill_between(
-        F_grid,
-        np.clip(F_grid - band_half, 0, 1),
-        np.clip(F_grid + band_half, 0, 1),
-        color="grey", alpha=0.75,
-        label=f"{int((1-alpha_band)*100)}% KS band",
-    )
-
-    # Ideal diagonal
-    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Ideal (Uniform)")
-
-    # Empirical CDF of PITs
-    ax.plot(F, ecdf, color=color, linewidth=1.5,
-            label=label or f"Empirical CDF (D={ks_stat:.4f})")
-
-    # Mark the point of maximum deviation
-    idx_max = np.argmax(np.abs(ecdf - F))
-    ax.plot([F[idx_max], F[idx_max]], [F[idx_max], ecdf[idx_max]],
-            color="red", linewidth=1.5, linestyle="-",
-            label=f"Max deviation = {ks_stat:.4f}")
-    ax.plot(F[idx_max], ecdf[idx_max], "o", color="red", markersize=5)
-
-    ax.set_xlabel("PIT value (theoretical quantile)")
-    ax.set_ylabel("Empirical CDF")
-    ax.set_title(title)
-    ax.legend(loc="lower right", fontsize=9)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_aspect("equal")
-
-    if own_fig and save_path is not None:
-        fig.savefig(save_path, bbox_inches="tight")
-        print(f"Saved calibration plot to: {save_path}")
-        plt.close(fig)
-
-    return fig, ks_stat
-
-
-def get_desired_order(results):
-    # Categorize models
-    obs = [mod for mod in results if results[mod]['learning_objective'] == 'obs']
-    obs_ctx = [mod for mod in results if results[mod]['learning_objective'] == 'obs_ctx']
-    ctx = [mod for mod in results if results[mod]['learning_objective'] == 'ctx']
-
-    # Sort obs by bottleneck_dim
-    obs_sorted = sorted(obs, key=lambda mod: results[mod]['bottleneck_dim'])
-    # Sort obs_ctx by bottleneck_dim, then kappa (inverted order)
-    obs_ctx_sorted = sorted(obs_ctx, key=lambda mod: (results[mod]['bottleneck_dim'], results[mod]['kappa']))
-    # Sort ctx by bottleneck_dim
-    ctx_sorted = sorted(ctx, key=lambda mod: results[mod]['bottleneck_dim'])
-
-    # Concatenate in desired order
-    return obs_sorted + obs_ctx_sorted + ctx_sorted
-
 
 if __name__ == "__main__":
 
     # Toggle: when True, load KF benchmark predictions and overlay them on the plots
-    USE_BENCHMARK_DATA = True
+    # USE_BENCHMARK_DATA = True
+    USE_BENCHMARK_DATA = False
 
-    models_dir = Path(__file__).parent.resolve() / Path('training_results/N_ctx_2/NonHierarchicalGM')
-    output_dir = Path(__file__).parent.resolve() / Path('evaluation_results/model_comparison/')
+
+    # models_dir = Path(__file__).parent.resolve() / Path('training_results/N_ctx_2/NonHierarchicalGM')
+    models_dir = Path(__file__).parent.resolve() / Path('training_results/N_ctx_2/HierarchicalGM')
+    output_dir = Path(__file__).parent.resolve() / Path('evaluation_results/model_comparison/HierarchicalGM')
     output_dir.mkdir(parents=True, exist_ok=True)
     benchmark_results_path = (
         Path(__file__).parent.resolve()
@@ -163,9 +36,8 @@ if __name__ == "__main__":
         models_info.append(info)
 
     # Load data info (all models should have the same data info, so we can just take the first one)
-    data_info = models_info[0].data_config_dict
+    data_config_dict = models_info[0].data_config_dict
     N_samples_test = 1000
-    data_config = eval.TestDataConfig.from_saved_config(data_info, n_samples=N_samples_test)
 
 
     # Choose test data source: generate or load from benchmark
@@ -179,7 +51,7 @@ if __name__ == "__main__":
             'pars': benchmark_data.pars,
         }
     else:
-        test_data = eval.generate_test_data(data_config)
+        test_data = eval.generate_test_data(data_config_dict, n_samples=N_samples_test)
 
     # For each model, test the model on the dataset and compute metrics
     # metrics should not be averaged for one model but should be stored as a distribution of metrics for each model
@@ -218,10 +90,10 @@ if __name__ == "__main__":
     metrics_names = ['mse', 'log_likelihood', 'ks_statistic', 'context_accuracy', 'context_log_prob']
 
     # Shorter name for model
-    names_short = ['Obj=' + results[mod]['learning_objective'] + ' ' + (f"(k={results[mod]['kappa']}) " if results[mod]['learning_objective']=='obs_ctx' else '') + 'bdim=' + f"{results[mod]['bottleneck_dim']}" for mod in results.keys()]
+    names_short = ['Obj=' + (results[mod]['learning_objective'] if 'learning_objective' in results[mod] else '') + ' ' + (f"(k={results[mod]['kappa']}) " if 'learning_objective' in results[mod] and results[mod]['learning_objective']=='obs_ctx' else '') + 'bdim=' + f"{results[mod]['bottleneck_dim']}" for mod in results.keys()]
 
     # Re-order dictionary
-    desired_order_list = get_desired_order(results)
+    desired_order_list = eval.get_desired_order(results)
     results_ord = {k: results[k] for k in desired_order_list}
 
     # Define color maps for each learning objective
@@ -279,7 +151,7 @@ if __name__ == "__main__":
 
         disp = results_ord[mod_name]['disp_name']
         cal_save = output_dir / f"calibration_curve_{mod_name}.png"
-        plot_calibration_curve(
+        eval.plot_calibration_curve(
             y_target, mu_pred, var_pred,
             save_path=cal_save,
             title=f"KS Calibration – {disp}",
@@ -310,10 +182,23 @@ if __name__ == "__main__":
 
     # for metric in metrics_names:
     for id, (metric, ax) in enumerate(zip(metrics_names, axs)):
-        # Build model columns
-        model_arrays = [results_ord[mod][metric] for mod in results_ord.keys()]
-        col_names    = [results_ord[mod]['disp_name'] for mod in results_ord.keys()]
-        palette      = list(mod_colors)
+        # Build model columns, skipping models that don't have this metric
+        model_arrays = []
+        col_names_metric = []
+        palette_metric = []
+        
+        for i, mod in enumerate(results_ord.keys()):
+            if metric in results_ord[mod]:
+                model_arrays.append(results_ord[mod][metric])
+                col_names_metric.append(results_ord[mod]['disp_name'])
+                palette_metric.append(mod_colors[i])
+        
+        # Skip this metric if no models have it
+        if not model_arrays:
+            continue
+        
+        col_names = col_names_metric
+        palette = palette_metric
 
         # Prepend KF column for observation-level metrics
         if USE_BENCHMARK_DATA and kf_metrics is not None and metric in kf_obs_metrics:

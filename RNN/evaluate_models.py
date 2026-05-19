@@ -57,11 +57,13 @@ import torch.nn as nn
 from torch.nn import functional as F
 from scipy import stats, special
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+
 
 # Local imports (files are now in the same directory)
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from model import SimpleRNN, VRNN, ObsCtxModuleNetwork
-from pipeline_next import extract_model_predictions, prepare_batch_data
+from model import SimpleRNN, VRNN, ObsCtxModuleNetwork, PopulationNetwork
+from pipeline_core_v2 import get_model_predictions, prepare_batch_data, _create_module_network_config, _create_population_network_config
 
 # Local config (for loading saved configs)
 from config_v2 import RunConfig, TrainingConfig, ModelArchConfig, DataConfig as TrainDataConfig
@@ -69,6 +71,142 @@ from config_v2 import RunConfig, TrainingConfig, ModelArchConfig, DataConfig as 
 # Generative models (PreProParadigm is one level up from RNN/)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from PreProParadigm.audit_gm import NonHierarchicalAuditGM, HierarchicalAuditGM
+
+
+# =============================================================================
+# Plotting helpers
+# =============================================================================
+
+def plot_calibration_curve(
+    y_true: np.ndarray,
+    mu_pred: np.ndarray,
+    var_pred: np.ndarray,
+    save_path: Path = None,
+    title: str = "KS Calibration Plot",
+    ax: plt.Axes = None,
+    color: str = "#1f77b4",
+    label: str = None,
+    alpha_band: float = 0.05,
+):
+    """
+    Plot the empirical CDF of the Probability Integral Transform (PIT) values
+    against the ideal uniform diagonal.
+
+    For a perfectly calibrated model the PIT values are Uniform(0,1), so the
+    empirical CDF should lie on the diagonal.  The maximum vertical distance
+    from the diagonal is the Kolmogorov–Smirnov D-statistic.
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (n_samples, seq_len)
+        True observations.
+    mu_pred : np.ndarray, shape (n_samples, seq_len)
+        Predicted means.
+    var_pred : np.ndarray, shape (n_samples, seq_len)
+        Predicted variances.
+    save_path : Path, optional
+        If given, save the figure to this path.
+    title : str
+        Plot title.
+    ax : matplotlib Axes, optional
+        If provided, draw on this axes (useful for multi-panel figures).
+    color : str
+        Line colour for the empirical CDF.
+    label : str, optional
+        Legend label for the empirical CDF curve.
+    alpha_band : float
+        Significance level for the KS confidence band (default 0.05 → 95 %).
+
+    Returns
+    -------
+    fig : matplotlib Figure or None
+        The figure object (None when an external *ax* was supplied).
+    ks_stat : float
+        The pooled KS D-statistic.
+    """
+
+    # --- Compute PIT values (pooled across samples & time) ---
+    sigma_pred = np.sqrt(var_pred)
+    pit = sp_norm.cdf((y_true - mu_pred) / sigma_pred)
+    pit_flat = pit.ravel()
+    pit_flat = pit_flat[~np.isnan(pit_flat)]
+    pit_flat.sort()
+
+    n = len(pit_flat)
+    ecdf = np.arange(1, n + 1) / n          # empirical CDF values
+    F    = pit_flat                           # theoretical quantiles (sorted PITs)
+
+    # KS statistic = max |ECDF(f) - f|
+    ks_stat = np.max(np.abs(ecdf - F))
+
+    # --- KS confidence band width ---
+    # c(alpha) for two-sided KS test: 1.36 (alpha=0.05), 1.22 (0.10), 1.63 (0.01)
+    c_alpha = {0.01: 1.63, 0.05: 1.36, 0.10: 1.22}.get(alpha_band, 1.36)
+    band_half = c_alpha / np.sqrt(n)
+
+    # --- Plot ---
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(6, 6))
+    else:
+        fig = None
+
+    # Confidence band around the diagonal
+    F_grid = np.linspace(0, 1, 500)
+    ax.fill_between(
+        F_grid,
+        np.clip(F_grid - band_half, 0, 1),
+        np.clip(F_grid + band_half, 0, 1),
+        color="grey", alpha=0.75,
+        label=f"{int((1-alpha_band)*100)}% KS band",
+    )
+
+    # Ideal diagonal
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Ideal (Uniform)")
+
+    # Empirical CDF of PITs
+    ax.plot(F, ecdf, color=color, linewidth=1.5,
+            label=label or f"Empirical CDF (D={ks_stat:.4f})")
+
+    # Mark the point of maximum deviation
+    idx_max = np.argmax(np.abs(ecdf - F))
+    ax.plot([F[idx_max], F[idx_max]], [F[idx_max], ecdf[idx_max]],
+            color="red", linewidth=1.5, linestyle="-",
+            label=f"Max deviation = {ks_stat:.4f}")
+    ax.plot(F[idx_max], ecdf[idx_max], "o", color="red", markersize=5)
+
+    ax.set_xlabel("PIT value (theoretical quantile)")
+    ax.set_ylabel("Empirical CDF")
+    ax.set_title(title)
+    ax.legend(loc="lower right", fontsize=9)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+
+    if own_fig and save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved calibration plot to: {save_path}")
+        plt.close(fig)
+
+    return fig, ks_stat
+
+
+def get_desired_order(results):
+    # Categorize models
+    obs = [mod for mod in results if results[mod]['learning_objective'] == 'obs']
+    obs_ctx = [mod for mod in results if results[mod]['learning_objective'] == 'obs_ctx']
+    ctx = [mod for mod in results if results[mod]['learning_objective'] == 'ctx']
+
+    # Sort obs by bottleneck_dim
+    obs_sorted = sorted(obs, key=lambda mod: results[mod]['bottleneck_dim'])
+    # Sort obs_ctx by bottleneck_dim, then kappa (inverted order)
+    obs_ctx_sorted = sorted(obs_ctx, key=lambda mod: (results[mod]['bottleneck_dim'], results[mod]['kappa']))
+    # Sort ctx by bottleneck_dim
+    ctx_sorted = sorted(ctx, key=lambda mod: results[mod]['bottleneck_dim'])
+
+    # Concatenate in desired order
+    return obs_sorted + obs_ctx_sorted + ctx_sorted
+
 
 
 # =============================================================================
@@ -98,26 +236,19 @@ def find_lr_id_for_learning_rate(model_dir: Path, target_lr: float = 0.01, toler
     for log_file in log_files:
         # Extract lr_id from filename
         filename = log_file.name  # e.g., "training_log_lr0.txt"
-        try:
-            lr_id = int(filename.split("_lr")[1].split(".txt")[0])
-        except (IndexError, ValueError):
-            continue
+        lr_id = int(filename.split("_lr")[1].split(".txt")[0])
         
         # Read first line to get the learning rate
-        try:
-            with open(log_file, 'r') as f:
-                first_line = f.readline().strip()
+        with open(log_file, 'r') as f:
+            first_line = f.readline().strip()
+        
+        # Parse "LR:  1e-02; epoch: ..." format
+        if "LR:" in first_line:
+            lr_str = first_line.split("LR:")[1].split(";")[0].strip()
+            actual_lr = float(lr_str)
             
-            # Parse "LR:  1e-02; epoch: ..." format
-            if "LR:" in first_line:
-                lr_str = first_line.split("LR:")[1].split(";")[0].strip()
-                actual_lr = float(lr_str)
-                
-                if abs(actual_lr - target_lr) < tolerance:
-                    return lr_id
-        except (IOError, ValueError) as e:
-            print(f"  Warning: Could not parse {log_file}: {e}")
-            continue
+            if abs(actual_lr - target_lr) < tolerance:
+                return lr_id
     
     return None
 
@@ -443,43 +574,52 @@ def load_model(info: ModelInfo, device: str = 'cpu') -> nn.Module:
         model = VRNN(config)
     
     elif info.model_type == 'module_network':
-        # Use bottleneck_dim from ModelInfo (parsed from dir name or config file)
-        # Default is 24 to match get_module_network_config() in config.py
-        bottleneck_dim = info.bottleneck_dim
-        
-        # Safety: infer from weights if there's a mismatch (shouldn't happen normally)
-        try:
+        # Use config from file if available, otherwise fall back to inference
+        if info.run_config is not None:
+            # Build config using the standard function from pipeline_core_v2
+            config = _create_module_network_config(info.run_config)
+            config['device'] = device
+        else:
+            # Fall back to inferring from directory structure
+            # This path is for legacy models without config files
+            bottleneck_dim = info.bottleneck_dim
+            
+            # Safety: infer from weights if there's a mismatch
             inferred_dim = infer_bottleneck_dim_from_weights(info.weights_path)
             if inferred_dim != bottleneck_dim:
-                # The weights use a different dimension than expected
                 print(f"  Warning: bottleneck_dim mismatch for {info.model_dir.name}: "
-                      f"expected {bottleneck_dim}, weights have {inferred_dim}. Using inferred value.")
+                        f"expected {bottleneck_dim}, weights have {inferred_dim}. Using inferred value.")
                 bottleneck_dim = inferred_dim
-        except Exception as e:
-            # Fall back to parsed value
-            pass
-            pass
-        
-        config = {
-            'kappa': info.kappa,
-            'observation_module': {
-                'input_dim': 1,
-                'output_dim': 2,
-                'rnn_hidden_dim': 64,
-                'rnn_n_layers': 1,
-                'bottleneck_dim': bottleneck_dim,
-            },
-            'context_module': {
-                'input_dim': 2,
-                'output_dim': info.n_ctx,
-                'rnn_hidden_dim': 32,
-                'rnn_n_layers': 1,
-                'bottleneck_dim': bottleneck_dim,
-            },
-            'device': device,
-        }
+            
+            config = {
+                'kappa': info.kappa,
+                'observation_module': {
+                    'input_dim': 1,
+                    'output_dim': 2,
+                    'rnn_hidden_dim': 64,
+                    'rnn_n_layers': 1,
+                    'bottleneck_dim': bottleneck_dim,
+                },
+                'context_module': {
+                    'input_dim': 2,
+                    'output_dim': info.n_ctx,
+                    'rnn_hidden_dim': 32,
+                    'rnn_n_layers': 1,
+                    'bottleneck_dim': bottleneck_dim,
+                },
+                'device': device,
+            }
         model = ObsCtxModuleNetwork(config)
     
+    
+    elif info.model_type == 'population_network':
+        # Build config 
+        config = _create_population_network_config(info.run_config)
+        config['device'] = device
+        # Create model
+        model = PopulationNetwork(config)
+
+
     else:
         raise ValueError(f"Unknown model type: {info.model_type}")
     
@@ -495,118 +635,148 @@ def load_model(info: ModelInfo, device: str = 'cpu') -> nn.Module:
 # Test Data Generation
 # =============================================================================
 
-@dataclass
-class TestDataConfig:
-    """Configuration for test data generation."""
-    n_samples: int = 1000
-    n_tones: int = 1000  # Sequence length
-    n_ctx: int = 1
-    gm_name: str = 'NonHierarchicalGM'
-    
-    # Parameter bounds (same as training)
-    mu_tau_bounds: dict = field(default_factory=lambda: {'low': 1, 'high': 250})
-    si_stat_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
-    si_r_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
-    
-    # Context parameters
-    mu_rho_ctx: float = 0.9
-    si_rho_ctx: float = 0.05
-    si_lim: float = 5.0
-    si_tau: float = 0.5
-    
-    # Multi-context
-    si_d_coef: float = 0.05
-    d_bounds: dict = field(default_factory=lambda: {'high': 4, 'low': 0.1})
-    mu_d: float = 2.0
-    
-    def to_gm_dict(self) -> dict:
-        """Convert to dict expected by GenerativeModel."""
-        d = {
-            'gm_name': self.gm_name,
-            'N_ctx': self.n_ctx,
-            'N_samples': self.n_samples,
-            'N_blocks': 1,
-            'N_tones': self.n_tones,
-            'mu_rho_ctx': self.mu_rho_ctx,
-            'si_rho_ctx': self.si_rho_ctx,
-            'si_lim': self.si_lim,
-            'si_tau': self.si_tau,
-            'params_testing': True,
-            'mu_tau_bounds': self.mu_tau_bounds,
-            'si_stat_bounds': self.si_stat_bounds,
-            'si_r_bounds': self.si_r_bounds,
-        }
-        
-        if self.n_ctx > 1:
-            d.update({
-                'si_d_coef': self.si_d_coef,
-                'd_bounds': self.d_bounds,
-                'mu_d': self.mu_d,
-            })
-        
-        return d
-    
-    @classmethod
-    def from_saved_config(cls, data_config_dict: dict, n_samples: int) -> 'TestDataConfig':
-        """Create TestDataConfig from a saved training data config dict."""
-        return cls(
-            n_samples=n_samples,
-            n_tones=data_config_dict.get('N_tones', 1000),
-            n_ctx=data_config_dict.get('N_ctx', 1),
-            gm_name=data_config_dict.get('gm_name', 'NonHierarchicalGM'),
-            mu_tau_bounds=data_config_dict.get('mu_tau_bounds', {'low': 1, 'high': 250}),
-            si_stat_bounds=data_config_dict.get('si_stat_bounds', {'low': 0.1, 'high': 2}),
-            si_r_bounds=data_config_dict.get('si_r_bounds', {'low': 0.1, 'high': 2}),
-            mu_rho_ctx=data_config_dict.get('mu_rho_ctx', 0.9),
-            si_rho_ctx=data_config_dict.get('si_rho_ctx', 0.05),
-            si_lim=data_config_dict.get('si_lim', 5.0),
-            si_tau=data_config_dict.get('si_tau', 0.5),
-            si_d_coef=data_config_dict.get('si_d_coef', 0.05),
-            d_bounds=data_config_dict.get('d_bounds', {'high': 4, 'low': 0.1}),
-            mu_d=data_config_dict.get('mu_d', 2.0),
-        )
-
-
-def generate_test_data(config: TestDataConfig, device: str = 'cpu') -> Dict[str, Any]:
+def generate_test_data(data_config: Union[TrainDataConfig, dict], n_samples: int, 
+                       device: str = 'cpu') -> Dict[str, Any]:
     """
-    Generate a shared test dataset.
+    Generate a shared test dataset using training data config.
     
-    Returns:
-        Dictionary with:
-        - 'y': Observations tensor (n_samples, seq_len, 1)
-        - 'contexts': Context labels (n_samples, seq_len) if n_ctx > 1
-        - 'pars': Generation parameters
+    Harmonized with training data generation (prepare_batch_data) to ensure consistent
+    tensor types, shapes, and field naming for both forward passes and evaluation.
+    
+    Parameters
+    ----------
+    data_config : TrainDataConfig or dict
+        Either a DataConfig object from config_v2, or a dict (from to_gm_dict()).
+        Using TrainDataConfig is recommended as it handles all GM types (including HierarchicalGM).
+    n_samples : int
+        Number of samples to generate for the test set.
+    device : str
+        Device to place tensors on ('cpu' or 'cuda').
+    
+    Returns
+    -------
+    dict
+        Dictionary containing (aligned with prepare_batch_data):
+        
+        Core fields (always present):
+        - 'y': Observations tensor (n_samples, seq_len, 1) [float32]
+        - 'y_np': Observations as numpy array (n_samples, seq_len)
+        - 'pars': Generation parameters dict
+        
+        Context fields (n_ctx > 1):
+        - 'contexts': Context labels tensor (n_samples, seq_len) [long]
+        - 'contexts_np': Context labels as numpy array
+        
+        HierarchicalGM-specific fields (HierarchicalGM only):
+        - 'rules': Active rules unsqueezed (n_samples, seq_len, 1) [long] ← used in forward pass
+        - 'rules_np': Same as numpy array
+        - 'dpos': Deviant positions unsqueezed (n_samples, seq_len, 1) [long] ← used in loss computation  
+        - 'dpos_np': Same as numpy array
+        - 'q': Cues converted to one-hot encoding (n_samples, seq_len, n_cues) [float32] ← used in forward pass
+        - 'q_np': Original cue indices as numpy array
+        - 'timbres': Object identities (n_samples, seq_len)
+        - 'timbres_np': Same as numpy array
+        - 'pi_rules': Rule transition probabilities
+        - (and other hierarchical fields as generated by HierarchicalAuditGM)
+    
+    Notes
+    -----
+    CRITICAL ALIGNMENT WITH TRAINING:
+    This function ensures test data matches training data structure exactly:
+    1. Fields used in forward pass (y, q) are float32 to work with GRU layers
+    2. Integer fields (rules, dpos) are unsqueezed to (batch, seq_len, 1) shape
+    3. Cues are one-hot encoded into 'q' field (not raw integers)
+    4. Both tensor and numpy versions provided for all fields
+    
+    For HierarchicalGM, all required parameters (rules_dpos_set, mu_rho_rules, 
+    si_rho_rules, p_cues, cues_set) must be present in the data config.
     """
-    gm_dict = config.to_gm_dict()
+    # Convert DataConfig to gm_dict, overriding sample count
+    if isinstance(data_config, TrainDataConfig):
+        gm_dict = data_config.to_gm_dict(n_samples)
+    elif isinstance(data_config, dict):
+        # Assume it's already a gm_dict; update sample count
+        gm_dict = data_config.copy()
+        gm_dict['N_samples'] = n_samples
+    else:
+        raise TypeError(f"data_config must be TrainDataConfig or dict, got {type(data_config)}")
     
-    if config.gm_name == 'NonHierarchicalGM':
+    gm_name = gm_dict['gm_name']
+    
+    # Instantiate the appropriate generative model
+    if gm_name == 'NonHierarchicalGM':
         gm = NonHierarchicalAuditGM(gm_dict)
-    elif config.gm_name == 'HierarchicalGM':
+    elif gm_name == 'HierarchicalGM':
         gm = HierarchicalAuditGM(gm_dict)
     else:
-        raise ValueError(f"Unknown GM: {config.gm_name}")
+        raise ValueError(f"Unknown GM: {gm_name}")
     
+    # Generate batch
     batch = gm.generate_batch(return_pars=True)
-    y = batch['obs']
-    contexts = batch['contexts']
-    pars = batch.get('pars', None)
     
-    # Convert to tensors
+    # Extract observations and convert to tensor
+    y = batch['obs']
     y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(-1).to(device)
     
+    # Initialize result with observations and parameters
     result = {
         'y': y_tensor,
         'y_np': y,
-        'pars': pars,
+        'pars': batch['pars'],
     }
     
-    if config.n_ctx > 1:
+    # Handle contexts (present in both NonHierarchicalGM and HierarchicalGM)
+    contexts = batch['contexts'] if 'contexts' in batch.keys() else None
+    n_ctx = gm_dict['N_ctx']
+    if n_ctx > 1 and contexts is not None:
         contexts_tensor = torch.tensor(contexts, dtype=torch.long).to(device)
         result['contexts'] = contexts_tensor
         result['contexts_np'] = contexts
     else:
         result['contexts'] = None
         result['contexts_np'] = None
+    
+    # ========== HierarchicalGM-specific field processing ==========
+    # Align with prepare_batch_data() to ensure consistent tensor types and shapes
+    # for both training and testing
+    if gm_name == 'HierarchicalGM':
+        # 1) Process rules_long: convert to long, unsqueeze, and store as 'rules'
+        #    (matches training where only rules_long is used and unsqueezed)
+        if 'rules_long' in batch:
+            rules_data = batch['rules_long']
+            result['rules'] = torch.tensor(rules_data, dtype=torch.long, requires_grad=False).unsqueeze(2).to(device)
+            result['rules_np'] = rules_data
+        
+        # 2) Process dpos_long: convert to long, unsqueeze, and store as 'dpos'
+        #    (matches training where only dpos_long is used and unsqueezed)
+        if 'dpos_long' in batch:
+            dpos_data = batch['dpos_long']
+            result['dpos'] = torch.tensor(dpos_data, dtype=torch.long, requires_grad=False).unsqueeze(2).to(device)
+            result['dpos_np'] = dpos_data
+        
+        # 3) Process cues_long: convert to one-hot encoding (float32) and store as 'q'
+        #    (matches training where cues_long is converted to one-hot and stored as 'q')
+        if 'cues_long' in batch:
+            cues_data = batch['cues_long']
+            q_onehot = torch.nn.functional.one_hot(
+                torch.tensor(cues_data, dtype=torch.long, requires_grad=False),
+                num_classes=gm.N_cues
+            ).float().to(device)
+            result['q'] = q_onehot  # Shape: (n_samples, seq_len, n_cues)
+            result['q_np'] = cues_data
+        
+        # 4) Store other hierarchical fields for analysis (numpy + tensor versions)
+        #    These are not used in forward pass but may be needed for evaluation
+        other_fields = ['timbres', 'timbres_long', 'pi_rules']
+        for field in other_fields:
+            if field in batch:
+                field_data = batch[field]
+                # Keep as appropriate dtype
+                if field_data.dtype in [np.int32, np.int64]:
+                    result[field] = torch.tensor(field_data, dtype=torch.long).to(device)
+                else:
+                    result[field] = torch.tensor(field_data, dtype=torch.float32).to(device)
+                result[f'{field}_np'] = field_data
     
     return result
 
@@ -831,11 +1001,21 @@ def evaluate_model(
     y = test_data['y']
     y_np = test_data['y_np']
     contexts_np = test_data.get('contexts_np')
-    
+    q = test_data.get('q')
+
     # Forward pass
     with torch.no_grad():
-        model_output = model(y[:, :-1, :])
-        mu_pred, var_pred, context_output = extract_model_predictions(model, model_output)
+        if info.model_type == 'population_network':
+            if q is None:
+                raise ValueError("PopulationNetwork requires 'q' field (one-hot encoded cues) in test_data")
+            model_output = model(y[:, :-1, :], q[:, :-1, :])
+        else:
+            model_output = model(y[:, :-1, :])
+        predictions = get_model_predictions(model, model_output)
+        mu_pred = predictions['mu_estim']
+        var_pred = predictions['var_estim']
+        # Extract raw logits from output (for context_accuracy and context_log_prob functions)
+        context_output = predictions['output']['ctx'] if 'output' in predictions else None
     
     # Target is y[1:] (predicting next observation)
     y_target = y_np[:, 1:]
@@ -866,6 +1046,9 @@ def evaluate_model(
         'hidden_dim': info.hidden_dim,
         'n_ctx': info.n_ctx,
         'gm_name': info.gm_name,
+        'learning_objective': info.learning_objective,
+        'kappa': info.kappa,
+        'bottleneck_dim': info.bottleneck_dim,
     }
     
     # MSE
@@ -886,9 +1069,6 @@ def evaluate_model(
     
     # ModuleNetwork specific metrics
     if info.model_type == 'module_network' and info.n_ctx > 1 and context_output is not None:
-        results['learning_objective'] = info.learning_objective
-        results['kappa'] = info.kappa
-        results['bottleneck_dim'] = info.bottleneck_dim
         
         # Context predictions – use pre-sliced arrays so timestep window matches y_target
         context_logits = context_output_np
@@ -1054,7 +1234,11 @@ def assess_model_against_benchmarks(
     # Model predicts y[t+1] from y[0:t], so we feed y[:, :-1]
     with torch.no_grad():
         model_output = model(y_tensor[:, :-1, :])
-        mu_model_full, var_model_full, context_output = extract_model_predictions(model, model_output)
+        predictions = get_model_predictions(model, model_output)
+        mu_model_full = predictions['mu_estim']
+        var_model_full = predictions['var_estim']
+        # Extract raw logits from output (for context handling if needed)
+        context_output = predictions['output']['ctx'] if 'output' in predictions else None
     
     # Model predictions correspond to y[:, 1:] (predicting next observation)
     # Align with KF which starts from min_obs_for_em
@@ -1212,13 +1396,10 @@ def assess_models_against_benchmarks(
     # Parse model information
     model_infos = []
     for model_dir in model_dirs:
-        try:
-            info = ModelInfo.from_path(Path(model_dir))
-            model_infos.append(info)
-            if verbose:
-                print(f"  Found: {info.model_type} (h={info.hidden_dim}, n_ctx={info.n_ctx})")
-        except Exception as e:
-            print(f"  ERROR parsing {model_dir}: {e}")
+        info = ModelInfo.from_path(Path(model_dir))
+        model_infos.append(info)
+        if verbose:
+            print(f"  Found: {info.model_type} (h={info.hidden_dim}, n_ctx={info.n_ctx})")
     
     if not model_infos:
         raise ValueError("No valid models found!")
@@ -1228,37 +1409,22 @@ def assess_models_against_benchmarks(
     results_unreduced = {}
     
     for info in tqdm(model_infos, desc="Evaluating models vs benchmarks", disable=not verbose):
-        try:
-            model = load_model(info, device=device)
-            metrics = assess_model_against_benchmarks(
-                model, info, benchmark_data, device=device, reduce=reduce
-            )
-            
-            if reduce:
-                results.append(metrics)
-            else:
-                model_name = info.model_dir.name
-                results_unreduced[model_name] = metrics
-            
-            # Cleanup
-            del model
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            print(f"ERROR evaluating {info.model_dir}: {e}")
-            import traceback
-            traceback.print_exc()
-            if reduce:
-                results.append({
-                    'model_dir': str(info.model_dir),
-                    'model_type': info.model_type,
-                    'error': str(e),
-                })
-            else:
-                model_name = info.model_dir.name
-                results_unreduced[model_name] = {'error': str(e)}
+        model = load_model(info, device=device)
+        metrics = assess_model_against_benchmarks(
+            model, info, benchmark_data, device=device, reduce=reduce
+        )
+        
+        if reduce:
+            results.append(metrics)
+        else:
+            model_name = info.model_dir.name
+            results_unreduced[model_name] = metrics
+        
+        # Cleanup
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # Return based on reduce mode
     if not reduce:
@@ -1347,13 +1513,10 @@ def evaluate_models(
     # Parse model information
     model_infos = []
     for model_dir in model_dirs:
-        try:
-            info = ModelInfo.from_path(Path(model_dir))
-            model_infos.append(info)
-            if verbose:
-                print(f"  Found: {info.model_type} (h={info.hidden_dim}, n_ctx={info.n_ctx})")
-        except Exception as e:
-            print(f"  ERROR parsing {model_dir}: {e}")
+        info = ModelInfo.from_path(Path(model_dir))
+        model_infos.append(info)
+        if verbose:
+            print(f"  Found: {info.model_type} (h={info.hidden_dim}, n_ctx={info.n_ctx})")
     
     if not model_infos:
         raise ValueError("No valid models found!")
@@ -1392,18 +1555,34 @@ def evaluate_models(
     
     if saved_data_config is not None:
         # Use saved config (ensures same params_testing bounds, etc.)
-        data_config = TestDataConfig.from_saved_config(saved_data_config, n_samples=n_samples)
+        test_data = generate_test_data(saved_data_config, n_samples=n_samples, device=device)
     else:
-        # Fall back to defaults
+        # Fall back to defaults: create a minimal gm_dict
         if verbose:
             print(f"  No saved config found, using defaults")
-        data_config = TestDataConfig(
-            n_samples=n_samples,
-            n_tones=n_tones,
-            n_ctx=n_ctx,
-            gm_name=gm_name,
-        )
-    test_data = generate_test_data(data_config, device=device)
+        # Build a minimal config dict for fallback
+        fallback_config = {
+            'gm_name': gm_name,
+            'N_ctx': n_ctx,
+            'N_samples': n_samples,
+            'N_blocks': 1,
+            'N_tones': n_tones,
+            'mu_rho_ctx': 0.9,
+            'si_rho_ctx': 0.05,
+            'si_lim': 5.0,
+            'si_tau': 0.5,
+            'params_testing': True,
+            'mu_tau_bounds': {'low': 1, 'high': 250},
+            'si_stat_bounds': {'low': 0.1, 'high': 2},
+            'si_r_bounds': {'low': 0.1, 'high': 2},
+        }
+        if n_ctx > 1:
+            fallback_config.update({
+                'si_d_coef': 0.05,
+                'd_bounds': {'high': 4, 'low': 0.1},
+                'mu_d': 2.0,
+            })
+        test_data = generate_test_data(fallback_config, n_samples=n_samples, device=device)
     
     if verbose:
         print(f"  Generated {n_samples} sequences of length {n_tones}")
@@ -1413,34 +1592,21 @@ def evaluate_models(
     results_unreduced = {}  # For reduce=False mode
     
     for info in tqdm(model_infos, desc="Evaluating models", disable=not verbose):
-        try:
-            model = load_model(info, device=device)
-            metrics = evaluate_model(model, info, test_data, device=device, reduce=reduce)
-            
-            if reduce:
-                results.append(metrics)
-            else:
-                # Use model directory name as key
-                model_name = info.model_dir.name
-                results_unreduced[model_name] = metrics
-            
-            # Cleanup
-            del model
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            print(f"ERROR evaluating {info.model_dir}: {e}")
-            if reduce:
-                results.append({
-                    'model_dir': str(info.model_dir),
-                    'model_type': info.model_type,
-                    'error': str(e),
-                })
-            else:
-                model_name = info.model_dir.name
-                results_unreduced[model_name] = {'error': str(e)}
+        model = load_model(info, device=device)
+        metrics = evaluate_model(model, info, test_data, device=device, reduce=reduce)
+        
+        if reduce:
+            results.append(metrics)
+        else:
+            # Use model directory name as key
+            model_name = info.model_dir.name
+            results_unreduced[model_name] = metrics
+        
+        # Cleanup
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # Return based on reduce mode
     if not reduce:

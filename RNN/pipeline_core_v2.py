@@ -95,9 +95,11 @@ def prepare_batch_data(gm, gm_name, data_mode, device, return_pars=False):
     """
     Generate a batch of data and prepare tensors based on data mode.
     
+    The CANONICAL data preparation function used throughout training and validation.
+    
     Parameters
     ----------
-    gm : NonHierachicalAuditGM or HierarchicalAuditGM
+    gm : NonHierarchicalAuditGM or HierarchicalAuditGM
         The generative model instance
     gm_name : str
         Name of the generative model ('NonHierarchicalGM' or 'HierarchicalGM')
@@ -111,10 +113,32 @@ def prepare_batch_data(gm, gm_name, data_mode, device, return_pars=False):
     Returns
     -------
     dict
-        Dictionary containing:
-        - 'y': Observation tensor of shape (batch, seq_len, 1)
-        - 'contexts': Context tensor of shape (batch, seq_len) if data_mode='multi_ctx', else None
+        Dictionary containing (CANONICAL STRUCTURE for all data generation):
+        
+        Core fields (always present):
+        - 'y': Observation tensor of shape (batch, seq_len, 1) [float32]
         - 'pars': Parameters dict if return_pars=True, else None
+        
+        Multi-context fields (data_mode='multi_ctx'):
+        - 'contexts': Context labels tensor (batch, seq_len) [long]
+        
+        HierarchicalGM-specific fields (gm_name='HierarchicalGM' + data_mode='multi_ctx'):
+        - 'rules': Active rules unsqueezed (batch, seq_len, 1) [long] ← FROM rules_long
+        - 'dpos': Deviant positions unsqueezed (batch, seq_len, 1) [long] ← FROM dpos_long
+        - 'q': One-hot encoded cues (batch, seq_len, N_cues) [float32] ← FROM cues_long with one_hot
+        
+    IMPORTANT IMPLEMENTATION NOTES:
+    - rules and dpos are stored with unsqueeze(2) to get shape (batch, seq_len, 1)
+    - cues_long is converted to one-hot encoding and stored as 'q' (not as raw cues)
+    - All tensor fields moved to device
+    - This structure is used by:
+        * _compute_forward_and_loss() for training/validation forward pass
+        * PopulationNetwork which expects q (float32) as input
+    
+    See Also
+    --------
+    generate_test_data : Test data generation that aligns with this function
+    _compute_forward_and_loss : Uses output of this function for forward pass
     """
     batch = gm.generate_batch(return_pars=return_pars)
     
@@ -1056,7 +1080,14 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         ax_ctx = None
 
     # ── top subplot: observations + predictions ──────────────────────────
-    ax_obs.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8)
+    # Plot obs line in blue
+    ax_obs.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8, linestyle='None', marker='.', markersize=4)
+    
+    # Overlay red dots only at deviant context positions
+    if contexts is not None:
+        deviant_indices = np.where(contexts[i])[0]
+        if len(deviant_indices) > 0:
+            ax_obs.plot(deviant_indices, obs[i][deviant_indices], color='tab:red', linestyle='None', marker='.', markersize=4, label='deviant')
 
     # When preds_aligned, predictions cover the same x-range as obs;
     # otherwise they start one step later (no prediction for the first obs).
@@ -1064,7 +1095,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         estim_x = range(len(obs[i]))
     else:
         estim_x = range(1, len(obs[i]))
-    ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)')
+    ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)', linestyle='--', marker='.', markersize=1)
     ax_obs.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2, label='std (model)')
 
     if kalman_mu is not None and kalman_sigma is not None:
@@ -1075,11 +1106,11 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
     if hidden_states is not None:
         ax_obs.plot(range(len(hidden_states[i])), hidden_states[i, :], label='hidden state', color='orange', alpha=0.8)
 
-    # context switch vertical lines on the obs panel
-    if n_ctx > 1 and contexts is not None:
-        context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1
-        for cc in context_changes:
-            ax_obs.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
+    # # context switch vertical lines on the obs panel
+    # if n_ctx > 1 and contexts is not None:
+    #     context_changes = np.where(np.diff(contexts[i]) != 0)[0] + 1
+    #     for cc in context_changes:
+    #         ax_obs.axvline(x=cc, color='red', linestyle='--', alpha=0.5)
 
     if shared_ylim:
         ax_obs.set_ylim(ylim)
@@ -1806,7 +1837,7 @@ def train_model(
     """
     # ========== SETUP ==========
     device = config.device
-    save_path = config.save_dir
+    save_path = Path(str(config.save_dir) + f'_lr{config.lr_id}')
     os.makedirs(save_path / 'samples', exist_ok=True)
     
     # Optimizer
@@ -1928,7 +1959,7 @@ def train_model(
         # Save sample plots periodically
         if epoch % epoch_res == epoch_res - 1:
             _save_validation_samples(
-                valid_metrics, config, epoch, lr_title, benchmarks
+                valid_metrics, config, epoch, lr_title, benchmarks, save_path
             )
         
         # Epoch logging
@@ -1949,7 +1980,7 @@ def train_model(
     print(f"Config saved to: {config_path}")
     
     # Save plots
-    _save_training_plots(history, config, lr_title, benchmarks)
+    _save_training_plots(history, config, lr_title, benchmarks, save_path)
     
     return history
 
@@ -2074,7 +2105,7 @@ def test_model(
     print(f"TESTING: {config.name}")
     print(f"{'='*60}")
     
-    save_path = config.save_dir
+    save_path = Path(str(config.save_dir) + f'_lr{config.lr_id}')
     device = config.device
     
     # Check model exists
@@ -2165,9 +2196,11 @@ def _log_epoch(save_path, lr_id, lr, epoch, metrics, elapsed, step, has_benchmar
         f.write(f'{msg}\n')
 
 
-def _save_validation_samples(metrics, config, epoch, title, benchmarks):
+def _save_validation_samples(metrics, config, epoch, title, benchmarks, save_path):
     """Save validation sample plots."""
-    save_path = config.save_dir / 'samples' / f'lr{config.lr_id}-epoch-{epoch:0>3}_samples'
+    plot_save_dir = save_path / 'samples'
+    os.makedirs(plot_save_dir, exist_ok=True)
+    plot_save_path = plot_save_dir / f'epoch-{epoch:0>3}_samples'
     
     kwargs = {
         'params': metrics['pars'],
@@ -2178,12 +2211,11 @@ def _save_validation_samples(metrics, config, epoch, title, benchmarks):
     }
     
     
-    plot_samples(metrics, save_path, **kwargs)
+    plot_samples(metrics, str(plot_save_path), **kwargs)
 
 
-def _save_training_plots(history, config, title, benchmarks):
+def _save_training_plots(history, config, title, benchmarks, save_path):
     """Save end-of-training plots."""
-    save_path = config.save_dir
     lr_id = config.lr_id
     
     # Loss curves
