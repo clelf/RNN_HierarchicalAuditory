@@ -63,7 +63,8 @@ from pipeline_core_v2 import (
 # =============================================================================
 
 def run_benchmarks(
-    grid: HyperparameterGrid,
+    data_config: DataConfig,
+    training_config: TrainingConfig,
     benchmark_mode: str = 'both',
     visualize: bool = True,
     verbose: bool = True,
@@ -78,10 +79,12 @@ def run_benchmarks(
     - Generating benchmark visualizations
     
     Args:
-        grid: Hyperparameter grid (only data config is used)
+        data_config: Data configuration object
+        training_config: Training configuration object (for batch sizes)
         benchmark_mode: 'both', 'train_only', or 'test_only'
         visualize: If True, generate parameter distribution plots
         verbose: If True, print progress information
+        suffix_tag: Optional tag appended to benchmark filenames
     
     Returns:
         Tuple of (benchmarks_train, benchmarks_test) dictionaries
@@ -90,27 +93,27 @@ def run_benchmarks(
         print("\n" + "=" * 70)
         print("BENCHMARK COMPUTATION")
         print("=" * 70)
-        print(f"N_ctx: {grid.data.N_ctx}, GM: {grid.data.gm_name}")
-        print(f"Batch size (train): {grid.training.batch_size}")
-        print(f"Batch size (test): {grid.training.batch_size_test}")
+        print(f"N_ctx: {data_config.N_ctx}, GM: {data_config.gm_name}")
+        print(f"Batch size (train): {training_config.batch_size}")
+        print(f"Batch size (test): {training_config.batch_size_test}")
         print(f"Mode: {benchmark_mode}")
-        print(f"Max cores: {grid.data.max_cores}")
+        print(f"Max cores: {data_config.max_cores}")
         print("=" * 70)
     
-    # Build config dicts for backward compatibility
+    # Build config dicts for backward compatibility with load_or_compute_benchmarks
     model_config = {
-        'batch_size': grid.training.batch_size,
-        'batch_size_test': grid.training.batch_size_test,
+        'batch_size': training_config.batch_size,
+        'batch_size_test': training_config.batch_size_test,
     }
-    data_config = grid.data.to_gm_dict(grid.training.batch_size)
+    data_config_dict = data_config.to_gm_dict(training_config.batch_size)
     
     benchmarks_train, benchmarks_test = load_or_compute_benchmarks(
-        data_config,
+        data_config_dict,
         model_config,
-        grid.data.N_ctx,
-        grid.data.gm_name,
+        data_config.N_ctx,
+        data_config.gm_name,
         visualize=visualize,
-        max_cores=grid.data.max_cores,
+        max_cores=data_config.max_cores,
         benchmark_mode=benchmark_mode,
         suffix_tag=suffix_tag,
     )
@@ -282,7 +285,7 @@ Examples:
     
     # Model selection
     parser.add_argument('--models', type=str, nargs='+',
-                        default=['rnn', 'vrnn'],
+                        default=None,
                         choices=['rnn', 'vrnn', 'module_network', 'population_network'],
                         help='Models to train (default: rnn vrnn)')
     
@@ -296,11 +299,12 @@ Examples:
     
     # ModuleNetwork specific
     parser.add_argument('--objectives', type=str, nargs='+',
-                        default=['obs'],
+                        default=None,
                         choices=['obs', 'ctx', 'all'],
                         help='Learning objectives for ModuleNetwork')
     parser.add_argument('--bottleneck_dims', type=int, nargs='+',
-                        default=[8, 16],
+                        default=None,
+                        choices=[8, 16],
                         help='Bottleneck dimensions for ModuleNetwork')
     parser.add_argument('--kappa_values', type=float, nargs='+',
                         default=[0.3, 0.5, 0.7],
@@ -341,6 +345,22 @@ def main():
         N_tones=training.batch_size,  # Sequence length matches batch size
     )
     
+    # =========================================================================
+    # BENCHMARK-ONLY MODE: Early exit, no model grid needed
+    # =========================================================================
+    if args.benchmark_only:
+        run_benchmarks(
+            data_config=data,
+            training_config=training,
+            benchmark_mode=args.benchmark_mode,
+            visualize=True,
+            suffix_tag=args.benchmark_tag,
+        )
+        return
+    
+    # =========================================================================
+    # TRAINING/TESTING MODE: Build full hyperparameter grid
+    # =========================================================================
     # Set default hyperparameters based on mode
     if args.unit_test:
         default_lrs = [0.01]
@@ -362,16 +382,6 @@ def main():
         data=data,
         run_id=run_id,
     )
-    
-    # Handle benchmark_only mode
-    if args.benchmark_only:
-        run_benchmarks(
-            hp_grid,
-            benchmark_mode=args.benchmark_mode,
-            visualize=True,
-            suffix_tag=args.benchmark_tag,
-        )
-        return
     
     # Run full pipeline
     run_pipeline(

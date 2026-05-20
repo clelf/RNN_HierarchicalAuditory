@@ -330,21 +330,38 @@ class ObsCtxModuleNetwork(nn.Module):
 
 
     def forward(self, x):
-        # First pass: observation module processes input
-        obs_output, obs_output_ext, obs_hx = self.observation_module(x, return_hidden=True)  # get hidden state
-        # obs_output, obs_hx = self.observation_module(x, hx=obs_hx, return_hidden=True) # Example of "thinking"
-        
-        # Compress and send to context module
-        enc_obs2ctx_output = self.readout_obs2ctx(obs_output)
-        ctx_output, ctx_output_ext = self.context_module(enc_obs2ctx_output)  # context module has its own independent hidden state
+        batch_size, seq_len, _ = x.size()
+
+        obs_hx = self.observation_module.init_hidden(batch_size)
+        ctx_hx = self.context_module.init_hidden(batch_size)
+
+        obs_outputs = []
+        ctx_outputs = []
+
+        for t in range(seq_len):
+            x_t = x[:, t:t+1, :]   # (batch, 1, input_dim)
+
+            # First pass: obs processes current input
+            obs_output, obs_output_ext, obs_hx = self.observation_module(x_t, hx=obs_hx, return_hidden=True)
+
+            # Compress and send to ctx
+            enc_obs2ctx = self.readout_obs2ctx(obs_output)
+            ctx_output, ctx_output_ext, ctx_hx = self.context_module(enc_obs2ctx, hx=ctx_hx, return_hidden=True)
+
+            # Feedback: ctx → obs (hidden state updated, output discarded)
+            enc_ctx2obs = self.readout_ctx2obs(ctx_output)
+            _, _, obs_hx = self.observation_module(enc_ctx2obs, hx=obs_hx, return_hidden=True)
+
+            # Second pass: obs with prior-informed hidden state re-processes current input
+            informed_obs_output, informed_obs_output_ext, obs_hx = self.observation_module(x_t, hx=obs_hx, return_hidden=True)
             
-        # Feedback: compress context output
-        enc_ctx2obs_output = self.readout_ctx2obs(ctx_output)
-        
-        # Second pass: combine context feedback and previous hidden state
-        informed_obs_output, informed_obs_output_ext = self.observation_module(enc_ctx2obs_output, hx=obs_hx)
-        
-        return informed_obs_output_ext, ctx_output_ext
+            obs_outputs.append(informed_obs_output_ext)
+            ctx_outputs.append(ctx_output_ext)
+
+        obs_outputs = torch.cat(obs_outputs, dim=1)
+        ctx_outputs = torch.cat(ctx_outputs, dim=1)
+
+        return obs_outputs, ctx_outputs
     
 
 
@@ -403,51 +420,80 @@ class PopulationNetwork(ObsCtxModuleNetwork):
 
     def forward(self, x, q):
         """
-        Two-pass forward computation with bidirectional information flow.
-        
-        Module dimensions:
-        - rule:       input_dim=cue_dim,        output_dim=N_rules
-        - dpos:       input_dim=N_dpos,   output_dim=N_dpos
-        - ctx:        input_dim=N_ctx,      output_dim=N_ctx
-        - obs:        input_dim=obs_dim,    output_dim=2
-        
-        Readout gates handle all dimensional transformations between modules.
-        """
-        # FORWARD PASS
-        
-        # 1) Process visual cues through rule module (ignoring external readout needed at this stage)
-        rule_output, _, rule_hx = self.rule_module(q, return_hidden=True)  # 1D → N_rules
-        
-        # 2) Compress rule output and inform dpos module
-        enc_rule2dpos_output = self.readout_rule2dpos(rule_output)  # N_rules → N_dpos
-        dpos_output, _, dpos_hx = self.dpos_module(enc_rule2dpos_output, return_hidden=True)  # N_dpos → N_dpos
-        
-        # 3) Compress dpos output and inform context module
-        enc_dpos2ctx_output = self.readout_dpos2ctx(dpos_output)  # N_dpos → N_ctx
-        ctx_output, _, ctx_hx = self.context_module(enc_dpos2ctx_output, return_hidden=True)  # N_ctx → N_ctx
-        
-        # 4) Compress context output to prime observation module with prior information (ignoring both internal and external readout, priming only with hidden states)
-        enc_ctx2obs_output = self.readout_ctx2obs(ctx_output)  # N_ctx → input_dim
-        _, _, obs_hx = self.observation_module(enc_ctx2obs_output, return_hidden=True)  # input_dim, stores hidden state → 2
-        
-        # 5) Process actual observation with prior-informed hidden state
-        posterior_obs_output, posterior_obs_output_ext = self.observation_module(x, hx=obs_hx)  # input_dim + prior hx → 2
-        
-        # FEEDBACK PASS -- Saving external readouts for training
-        # 6) Compress obs output and send feedback to context module
-        enc_obs2ctx_output = self.readout_obs2ctx(posterior_obs_output)  # 2 → N_ctx
-        posterior_ctx_output, posterior_ctx_output_ext = self.context_module(enc_obs2ctx_output, hx=ctx_hx)  # N_ctx + prior hx → N_ctx
-        
-        # 7) Compress context output and send feedback to dpos module
-        enc_ctx2dpos_output = self.readout_ctx2dpos(posterior_ctx_output)  # N_ctx → N_dpos
-        posterior_dpos_output, posterior_dpos_output_ext = self.dpos_module(enc_ctx2dpos_output, hx=dpos_hx)  # N_dpos + prior hx → N_dpos
-        
-        # 8) Compress dpos output and send feedback to rule module
-        enc_dpos2rule_output = self.readout_dpos2rule(posterior_dpos_output)  # N_dpos → 1
-        _, posterior_rule_output_ext = self.rule_module(enc_dpos2rule_output, hx=rule_hx)  # 1 + prior hx → N_rules
-        
-        return posterior_obs_output_ext, posterior_ctx_output_ext, posterior_dpos_output_ext, posterior_rule_output_ext
+        Timestep-synchronous forward computation with bidirectional information flow.
+        At each timestep t, the full forward+feedback cycle is executed before moving to t+1.
 
+        Module dimensions:
+        - rule:  input_dim=cue_dim,   output_dim=N_rules
+        - dpos:  input_dim=N_dpos,    output_dim=N_dpos
+        - ctx:   input_dim=N_ctx,     output_dim=N_ctx
+        - obs:   input_dim=obs_dim,   output_dim=2
+        """
+        batch_size, seq_len, _ = x.size()
+
+        # Initialise hidden states for all four modules
+        rule_hx = self.rule_module.init_hidden(batch_size)
+        dpos_hx = self.dpos_module.init_hidden(batch_size)
+        ctx_hx  = self.context_module.init_hidden(batch_size)
+        obs_hx  = self.observation_module.init_hidden(batch_size)
+
+        # Accumulators for outputs across time
+        obs_outputs  = []
+        ctx_outputs  = []
+        dpos_outputs = []
+        rule_outputs = []
+
+        for t in range(seq_len):
+            x_t = x[:, t:t+1, :]   # (batch, 1, obs_dim)   -- keeps 3-D shape for GRU
+            q_t = q[:, t:t+1, :]   # (batch, 1, cue_dim)
+
+            # --- FORWARD PASS ---
+
+            # 1) Cues through rule module
+            rule_output, _, rule_hx = self.rule_module(q_t, hx=rule_hx, return_hidden=True)
+
+            # 2) Rule → dpos
+            enc_rule2dpos = self.readout_rule2dpos(rule_output)             # (batch, 1, N_dpos)
+            dpos_output, _, dpos_hx = self.dpos_module(enc_rule2dpos, hx=dpos_hx, return_hidden=True)
+
+            # 3) Dpos → ctx
+            enc_dpos2ctx = self.readout_dpos2ctx(dpos_output)               # (batch, 1, N_ctx)
+            ctx_output, _, ctx_hx = self.context_module(enc_dpos2ctx, hx=ctx_hx, return_hidden=True)
+
+            # 4) Ctx primes obs (hidden state updated, output discarded)
+            enc_ctx2obs = self.readout_ctx2obs(ctx_output)                  # (batch, 1, obs_input_dim)
+            _, _, obs_hx = self.observation_module(enc_ctx2obs, hx=obs_hx, return_hidden=True)
+
+            # 5) Actual observation processed with prior-informed hidden state
+            posterior_obs_output, posterior_obs_output_ext, obs_hx = self.observation_module(x_t, hx=obs_hx, return_hidden=True)  # posterior-informed output and hidden state
+
+            # --- FEEDBACK PASS ---
+
+            # 6) Obs → ctx
+            enc_obs2ctx = self.readout_obs2ctx(posterior_obs_output)        # (batch, 1, N_ctx)
+            posterior_ctx_output, posterior_ctx_output_ext, ctx_hx = self.context_module(enc_obs2ctx, hx=ctx_hx, return_hidden=True)
+
+            # 7) Ctx → dpos
+            enc_ctx2dpos = self.readout_ctx2dpos(posterior_ctx_output)      # (batch, 1, N_dpos)
+            posterior_dpos_output, posterior_dpos_output_ext, dpos_hx = self.dpos_module(enc_ctx2dpos, hx=dpos_hx, return_hidden=True)
+
+            # 8) Dpos → rule
+            enc_dpos2rule = self.readout_dpos2rule(posterior_dpos_output)   # (batch, 1, N_rules)
+            _, posterior_rule_output_ext, rule_hx = self.rule_module(enc_dpos2rule, hx=rule_hx, return_hidden=True)
+
+            # Collect the supervised readouts for this timestep
+            obs_outputs.append(posterior_obs_output_ext)
+            ctx_outputs.append(posterior_ctx_output_ext)
+            dpos_outputs.append(posterior_dpos_output_ext)
+            rule_outputs.append(posterior_rule_output_ext)
+
+        # Stack along the time dimension → (batch, seq_len, output_dim)
+        obs_outputs  = torch.cat(obs_outputs,  dim=1)
+        ctx_outputs  = torch.cat(ctx_outputs,  dim=1)
+        dpos_outputs = torch.cat(dpos_outputs, dim=1)
+        rule_outputs = torch.cat(rule_outputs, dim=1)
+
+        return obs_outputs, ctx_outputs, dpos_outputs, rule_outputs
 
 
 
