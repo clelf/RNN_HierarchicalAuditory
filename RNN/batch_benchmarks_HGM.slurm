@@ -37,8 +37,7 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
 /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
     --n_ctx 2 \
     --gm_name HierarchicalGM \
-    --benchmark_only \
-    --benchmark_mode test_only
+    --benchmark_only
 
 
 # Verify Python version and activated environment

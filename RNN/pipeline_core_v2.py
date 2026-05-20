@@ -384,22 +384,38 @@ def _process_single_kf_sample(args):
     
     Returns:
         dict: Sample data dictionary with 'y', 'contexts', 'mu_kal_pred', 'sigma_kal_pred', 
+              'per_ctx_mu_kal_pred', 'per_ctx_sigma_kal_pred' (for multi-context), 
               'pars', 'perf', 'n_ctx', 'min_obs_for_em'
     """
     i, y_i, ctx_i, pars_i, n_ctx, n_iter, incr_dir = args
     
+    # Validate and align observation and context lengths
+    if n_ctx > 1 and ctx_i is not None:
+        y_len = len(y_i)
+        ctx_len = len(ctx_i)
+        if y_len != ctx_len:
+            # Trim to the minimum length to ensure alignment
+            min_len = min(y_len, ctx_len)
+            y_i = y_i[:min_len]
+            ctx_i = ctx_i[:min_len]
+    
     # Fit Kalman filter for this single sample
     if n_ctx == 1:
         mu_pred_i, sigma_pred_i, _ = kalman_online_fit_predict(y_i, n_iter=n_iter)
+        per_ctx_mu_i = None
+        per_ctx_sigma_i = None
     else:
         # Convert context labels to responsibilities for multicontext KF
         responsibilities_i = contexts_to_probabilities(ctx_i, n_ctx)
-        mu_pred_i, sigma_pred_i, _ = kalman_online_fit_predict_multicontext(
-            y_i, responsibilities_i, n_iter=n_iter
-        )
+        mu_pred_i, sigma_pred_i, _, per_ctx_mu_i, per_ctx_sigma_i = \
+            kalman_online_fit_predict_multicontext(
+                y_i, responsibilities_i, n_iter=n_iter, return_per_ctx=True
+            )
     
     # Compute MSE for this sample
-    mse_i = ((mu_pred_i - y_i[MIN_OBS_FOR_EM:]) ** 2).mean()
+    # Use only the valid predictions (skip first MIN_OBS_FOR_EM NaN values)
+    valid_slice = slice(MIN_OBS_FOR_EM, len(mu_pred_i))
+    mse_i = ((mu_pred_i[valid_slice] - y_i[valid_slice]) ** 2).mean()
     
     # Build sample data
     sample_data = {
@@ -407,6 +423,8 @@ def _process_single_kf_sample(args):
         'contexts': ctx_i,
         'mu_kal_pred': mu_pred_i,
         'sigma_kal_pred': sigma_pred_i,
+        'per_ctx_mu_kal_pred': per_ctx_mu_i,
+        'per_ctx_sigma_kal_pred': per_ctx_sigma_i,
         'pars': pars_i,
         'perf': float(mse_i),
         'n_ctx': n_ctx,
@@ -478,6 +496,8 @@ def aggregate_individual_benchmarks(benchmarkpath, N_ctx, gm_name, N_samples, su
         'contexts': np.stack([s['contexts'] for s in samples], axis=0) if samples[0]['contexts'] is not None else None,
         'mu_kal_pred': np.stack([s['mu_kal_pred'] for s in samples], axis=0),
         'sigma_kal_pred': np.stack([s['sigma_kal_pred'] for s in samples], axis=0),
+        'per_ctx_mu_kal_pred': np.stack([s['per_ctx_mu_kal_pred'] for s in samples], axis=0) if samples[0]['per_ctx_mu_kal_pred'] is not None else None,
+        'per_ctx_sigma_kal_pred': np.stack([s['per_ctx_sigma_kal_pred'] for s in samples], axis=0) if samples[0]['per_ctx_sigma_kal_pred'] is not None else None,
         'pars': {key: np.stack([s['pars'][key] for s in samples], axis=0) for key in samples[0]['pars'].keys()},
         'perf': np.array([s['perf'] for s in samples]),
         'n_ctx': samples[0]['n_ctx'],
@@ -674,12 +694,12 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
             with ProcessingPool(nodes=max_cores) as pool:
                 results = list(tqdm(
                     pool.imap(_process_single_kf_sample, args_list),
-                    total=N_samples, desc="KF fitting (parallel)", initial=start_sample
+                    total=len(args_list), desc="KF fitting (parallel)", initial=start_sample
                 ))
         else:
             results = [
                 _process_single_kf_sample(args)
-                for args in tqdm(args_list, desc="KF fitting", total=N_samples, initial=start_sample)
+                for args in tqdm(args_list, desc="KF fitting", total=len(args_list), initial=start_sample)
             ]
 
     # --- Assemble benchmark_kit ---
@@ -694,6 +714,8 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
             'contexts': np.stack([s['contexts'] for s in results]) if results[0]['contexts'] is not None else None,
             'mu_kal_pred': np.stack([s['mu_kal_pred'] for s in results]),
             'sigma_kal_pred': np.stack([s['sigma_kal_pred'] for s in results]),
+            'per_ctx_mu_kal_pred': np.stack([s['per_ctx_mu_kal_pred'] for s in results]) if results[0]['per_ctx_mu_kal_pred'] is not None else None,
+            'per_ctx_sigma_kal_pred': np.stack([s['per_ctx_sigma_kal_pred'] for s in results]) if results[0]['per_ctx_sigma_kal_pred'] is not None else None,
             'pars': {key: np.stack([s['pars'][key] for s in results]) for key in results[0]['pars'].keys()},
             'perf': np.array([s['perf'] for s in results]),
             'n_ctx': N_ctx,
@@ -707,9 +729,9 @@ def compute_benchmarks(data_config, N_ctx, gm_name, N_samples=None, n_iter=5, be
 
     return benchmark_kit
 
-def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_cores=None, benchmark_mode='both', suffix_tag=''):
+def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visualize=True, max_cores=None, suffix_tag=''):
     """
-    Load precomputed benchmarks if available, otherwise compute and save them.
+    Load precomputed test benchmarks if available, otherwise compute and save them.
     
     Supports resuming from partial individual computation if the job was interrupted.
     
@@ -721,69 +743,39 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
         visualize: Whether to visualize parameter distributions for newly computed benchmarks
         max_cores: Number of parallel cores for KF fitting. None or 1 = sequential, 
                      >1 = parallel with that many cores, -1 = use all CPU cores.
-        benchmark_mode: Which benchmarks to compute. Options:
-                       'both' (default): Compute/load both train and test benchmarks
-                       'test_only': Compute/load only test benchmarks (train=None)
-                       'train_only': Compute/load only train benchmarks (test=None)
         suffix_tag: Optional string appended to file/dir suffixes (e.g. 'unit_test')
                     to produce distinct benchmark files without overwriting existing ones.
     
     Returns:
-        tuple: (benchmarks_train, benchmarks_test) - either may be None based on benchmark_mode
+        benchmarks_test: Test benchmarks dictionary
     """
     benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
     tag = f'_{suffix_tag}' if suffix_tag else ''
-    suffix_train = f'train{tag}'
     suffix_test = f'test{tag}'
-    benchmarkfile_train = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_train)
     benchmarkfile_test = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_test)
     
     # Check for individual directories (partial computation from previous interrupted run)
-    incr_dir_train = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_train)
     incr_dir_test = benchmark_individual_dir(benchmarkpath, N_ctx, gm_name, model_config['batch_size_test'], suffix=suffix_test)
 
-    # Determine which benchmarks to compute based on mode
-    compute_train = benchmark_mode in ['both', 'train_only']
-    compute_test = benchmark_mode in ['both', 'test_only']
-    
-    benchmarks_train = None
     benchmarks_test = None
     
-    # Handle training benchmarks
-    if compute_train:
-        if benchmarkfile_train.exists():
-            print(f"Loading precomputed training benchmarks from {benchmarkfile_train}")
-            with open(benchmarkfile_train, 'rb') as f:
-                benchmarks_train = pickle.load(f)
-        else:
-            has_partial_train = incr_dir_train.exists() and len(list(incr_dir_train.glob("sample_*.pkl"))) > 0
-            if has_partial_train:
-                print(f"Found partial training benchmarks in {incr_dir_train}, resuming...")
-            else:
-                print(f"Computing training benchmarks (will save to {benchmarkfile_train})...")
-            print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-            benchmarks_train = compute_benchmarks(data_config, N_ctx, gm_name, n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix=suffix_train, individual=True, max_cores=max_cores)
-            if visualize:
-                benchmarks_pars_viz(benchmarks_train, data_config, N_ctx, gm_name, suffix=suffix_train)
-    
     # Handle test benchmarks
-    if compute_test:
-        if benchmarkfile_test.exists():
-            print(f"Loading precomputed test benchmarks from {benchmarkfile_test}")
-            with open(benchmarkfile_test, 'rb') as f:
-                benchmarks_test = pickle.load(f)
+    if benchmarkfile_test.exists():
+        print(f"Loading precomputed test benchmarks from {benchmarkfile_test}")
+        with open(benchmarkfile_test, 'rb') as f:
+            benchmarks_test = pickle.load(f)
+    else:
+        has_partial_test = incr_dir_test.exists() and len(list(incr_dir_test.glob("sample_*.pkl"))) > 0
+        if has_partial_test:
+            print(f"Found partial test benchmarks in {incr_dir_test}, resuming...")
         else:
-            has_partial_test = incr_dir_test.exists() and len(list(incr_dir_test.glob("sample_*.pkl"))) > 0
-            if has_partial_test:
-                print(f"Found partial test benchmarks in {incr_dir_test}, resuming...")
-            else:
-                print(f"Computing test benchmarks (will save to {benchmarkfile_test})...")
-            print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
-            benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix=suffix_test, individual=True, max_cores=max_cores)
-            if visualize:
-                benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix=suffix_test)
+            print(f"Computing test benchmarks (will save to {benchmarkfile_test})...")
+        print(f"  Using {'context-aware' if N_ctx > 1 else 'standard'} Kalman filter (N_ctx={N_ctx})")
+        benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix=suffix_test, individual=True, max_cores=max_cores)
+        if visualize:
+            benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix=suffix_test)
     
-    return benchmarks_train, benchmarks_test
+    return benchmarks_test
 
 
 # =============================================================================
@@ -1140,8 +1132,9 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         trial_labels = [str(start_trial + t) for t in range(0, n_trials, label_interval)]
         ax_obs.set_xticks(trial_ticks)
         ax_obs.set_xticklabels(trial_labels)
-        ax_obs.set_xlabel('trial')
     
+    ax_obs.set_xlabel('')
+    ax_obs.set_ylabel('observations process')
     ax_obs.spines['top'].set_visible(False)
     ax_obs.spines['right'].set_visible(False)
 

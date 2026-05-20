@@ -65,38 +65,34 @@ from pipeline_core_v2 import (
 def run_benchmarks(
     data_config: DataConfig,
     training_config: TrainingConfig,
-    benchmark_mode: str = 'both',
     visualize: bool = True,
     verbose: bool = True,
     suffix_tag: str = '',
 ):
     """
-    Compute Kalman filter benchmarks only (no model training/testing).
+    Compute Kalman filter test benchmarks only (no model training/testing).
     
     This is useful for:
-    - Pre-computing expensive benchmarks before running training
+    - Pre-computing expensive test benchmarks before evaluating trained models
     - Analyzing Kalman filter performance on different data configurations
     - Generating benchmark visualizations
     
     Args:
         data_config: Data configuration object
         training_config: Training configuration object (for batch sizes)
-        benchmark_mode: 'both', 'train_only', or 'test_only'
         visualize: If True, generate parameter distribution plots
         verbose: If True, print progress information
         suffix_tag: Optional tag appended to benchmark filenames
     
     Returns:
-        Tuple of (benchmarks_train, benchmarks_test) dictionaries
+        Test benchmarks dictionary
     """
     if verbose:
         print("\n" + "=" * 70)
-        print("BENCHMARK COMPUTATION")
+        print("BENCHMARK COMPUTATION (TEST DATA)")
         print("=" * 70)
         print(f"N_ctx: {data_config.N_ctx}, GM: {data_config.gm_name}")
-        print(f"Batch size (train): {training_config.batch_size}")
         print(f"Batch size (test): {training_config.batch_size_test}")
-        print(f"Mode: {benchmark_mode}")
         print(f"Max cores: {data_config.max_cores}")
         print("=" * 70)
     
@@ -107,29 +103,25 @@ def run_benchmarks(
     }
     data_config_dict = data_config.to_gm_dict(training_config.batch_size)
     
-    benchmarks_train, benchmarks_test = load_or_compute_benchmarks(
+    benchmarks_test = load_or_compute_benchmarks(
         data_config_dict,
         model_config,
         data_config.N_ctx,
         data_config.gm_name,
         visualize=visualize,
         max_cores=data_config.max_cores,
-        benchmark_mode=benchmark_mode,
         suffix_tag=suffix_tag,
     )
     
     if verbose:
         print("\n" + "=" * 70)
         print("BENCHMARK COMPUTATION COMPLETE")
-        if benchmarks_train is not None:
-            print(f"Train benchmarks: {benchmarks_train['y'].shape[0]} samples")
-            print(f"  KF MSE (mean): {benchmarks_train['perf'].mean():.4f}")
         if benchmarks_test is not None:
             print(f"Test benchmarks: {benchmarks_test['y'].shape[0]} samples")
             print(f"  KF MSE (mean): {benchmarks_test['perf'].mean():.4f}")
         print("=" * 70)
     
-    return benchmarks_train, benchmarks_test
+    return benchmarks_test
 
 
 # =============================================================================
@@ -174,16 +166,15 @@ def run_pipeline(
             print(f"Run ID: {hp_grid.run_id}")
         print("=" * 70)
     
-    # ========== STEP 2: COMPUTE BENCHMARKS ==========
+    # ========== STEP 2: COMPUTE/LOAD BENCHMARKS ==========
     if skip_benchmarks:
         if verbose:
             print("\nSkipping benchmarks (skip_benchmarks=True)")
-        benchmarks_train = None
         benchmarks_test = None
     else:
         if verbose:
             print("\n" + "-" * 40)
-            print("STEP 1: Computing/loading benchmarks")
+            print("STEP 1: Computing/loading test benchmarks")
             print("-" * 40)
         
         # Build model_config and data_config dicts for backward compatibility
@@ -194,14 +185,13 @@ def run_pipeline(
         }
         data_config = hp_grid.data.to_gm_dict(hp_grid.training.batch_size)
         
-        benchmarks_train, benchmarks_test = load_or_compute_benchmarks(
+        benchmarks_test = load_or_compute_benchmarks(
             data_config,
             model_config,
             hp_grid.data.N_ctx,
             hp_grid.data.gm_name,
             visualize=True,
             max_cores=hp_grid.data.max_cores,
-            benchmark_mode='both',
         )
     
     # ========== STEP 3: RUN EACH CONFIG ==========
@@ -218,7 +208,7 @@ def run_pipeline(
         
         result = run_single_config(
             config,
-            benchmarks_train=benchmarks_train,
+            benchmarks_train=None,
             benchmarks_test=benchmarks_test,
             train_only=train_only,
             test_only=test_only,
@@ -268,9 +258,6 @@ Examples:
                         help='Skip Kalman filter benchmark computation')
     parser.add_argument('--benchmark_only', action='store_true',
                         help='Only compute benchmarks (no training/testing)')
-    parser.add_argument('--benchmark_mode', type=str, default='both',
-                        choices=['both', 'train_only', 'test_only'],
-                        help='Which benchmarks to compute (default: both)')
     parser.add_argument('--benchmark_tag', type=str, default='',
                         help='Optional tag appended to benchmark file/dir names to avoid '
                              'overwriting existing files (e.g. "unit_test")')
@@ -345,6 +332,29 @@ def main():
         N_tones=training.batch_size,  # Sequence length matches batch size
     )
     
+    # Apply HierarchicalGM-specific defaults if needed
+    if args.gm_name == 'HierarchicalGM':
+        import numpy as np
+        data = DataConfig(
+            gm_name='HierarchicalGM',
+            N_ctx=args.n_ctx,
+            N_tones=training.batch_size,
+            # HierarchicalGM-specific parameters
+            si_d_coef=0.05,
+            d_bounds={'high': 4, 'low': 0.1},
+            mu_d=2,
+            N_blocks=125,
+            rules_dpos_set=np.array([[3, 4, 5], [5, 6, 7]]),
+            mu_rho_rules=0.9,
+            si_rho_rules=0.05,
+            si_lim=5,
+            mu_tau_bounds={'low': 1, 'high': 250},
+            si_stat_bounds={'low': 0.1, 'high': 2},
+            si_r_bounds={'low': 0.1, 'high': 2},
+            p_cues=np.array([0.8, 0.2]),
+            cues_set=[0, 1],
+        )
+    
     # =========================================================================
     # BENCHMARK-ONLY MODE: Early exit, no model grid needed
     # =========================================================================
@@ -352,7 +362,6 @@ def main():
         run_benchmarks(
             data_config=data,
             training_config=training,
-            benchmark_mode=args.benchmark_mode,
             visualize=True,
             suffix_tag=args.benchmark_tag,
         )

@@ -106,11 +106,13 @@ class DataConfig:
     max_cores: Optional[int] = None
     
     def __post_init__(self):
-        # Auto-detect max_cores if not set
+        # Auto-detect max_cores based on HPC environment
+        # Only use parallel processing when running on SLURM cluster
+        # Default to sequential (1 core) for local/terminal runs
         if self.max_cores is None:
             slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
             object.__setattr__(self, 'max_cores', 
-                int(slurm_cpus) if slurm_cpus else max(1, cpu_count() // 2))
+                int(slurm_cpus) if slurm_cpus else 1)
     
     @property
     def data_mode(self) -> DataMode:
