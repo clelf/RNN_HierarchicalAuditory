@@ -28,6 +28,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from tqdm import tqdm
 import pickle
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
@@ -1024,7 +1025,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 contexts=None, contexts_prob=None, contexts_pred=None,
                 preds_aligned=False, shared_ylim=False, ylim=None, kal_x_start=None,
                 dpos_true=None, dpos_pred=None, dpos_prob=None, rule_true=None, rule_pred=None, rule_prob=None, cues=None,
-                ctx_colors=None, dpos_colors=None, rule_colors=None, cue_colors=None):
+                ctx_colors=None, dpos_colors=None, rule_colors=None, cue_colors=None, x_offset=0, N_tones=None):
     """
     Plot a single observation sequence with model and optional Kalman filter predictions.
     
@@ -1054,6 +1055,9 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         rule_true: True rules, shape (N, T)
         rule_prob: Predicted rule probabilities, shape (N, T, N_rules)
     """
+    # Remove padding
+    mpl.rcParams['savefig.pad_inches'] = 0
+    
     # Decide whether to use context panel (with optional dpos and rule tracks)
     use_ctx_panel = n_ctx > 1 and (contexts is not None or contexts_prob is not None or contexts_pred is not None or dpos_true is not None or dpos_prob is not None or rule_true is not None or rule_prob is not None or cues is not None)
 
@@ -1081,30 +1085,31 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
 
     # ── top subplot: observations + predictions ──────────────────────────
     # Plot obs line in blue
-    ax_obs.plot(range(len(obs[i])), obs[i], color='tab:blue', label='y_obs', alpha=0.8, linestyle='None', marker='.', markersize=4)
+    obs_x = x_offset + np.arange(len(obs[i]))
+    ax_obs.plot(obs_x, obs[i], color='tab:blue', label='y_obs', alpha=0.8, linestyle='-', marker='o', markersize=5)
     
     # Overlay red dots only at deviant context positions
     if contexts is not None:
         deviant_indices = np.where(contexts[i])[0]
         if len(deviant_indices) > 0:
-            ax_obs.plot(deviant_indices, obs[i][deviant_indices], color='tab:red', linestyle='None', marker='.', markersize=4, label='deviant')
+            ax_obs.plot(x_offset + deviant_indices, obs[i][deviant_indices], color='tab:red', linestyle='None', marker='o', markersize=5, label='deviant')
 
     # When preds_aligned, predictions cover the same x-range as obs;
     # otherwise they start one step later (no prediction for the first obs).
     if preds_aligned:
-        estim_x = range(len(obs[i]))
+        estim_x = x_offset + np.arange(len(obs[i]))
     else:
-        estim_x = range(1, len(obs[i]))
-    ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)', linestyle='--', marker='.', markersize=1)
+        estim_x = x_offset + np.arange(1, len(obs[i]))
+    ax_obs.plot(estim_x, mu_estim[i], color='k', label='y_hat (model pred)', linestyle='-', marker='o', markersize=5, markerfacecolor="None")
     ax_obs.fill_between(estim_x, mu_estim[i]-sigma_estim[i], mu_estim[i]+sigma_estim[i], color='k', alpha=0.2, label='std (model)')
 
     if kalman_mu is not None and kalman_sigma is not None:
-        kal_x = range(kal_x_start, kal_x_start + len(kalman_mu[i]))
+        kal_x = x_offset + np.arange(kal_x_start, kal_x_start + len(kalman_mu[i]))
         ax_obs.plot(kal_x, kalman_mu[i], label='y_kal (KF pred)', color='green', alpha=0.8)
         ax_obs.fill_between(kal_x, kalman_mu[i]-kalman_sigma[i], kalman_mu[i]+kalman_sigma[i], color='green', alpha=0.2, label='std (KF)')
     
     if hidden_states is not None:
-        ax_obs.plot(range(len(hidden_states[i])), hidden_states[i, :], label='hidden state', color='orange', alpha=0.8)
+        ax_obs.plot(x_offset + np.arange(len(hidden_states[i])), hidden_states[i, :], label='hidden state', color='orange', alpha=0.8)
 
     # # context switch vertical lines on the obs panel
     # if n_ctx > 1 and contexts is not None:
@@ -1118,6 +1123,27 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         ax_obs.tick_params(labelbottom=False)  # x labels only on bottom panel
     else:
         ax_obs.set_xlabel('time step')
+    
+    # Remove white padding: set explicit x-axis limits and remove automatic margins
+    ax_obs.set_xlim(x_offset - 0.5, x_offset + len(obs[i]) - 0.5)
+    ax_obs.margins(x=0)
+    
+    # Set trial-based x-axis ticks if N_tones is provided
+    if N_tones is not None and N_tones > 0:
+        n_timesteps = len(obs[i])
+        n_trials = (n_timesteps + N_tones - 1) // N_tones  # ceiling division
+        # Auto-detect label interval: label every trial if < 50 trials, else every 8 trials
+        label_interval = 1 if n_trials < 50 else 8
+        # Compute tick positions (at start of each labeled trial)
+        start_trial = x_offset // N_tones  # First trial number in this window
+        trial_ticks = [x_offset + t * N_tones for t in range(0, n_trials, label_interval)]
+        trial_labels = [str(start_trial + t) for t in range(0, n_trials, label_interval)]
+        ax_obs.set_xticks(trial_ticks)
+        ax_obs.set_xticklabels(trial_labels)
+        ax_obs.set_xlabel('trial')
+    
+    ax_obs.spines['top'].set_visible(False)
+    ax_obs.spines['right'].set_visible(False)
 
     # ── bottom subplot: context lines (and optionally dpos, rule) ──────────────────
     if use_ctx_panel:
@@ -1161,7 +1187,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 cue_val = int(cue_indices[seg_start])
                 label = f'cue {cue_val}' if cue_val not in cue_labels_placed else None
                 cue_labels_placed.add(cue_val)
-                ax_ctx.hlines(ROW_CUES, seg_start, seg_end, colors=cue_colors[cue_val], linewidth=6, label=label)
+                ax_ctx.hlines(ROW_CUES, x_offset + seg_start, x_offset + seg_end, colors=cue_colors[cue_val], linewidth=6, label=label)
 
         if contexts_pred is not None:
             pred_labels_placed = set()
@@ -1171,7 +1197,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 alpha = float(contexts_prob[i][t, ctx_val])
                 label = f'ctx {ctx_val} pred' if ctx_val not in pred_labels_placed else None
                 pred_labels_placed.add(ctx_val)
-                ax_ctx.hlines(ROW_PRED, t + pred_x_off, t + pred_x_off + 1,
+                ax_ctx.hlines(ROW_PRED, x_offset + t + pred_x_off, x_offset + t + pred_x_off + 1,
                               colors=ctx_colors[ctx_val],
                               linewidth=6, alpha=alpha, label=label)
 
@@ -1183,7 +1209,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 ctx_val = int(contexts[i][seg_start])
                 label = f'ctx {ctx_val} (N={ctx_counts[ctx_val]})' if ctx_val not in ctx_labels_placed else None
                 ctx_labels_placed.add(ctx_val)
-                ax_ctx.hlines(ROW_TRUE, seg_start, seg_end, colors=ctx_colors[ctx_val], linewidth=6, label=label) # alpha=0.8, 
+                ax_ctx.hlines(ROW_TRUE, x_offset + seg_start, x_offset + seg_end, colors=ctx_colors[ctx_val], linewidth=6, label=label) # alpha=0.8, 
 
         # Plot dpos tracks
         if dpos_true is not None and dpos_pred is not None and dpos_prob is not None:
@@ -1195,7 +1221,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 alpha = float(dpos_pred_probs[t])
                 label = f'dpos {dpos_val} pred' if dpos_val not in dpos_labels_placed else None
                 dpos_labels_placed.add(dpos_val)
-                ax_ctx.hlines(ROW_DPOS_PRED, t + pred_x_off, t + pred_x_off + 1,
+                ax_ctx.hlines(ROW_DPOS_PRED, x_offset + t + pred_x_off, x_offset + t + pred_x_off + 1,
                               colors=dpos_colors[dpos_val], linewidth=6, alpha=alpha, label=label)
             
             true_dpos = dpos_true[i]
@@ -1205,7 +1231,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 dpos_val = int(true_dpos[seg_start])
                 label = f'dpos {dpos_val}' if dpos_val not in dpos_labels_placed else None
                 dpos_labels_placed.add(dpos_val)
-                ax_ctx.hlines(ROW_DPOS_TRUE, seg_start, seg_end, colors=dpos_colors[dpos_val], 
+                ax_ctx.hlines(ROW_DPOS_TRUE, x_offset + seg_start, x_offset + seg_end, colors=dpos_colors[dpos_val], 
                               linewidth=6, label=label) # alpha=0.8, 
 
         # Plot rule tracks
@@ -1218,7 +1244,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 alpha = float(rule_pred_probs[t])
                 label = f'rule {rule_val} pred' if rule_val not in rule_labels_placed else None
                 rule_labels_placed.add(rule_val)
-                ax_ctx.hlines(ROW_RULE_PRED, t + pred_x_off, t + pred_x_off + 1,
+                ax_ctx.hlines(ROW_RULE_PRED, x_offset + t + pred_x_off, x_offset + t + pred_x_off + 1,
                               colors=rule_colors[rule_val], linewidth=6, alpha=alpha, label=label)
             
             true_rule = rule_true[i]
@@ -1228,7 +1254,7 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
                 rule_val = int(true_rule[seg_start])
                 label = f'rule {rule_val}' if rule_val not in rule_labels_placed else None
                 rule_labels_placed.add(rule_val)
-                ax_ctx.hlines(ROW_RULE_TRUE, seg_start, seg_end, colors=rule_colors[rule_val], 
+                ax_ctx.hlines(ROW_RULE_TRUE, x_offset + seg_start, x_offset + seg_end, colors=rule_colors[rule_val], 
                               linewidth=6, label=label) # alpha=0.8, 
 
         # Adjust y-axis to fit all rows
@@ -1247,6 +1273,27 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         ax_ctx.set_yticklabels(yticklabels, fontsize=8)
         ax_ctx.invert_yaxis()  # Invert to show cues at the top
         ax_ctx.set_xlabel('time step')
+        
+        # Remove white padding: set explicit x-axis limits and remove automatic margins
+        ax_ctx.set_xlim(x_offset - 0.5, x_offset + len(obs[i]) - 0.5)
+        ax_ctx.margins(x=0)
+        
+        # Set trial-based x-axis ticks if N_tones is provided
+        if N_tones is not None and N_tones > 0:
+            n_timesteps = len(obs[i])
+            n_trials = (n_timesteps + N_tones - 1) // N_tones  # ceiling division
+            # Auto-detect label interval: label every trial if < 50 trials, else every 8 trials
+            label_interval = 1 if n_trials < 50 else 8
+            # Compute tick positions (at start of each labeled trial)
+            start_trial = x_offset // N_tones  # First trial number in this window
+            trial_ticks = [x_offset + t * N_tones for t in range(0, n_trials, label_interval)]
+            trial_labels = [str(start_trial + t) for t in range(0, n_trials, label_interval)]
+            ax_ctx.set_xticks(trial_ticks)
+            ax_ctx.set_xticklabels(trial_labels)
+            ax_ctx.set_xlabel('trial')
+
+        ax_ctx.spines['top'].set_visible(False)
+        ax_ctx.spines['right'].set_visible(False)
 
     # ── shared legend on the right (only selected labels) ────────────────
     # Collect labels to show: y_obs, y_hat, sigma, y_kal, and "ctx N (N=...)" from the ctx panel
@@ -1592,6 +1639,8 @@ def plot_samples(sample_metrics, save_path, title=None, params=None, seq_start=N
                 dpos_colors=dpos_colors,
                 rule_colors=rule_colors,
                 cue_colors=cue_colors,
+                x_offset=start_idx,
+                N_tones=data_config.get('N_tones'),
             )
 
 
