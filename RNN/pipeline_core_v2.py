@@ -1955,6 +1955,8 @@ def train_model(
             
             # Backward pass
             loss.backward()
+            # Clip gradients to prevent explosion (especially important for RNNs/hierarchical outputs)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             # Track weights after update
