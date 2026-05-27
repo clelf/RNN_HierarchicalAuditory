@@ -1078,13 +1078,13 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
     # ── top subplot: observations + predictions ──────────────────────────
     # Plot obs line in blue
     obs_x = x_offset + np.arange(len(obs[i]))
-    ax_obs.plot(obs_x, obs[i], color='tab:blue', label='y_obs', alpha=0.8, linestyle='-', marker='o', markersize=5)
+    ax_obs.plot(obs_x, obs[i], color='tab:blue', label='y (obs), std', alpha=0.8, linestyle='-', marker='o', markersize=5)
     
     # Overlay red dots only at deviant context positions
     if contexts is not None:
         deviant_indices = np.where(contexts[i])[0]
         if len(deviant_indices) > 0:
-            ax_obs.plot(x_offset + deviant_indices, obs[i][deviant_indices], color='tab:red', linestyle='None', marker='o', markersize=5, label='deviant')
+            ax_obs.plot(x_offset + deviant_indices, obs[i][deviant_indices], color='tab:red', linestyle='None', marker='o', markersize=5, label='y (obs), dev')
 
     # When preds_aligned, predictions cover the same x-range as obs;
     # otherwise they start one step later (no prediction for the first obs).
@@ -1289,8 +1289,8 @@ def plot_sample(id, i, obs, mu_estim, sigma_estim, save_path, n_ctx, title=None,
         ax_ctx.spines['right'].set_visible(False)
 
     # ── shared legend on the right (only selected labels) ────────────────
-    # Collect labels to show: y_obs, y_hat, sigma, y_kal, and "ctx N (N=...)" from the ctx panel
-    _LEGEND_KEEP = {'y_obs', 'y_hat (model pred)', 'std (model)', 'y_kal (KF pred)', 'std (KF)'}
+    # Collect labels to show: y_obs, y_hat, sigma, y_kal, deviant, and "ctx N (N=...)" from the ctx panel
+    _LEGEND_KEEP = {'y (obs), std', 'y (obs), dev', 'y_hat (model pred)', 'std (model)', 'y_kal (KF pred)', 'std (KF)'}
     handles, labels = [], []
     for ax in ([ax_obs, ax_ctx] if use_ctx_panel else [ax_obs]):
         if ax is None:
@@ -1879,7 +1879,7 @@ def train_model(
     """
     # ========== SETUP ==========
     device = config.device
-    save_path = Path(str(config.save_dir) + f'_lr{config.lr_id}')
+    save_path = Path(str(config.save_dir) + f'_lr{config.learning_rate}')
     os.makedirs(save_path / 'samples', exist_ok=True)
     
     # Optimizer
@@ -2017,7 +2017,7 @@ def train_model(
     print(f"Final - Train Loss: {np.mean(epoch_losses):.4f}, Valid Loss: {valid_metrics['loss']:.4f}")
     
     # Save model weights
-    torch.save(model.state_dict(), save_path / f'lr{config.lr_id}_weights.pth')
+    torch.save(model.state_dict(), save_path / f'lr{config.learning_rate}_weights.pth')
     
     # Save config for reproducibility and easy loading
     config_path = config.save()
@@ -2149,11 +2149,11 @@ def test_model(
     print(f"TESTING: {config.name}")
     print(f"{'='*60}")
     
-    save_path = Path(str(config.save_dir) + f'_lr{config.lr_id}')
+    save_path = Path(str(config.save_dir) + f'_lr{config.learning_rate}')
     device = config.device
     
     # Check model exists
-    weights_path = save_path / f'lr{config.lr_id}_weights.pth'
+    weights_path = save_path / f'lr{config.learning_rate}_weights.pth'
     if not weights_path.exists():
         raise FileNotFoundError(f"Model weights not found: {weights_path}")
     
@@ -2211,7 +2211,7 @@ def test_model(
             binned_df = map_binned_params_2_metrics(param_bins, y_aligned, mu_estim_aligned, pars, mu_kal=mu_kal)
         else:
             binned_df = map_binned_params_2_metrics(param_bins, y_np[:, 1:], mu_estim, pars)
-        binned_df.to_csv(save_path / f'test_binned_metrics_lr{config.lr_id}.csv', index=False)
+        binned_df.to_csv(save_path / f'test_binned_metrics_lr{config.learning_rate}.csv', index=False)
     
     print(f"Test MSE: {results['mse']:.4f}")
     if 'mse_model2kal' in results:
@@ -2227,7 +2227,7 @@ def test_model(
 def _log_batch(save_path, lr_id, lr, epoch, batch, loss, batch_loss, elapsed, step):
     """Log batch-level training info."""
     msg = f'LR: {lr:>6.0e}; epoch: {epoch:0>3}; batch: {batch:>3}; loss: {loss:>7.4f}; batch loss: {batch_loss:7.4f}; time: {elapsed:>.2f}; step: {step}'
-    with open(save_path / f'training_loss_lr{lr_id}.txt', 'a') as f:
+    with open(save_path / f'training_loss_lr{lr}.txt', 'a') as f:
         f.write(f'{msg}\n')
 
 
@@ -2236,7 +2236,7 @@ def _log_epoch(save_path, lr_id, lr, epoch, metrics, elapsed, step, has_benchmar
     msg = f"LR: {lr:>6.0e}; epoch: {epoch:>3}; mean var: {metrics['sigma_mean']:>7.2f}; mean MSE: {metrics['mse']:>7.2f}; time: {elapsed:>.2f}; step: {step}"
     if has_benchmarks and 'mse_model2kal' in metrics:
         msg += f"; Model-KF MSE: {metrics['mse_model2kal']:>7.2f}"
-    with open(save_path / f'training_log_lr{lr_id}.txt', 'a') as f:
+    with open(save_path / f'training_log_lr{lr}.txt', 'a') as f:
         f.write(f'{msg}\n')
 
 
@@ -2260,19 +2260,19 @@ def _save_validation_samples(metrics, config, epoch, title, benchmarks, save_pat
 
 def _save_training_plots(history, config, title, benchmarks, save_path):
     """Save end-of-training plots."""
-    lr_id = config.lr_id
+    lr = config.learning_rate
     
     # Loss curves
     plot_losses(
         history['train_steps'], history['valid_steps'],
         history['train_losses'], history['valid_losses'],
         'Training steps', 'Loss', title,
-        save_path / f'loss_trainvalid_lr{lr_id}.png'
+        save_path / f'loss_trainvalid_lr{lr}.png'
     )
     
     # Variance over epochs
     epoch_steps = list(range(len(history['valid_sigma'])))
-    plot_variance(epoch_steps, history['valid_sigma'], title, save_path / f'variance_valid_lr{lr_id}.png')
+    plot_variance(epoch_steps, history['valid_sigma'], title, save_path / f'variance_valid_lr{lr}.png')
     
     # MSE over epochs
     if benchmarks and history['model_kf_mse']:
@@ -2280,10 +2280,10 @@ def _save_training_plots(history, config, title, benchmarks, save_path):
         if hasattr(mse_kal, 'mean'):
             mse_kal = mse_kal.mean()
         plot_mse(epoch_steps, history['valid_mse'], title, 
-                 save_path / f'mse_valid_lr{lr_id}.png',
+                 save_path / f'mse_valid_lr{lr}.png',
                  mse_kal=mse_kal, model_mse_kal=history['model_kf_mse'])
     else:
-        plot_mse(epoch_steps, history['valid_mse'], title, save_path / f'mse_valid_lr{lr_id}.png')
+        plot_mse(epoch_steps, history['valid_mse'], title, save_path / f'mse_valid_lr{lr}.png')
     
     # Weight updates
     if history['weights_updates']:
@@ -2293,7 +2293,7 @@ def _save_training_plots(history, config, title, benchmarks, save_path):
             weights_updates,
             [f'param_{i}' for i in range(weights_updates.shape[0])],
             title,
-            save_path / f'weights_updates_lr{lr_id}.png'
+            save_path / f'weights_updates_lr{lr}.png'
         )
 
 
