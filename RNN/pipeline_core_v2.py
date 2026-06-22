@@ -1583,11 +1583,38 @@ def plot_samples(sample_metrics, save_path, title=None, params=None, seq_start=N
 
         # Get color mappings for dpos and rule
         if dpos_true is not None or dpos_pred is not None:
-            dpos_colors = _get_dpos_color_map()
-        else: dpos_colors = None
+            # Determine actual min/max dpos values from the data to create proper color map
+            dpos_values = []
+            if dpos_true is not None:
+                dpos_values.extend(np.unique(dpos_true[dpos_true >= 0]).astype(int))
+            if dpos_pred is not None:
+                dpos_values.extend(np.unique(dpos_pred[dpos_pred >= 0]).astype(int))
+            
+            if dpos_values:
+                dpos_values = np.unique(dpos_values)
+                dpos_id_min = int(np.min(dpos_values))
+                dpos_n_classes = int(np.max(dpos_values) - dpos_id_min + 1)
+                dpos_colors = _get_dpos_color_map(n_dpos_classes=dpos_n_classes, id_min=dpos_id_min)
+            else:
+                dpos_colors = _get_dpos_color_map()
+        else: 
+            dpos_colors = None
         if rule_true is not None or rule_pred is not None:
-            rule_colors = _get_rule_color_map()
-        else: rule_colors = None
+            # Determine actual min/max rule values from the data to create proper color map
+            rule_values = []
+            if rule_true is not None:
+                rule_values.extend(np.unique(rule_true[rule_true >= 0]).astype(int))
+            if rule_pred is not None:
+                rule_values.extend(np.unique(rule_pred[rule_pred >= 0]).astype(int))
+            
+            if rule_values:
+                rule_values = np.unique(rule_values)
+                rule_n_classes = int(np.max(rule_values) + 1)  # rules typically start from 0
+                rule_colors = _get_rule_color_map(n_rule_classes=rule_n_classes)
+            else:
+                rule_colors = _get_rule_color_map()
+        else: 
+            rule_colors = None
 
         # Get color mapping for cues (Accent colormap, starting from index 1)
         if cues is not None:
@@ -1976,7 +2003,7 @@ def train_model(
                 history['train_losses'].append(loss.item())
                 
                 _log_batch(
-                    save_path, config.lr_id, config.learning_rate,
+                    save_path, config.learning_rate,
                     epoch, batch_idx, loss.item(),
                     np.mean(epoch_losses[-batch_res:]),
                     time.time() - t_start,
@@ -2008,7 +2035,7 @@ def train_model(
         
         # Epoch logging
         _log_epoch(
-            save_path, config.lr_id, config.learning_rate,
+            save_path, config.learning_rate,
             epoch, valid_metrics, time.time() - t_start,
             (epoch + 1) * n_batches, benchmarks is not None
         )
@@ -2020,7 +2047,8 @@ def train_model(
     torch.save(model.state_dict(), save_path / f'lr{config.learning_rate}_weights.pth')
     
     # Save config for reproducibility and easy loading
-    config_path = config.save()
+    # Save to the same directory as the model weights (save_path with lr suffix)
+    config_path = config.save(save_path / 'config.json')
     print(f"Config saved to: {config_path}")
     
     # Save plots
@@ -2224,14 +2252,14 @@ def test_model(
 # Logging Helpers
 # =============================================================================
 
-def _log_batch(save_path, lr_id, lr, epoch, batch, loss, batch_loss, elapsed, step):
+def _log_batch(save_path, lr, epoch, batch, loss, batch_loss, elapsed, step):
     """Log batch-level training info."""
     msg = f'LR: {lr:>6.0e}; epoch: {epoch:0>3}; batch: {batch:>3}; loss: {loss:>7.4f}; batch loss: {batch_loss:7.4f}; time: {elapsed:>.2f}; step: {step}'
     with open(save_path / f'training_loss_lr{lr}.txt', 'a') as f:
         f.write(f'{msg}\n')
 
 
-def _log_epoch(save_path, lr_id, lr, epoch, metrics, elapsed, step, has_benchmarks):
+def _log_epoch(save_path, lr, epoch, metrics, elapsed, step, has_benchmarks):
     """Log epoch-level validation info."""
     msg = f"LR: {lr:>6.0e}; epoch: {epoch:>3}; mean var: {metrics['sigma_mean']:>7.2f}; mean MSE: {metrics['mse']:>7.2f}; time: {elapsed:>.2f}; step: {step}"
     if has_benchmarks and 'mse_model2kal' in metrics:
@@ -2251,7 +2279,7 @@ def _save_validation_samples(metrics, config, epoch, title, benchmarks, save_pat
         'title': title,
         'seq_start': -config.seq_len_viz if config.seq_len_viz is not None else None,
         'N_plots': 4,
-        'data_config': config.data.to_gm_dict(config.training.batch_size),
+        'data_config': config.data.to_gm_dict(config.training.batch_size), # TODO: What?
     }
     
     

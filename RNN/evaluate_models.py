@@ -196,6 +196,8 @@ def get_desired_order(results):
     obs = [mod for mod in results if results[mod]['learning_objective'] == 'obs']
     obs_ctx = [mod for mod in results if results[mod]['learning_objective'] == 'obs_ctx']
     ctx = [mod for mod in results if results[mod]['learning_objective'] == 'ctx']
+    # Handle any other objectives (e.g., 'all')
+    other = [mod for mod in results if results[mod]['learning_objective'] not in ['obs', 'obs_ctx', 'ctx']]
 
     # Sort obs by bottleneck_dim
     obs_sorted = sorted(obs, key=lambda mod: results[mod]['bottleneck_dim'])
@@ -203,9 +205,11 @@ def get_desired_order(results):
     obs_ctx_sorted = sorted(obs_ctx, key=lambda mod: (results[mod]['bottleneck_dim'], results[mod]['kappa']))
     # Sort ctx by bottleneck_dim
     ctx_sorted = sorted(ctx, key=lambda mod: results[mod]['bottleneck_dim'])
+    # Sort other by bottleneck_dim
+    other_sorted = sorted(other, key=lambda mod: results[mod]['bottleneck_dim'])
 
     # Concatenate in desired order
-    return obs_sorted + obs_ctx_sorted + ctx_sorted
+    return obs_sorted + obs_ctx_sorted + ctx_sorted + other_sorted
 
 
 
@@ -402,7 +406,7 @@ class ModelInfo:
             return cls._from_config_file(config_path, model_dir, weights_path)
         
         # Try to find legacy lr*_config.json files
-        config_files = list(model_dir.glob('lr*_config.json'))
+        config_files = list(model_dir.glob('*config*.json'))
         if config_files:
             # Use the first available config file
             fallback_config = config_files[0]
@@ -903,21 +907,19 @@ def measure_KS_stat(x, u, s):
 
 
 
-def compute_context_accuracy(contexts_true: np.ndarray, context_logits: np.ndarray,
+def compute_context_accuracy(contexts_true: np.ndarray, contexts_pred: np.ndarray,
                              reduce: bool = True) -> Union[np.ndarray, float]:
     """
-    Compute context inference accuracy.
+    Compute context inference accuracy using predicted labels.
     
     Args:
         contexts_true: True context labels (n_samples, seq_len)
-        context_logits: Model context output logits (n_samples, seq_len, n_ctx)
+        contexts_pred: Model context predictions (n_samples, seq_len) - argmax already applied
         reduce: If True, return scalar mean. If False, return per-sample accuracy (n_samples,)
     
     Returns:
         Scalar accuracy if reduce=True, else array of per-sample accuracy values.
     """
-    # Get predicted contexts (argmax over context dimension)
-    contexts_pred = np.argmax(context_logits, axis=-1)
     correct = (contexts_pred == contexts_true)
     
     if reduce:
@@ -927,30 +929,151 @@ def compute_context_accuracy(contexts_true: np.ndarray, context_logits: np.ndarr
         return np.mean(correct, axis=1)
 
 
-def compute_context_log_prob(contexts_true: np.ndarray, context_logits: np.ndarray,
-                             reduce: bool = True) -> Union[np.ndarray, float]:
+def compute_context_log_likelihood(contexts_true: np.ndarray, context_probs: np.ndarray,
+                                    reduce: bool = True) -> Union[np.ndarray, float]:
     """
-    Compute log-probability of true contexts.
+    Compute log-likelihood of true contexts given predicted probabilities.
+    
+    This is the log-likelihood of the true context labels under the categorical
+    distribution defined by the model's softmax probabilities.
     
     Args:
         contexts_true: True context labels (n_samples, seq_len)
-        context_logits: Model context output logits (n_samples, seq_len, n_ctx)
+        context_probs: Model context probabilities (n_samples, seq_len, n_ctx) - already softmax applied
+        reduce: If True, return scalar mean. If False, return per-sample log-likelihood (n_samples,)
+    
+    Returns:
+        Scalar mean log-likelihood if reduce=True, else array of per-sample values.
+    """
+    # Get probability of true context for each timestep
+    n_samples, seq_len = contexts_true.shape
+    true_probs = np.zeros((n_samples, seq_len))
+    
+    # Calculate minimum context index to handle non-zero-based indexing
+    ctx_min = contexts_true.min()
+    
+    for i in range(n_samples):
+        for t in range(seq_len):
+            true_ctx = contexts_true[i, t]
+            # Shift to 0-based index for probability array access
+            true_probs[i, t] = context_probs[i, t, true_ctx - ctx_min]
+    
+    # Compute log probability
+    log_probs = np.log(true_probs + 1e-10)  # Add small epsilon to avoid log(0)
+    
+    if reduce:
+        return float(np.mean(log_probs))
+    else:
+        # Mean over sequence dimension, keep sample dimension
+        return np.mean(log_probs, axis=1)
+
+
+def compute_dpos_accuracy(dpos_true: np.ndarray, dpos_pred: np.ndarray,
+                          reduce: bool = True) -> Union[np.ndarray, float]:
+    """
+    Compute deviant position inference accuracy using predicted labels.
+    
+    Args:
+        dpos_true: True dpos labels (n_samples, seq_len)
+        dpos_pred: Model dpos predictions (n_samples, seq_len) - argmax already applied
+        reduce: If True, return scalar mean. If False, return per-sample accuracy (n_samples,)
+    
+    Returns:
+        Scalar accuracy if reduce=True, else array of per-sample accuracy values.
+    """
+    correct = (dpos_pred == dpos_true)
+    
+    if reduce:
+        return float(np.mean(correct))
+    else:
+        # Mean over sequence dimension, keep sample dimension
+        return np.mean(correct, axis=1)
+
+
+def compute_dpos_log_prob(dpos_true: np.ndarray, dpos_probs: np.ndarray,
+                          reduce: bool = True) -> Union[np.ndarray, float]:
+    """
+    Compute log-probability of true deviant positions (dpos).
+    
+    Args:
+        dpos_true: True dpos labels (n_samples, seq_len)
+        dpos_probs: Model dpos probabilities (n_samples, seq_len, n_dpos) - already softmax applied
         reduce: If True, return scalar mean. If False, return per-sample log-prob (n_samples,)
     
     Returns:
         Scalar mean log-probability if reduce=True, else array of per-sample values.
     """
-    # Apply softmax to get probabilities
-    context_probs = F.softmax(torch.tensor(context_logits), dim=-1).numpy()
-    
-    # Get probability of true context for each timestep
-    n_samples, seq_len = contexts_true.shape
+    # Get probability of true dpos for each timestep
+    n_samples, seq_len = dpos_true.shape
     true_probs = np.zeros((n_samples, seq_len))
+    
+    # Calculate minimum dpos index to handle non-zero-based indexing
+    # (e.g., dpos_true contains [3, 4, 5, 6, 7] but dpos_probs is indexed [0, 1, 2, 3, 4])
+    dpos_min = dpos_true.min()
     
     for i in range(n_samples):
         for t in range(seq_len):
-            true_ctx = contexts_true[i, t]
-            true_probs[i, t] = context_probs[i, t, true_ctx]
+            true_dpos = dpos_true[i, t]
+            # Shift to 0-based index for probability array access
+            true_probs[i, t] = dpos_probs[i, t, int(true_dpos - dpos_min)]
+    
+    # Compute log probability
+    log_probs = np.log(true_probs + 1e-10)  # Add small epsilon to avoid log(0)
+    
+    if reduce:
+        return float(np.mean(log_probs))
+    else:
+        # Mean over sequence dimension, keep sample dimension
+        return np.mean(log_probs, axis=1)
+
+
+def compute_rule_accuracy(rules_true: np.ndarray, rules_pred: np.ndarray,
+                          reduce: bool = True) -> Union[np.ndarray, float]:
+    """
+    Compute rule inference accuracy using predicted labels.
+    
+    Args:
+        rules_true: True rule labels (n_samples, seq_len)
+        rules_pred: Model rule predictions (n_samples, seq_len) - argmax already applied
+        reduce: If True, return scalar mean. If False, return per-sample accuracy (n_samples,)
+    
+    Returns:
+        Scalar accuracy if reduce=True, else array of per-sample accuracy values.
+    """
+    correct = (rules_pred == rules_true)
+    
+    if reduce:
+        return float(np.mean(correct))
+    else:
+        # Mean over sequence dimension, keep sample dimension
+        return np.mean(correct, axis=1)
+
+
+def compute_rule_log_prob(rules_true: np.ndarray, rule_probs: np.ndarray,
+                          reduce: bool = True) -> Union[np.ndarray, float]:
+    """
+    Compute log-probability of true rules.
+    
+    Args:
+        rules_true: True rule labels (n_samples, seq_len)
+        rule_probs: Model rule probabilities (n_samples, seq_len, n_rules) - already softmax applied
+        reduce: If True, return scalar mean. If False, return per-sample log-prob (n_samples,)
+    
+    Returns:
+        Scalar mean log-probability if reduce=True, else array of per-sample values.
+    """
+    # Get probability of true rule for each timestep
+    n_samples, seq_len = rules_true.shape
+    true_probs = np.zeros((n_samples, seq_len))
+    
+    # Calculate minimum rule index to handle non-zero-based indexing
+    rule_min = rules_true.min()
+    
+    for i in range(n_samples):
+        for t in range(seq_len):
+            true_rule = rules_true[i, t]
+            # Shift to 0-based index for probability array access
+            true_probs[i, t] = rule_probs[i, t, int(true_rule - rule_min)]
     
     # Compute log probability
     log_probs = np.log(true_probs + 1e-10)  # Add small epsilon to avoid log(0)
@@ -1001,6 +1124,8 @@ def evaluate_model(
     y = test_data['y']
     y_np = test_data['y_np']
     contexts_np = test_data.get('contexts_np')
+    dpos_np = test_data.get('dpos_np')
+    rules_np = test_data.get('rules_np')
     q = test_data.get('q')
 
     # Forward pass
@@ -1014,8 +1139,13 @@ def evaluate_model(
         predictions = get_model_predictions(model, model_output)
         mu_pred = predictions['mu_estim']
         var_pred = predictions['var_estim']
-        # Extract raw logits from output (for context_accuracy and context_log_prob functions)
-        context_output = predictions['output']['ctx'] if 'output' in predictions else None
+        # Extract softmax-applied probabilities and argmax predictions
+        ctx_prob = predictions['ctx_prob']  # (n_samples, seq_len, n_ctx) or None
+        ctx_pred = predictions['ctx_pred']  # (n_samples, seq_len) or None
+        dpos_prob = predictions['dpos_prob']  # (n_samples, seq_len, n_dpos) or None
+        dpos_pred = predictions['dpos_pred']  # (n_samples, seq_len) or None
+        rule_prob = predictions['rule_prob']  # (n_samples, seq_len, n_rules) or None
+        rule_pred = predictions['rule_pred']  # (n_samples, seq_len) or None
     
     # Target is y[1:] (predicting next observation)
     y_target = y_np[:, 1:]
@@ -1029,15 +1159,25 @@ def evaluate_model(
         mu_pred   = mu_pred[:, start:]
         var_pred  = var_pred[:, start:]
         y_target  = y_target[:, start:]   # y_target[:,start:] == y_np[:,min_obs_for_em:]
-        if context_output is not None:
-            # context_output shape: (N, T-1, n_ctx); same slicing as predictions
-            context_output_np = context_output.detach().cpu().numpy()[:, start:, :]
+        if ctx_prob is not None:
+            ctx_prob = ctx_prob[:, start:, :]
+            ctx_pred = ctx_pred[:, start:]
         # contexts_np[:,1:] aligned; slice the same way for context targets
         contexts_np_aligned = contexts_np[:, min_obs_for_em:] if contexts_np is not None else None
+        if dpos_prob is not None:
+            dpos_prob = dpos_prob[:, start:, :]
+            dpos_pred = dpos_pred[:, start:]
+        # dpos_np[:,1:] aligned; slice the same way for dpos targets
+        dpos_np_aligned = dpos_np[:, min_obs_for_em:] if dpos_np is not None else None
+        if rule_prob is not None:
+            rule_prob = rule_prob[:, start:, :]
+            rule_pred = rule_pred[:, start:]
+        # rules_np[:,1:] aligned; slice the same way for rule targets
+        rules_np_aligned = rules_np[:, min_obs_for_em:] if rules_np is not None else None
     else:
-        if context_output is not None:
-            context_output_np = context_output.detach().cpu().numpy()
         contexts_np_aligned = contexts_np[:, 1:] if contexts_np is not None else None
+        dpos_np_aligned = dpos_np[:, 1:] if dpos_np is not None else None
+        rules_np_aligned = rules_np[:, 1:] if rules_np is not None else None
     
     # Compute observation metrics
     results = {
@@ -1055,7 +1195,7 @@ def evaluate_model(
     results['mse'] = compute_mse(y_target, mu_pred, reduce=reduce)
     
     # Log-likelihood
-    results['log_likelihood'] = compute_log_likelihood(y_target, mu_pred, var_pred, reduce=reduce)
+    results['obs_loglik'] = compute_log_likelihood(y_target, mu_pred, var_pred, reduce=reduce)
     
     # Calibration (KS statistic)
     if reduce:
@@ -1068,17 +1208,43 @@ def evaluate_model(
         results['ks_statistic'] = compute_calibration_ks(y_target, mu_pred, var_pred, reduce=False)
     
     # ModuleNetwork specific metrics
-    if info.model_type == 'module_network' and info.n_ctx > 1 and context_output is not None:
+    if info.model_type in ['module_network', 'population_network'] and info.n_ctx > 1 and ctx_pred is not None:
         
         # Context predictions – use pre-sliced arrays so timestep window matches y_target
-        context_logits = context_output_np
         contexts_target = contexts_np_aligned
         
-        # Context accuracy
-        results['context_accuracy'] = compute_context_accuracy(contexts_target, context_logits, reduce=reduce)
+        # Context accuracy (using predicted labels directly)
+        results['context_accuracy'] = compute_context_accuracy(contexts_target, ctx_pred, reduce=reduce)
         
-        # Context log-probability
-        results['context_log_prob'] = compute_context_log_prob(contexts_target, context_logits, reduce=reduce)
+        # Context log-likelihood (using probabilities)
+        results['context_loglik'] = compute_context_log_likelihood(contexts_target, ctx_prob, reduce=reduce)
+    
+    # PopulationNetwork specific metrics
+    if info.model_type == 'population_network':
+        # Context log-likelihood
+        if ctx_prob is not None and contexts_np_aligned is not None:
+            contexts_target = contexts_np_aligned
+            results['context_loglik'] = compute_context_log_likelihood(contexts_target, ctx_prob, reduce=reduce)
+        
+        # Dpos accuracy (using predicted labels directly)
+        if dpos_pred is not None and dpos_np_aligned is not None:
+            dpos_target = dpos_np_aligned
+            results['dpos_accuracy'] = compute_dpos_accuracy(dpos_target, dpos_pred, reduce=reduce)
+        
+        # Dpos log-likelihood (using probabilities)
+        if dpos_prob is not None and dpos_np_aligned is not None:
+            dpos_target = dpos_np_aligned
+            results['dpos_loglik'] = compute_dpos_log_prob(dpos_target, dpos_prob, reduce=reduce)
+        
+        # Rule accuracy (using predicted labels directly)
+        if rule_pred is not None and rules_np_aligned is not None:
+            rules_target = rules_np_aligned
+            results['rule_accuracy'] = compute_rule_accuracy(rules_target, rule_pred, reduce=reduce)
+        
+        # Rule log-likelihood (using probabilities)
+        if rule_prob is not None and rules_np_aligned is not None:
+            rules_target = rules_np_aligned
+            results['rule_loglik'] = compute_rule_log_prob(rules_target, rule_prob, reduce=reduce)
     
     return results
 
@@ -1237,8 +1403,9 @@ def assess_model_against_benchmarks(
         predictions = get_model_predictions(model, model_output)
         mu_model_full = predictions['mu_estim']
         var_model_full = predictions['var_estim']
-        # Extract raw logits from output (for context handling if needed)
-        context_output = predictions['output']['ctx'] if 'output' in predictions else None
+        # Extract softmax-applied probabilities and argmax predictions
+        ctx_prob = predictions['ctx_prob']
+        ctx_pred = predictions['ctx_pred']
     
     # Model predictions correspond to y[:, 1:] (predicting next observation)
     # Align with KF which starts from min_obs_for_em
@@ -1288,12 +1455,12 @@ def assess_model_against_benchmarks(
         ks_kf, ks_pval_kf = compute_calibration_ks(y_target_kf, mu_kf, var_kf, reduce=True)
         
         results['mse'] = mse_model
-        results['log_likelihood'] = ll_model
+        results['obs_loglik'] = ll_model
         results['ks_statistic'] = ks_model
         results['ks_pvalue'] = ks_pval_model
         
         results['mse_kf'] = mse_kf_computed
-        results['log_likelihood_kf'] = ll_kf
+        results['obs_loglik_kf'] = ll_kf
         results['ks_statistic_kf'] = ks_kf
         results['ks_pvalue_kf'] = ks_pval_kf
         
@@ -1302,7 +1469,7 @@ def assess_model_against_benchmarks(
         results['mse_ratio'] = mse_model / (mse_kf_computed + 1e-10)
         # ll_ratio > 1 means model is better (higher log-likelihood)
         # Use difference for log-likelihood since ratio of logs is less interpretable
-        results['log_likelihood_diff'] = ll_model - ll_kf
+        results['obs_loglik_diff'] = ll_model - ll_kf
         # ks_ratio < 1 means model is better calibrated
         results['ks_ratio'] = ks_model / (ks_kf + 1e-10)
     else:
@@ -1310,37 +1477,37 @@ def assess_model_against_benchmarks(
         ks_kf = compute_calibration_ks(y_target_kf, mu_kf, var_kf, reduce=False)
         
         results['mse'] = mse_model
-        results['log_likelihood'] = ll_model
+        results['obs_loglik'] = ll_model
         results['ks_statistic'] = ks_model
         
         results['mse_kf'] = mse_kf_computed
-        results['log_likelihood_kf'] = ll_kf
+        results['obs_loglik_kf'] = ll_kf
         results['ks_statistic_kf'] = ks_kf
         
         # Compute per-sample ratios
         results['mse_ratio'] = mse_model / (mse_kf_computed + 1e-10)
-        results['log_likelihood_diff'] = ll_model - ll_kf
+        results['obs_loglik_diff'] = ll_model - ll_kf
         results['ks_ratio'] = ks_model / (ks_kf + 1e-10)
     
     # --- Context Metrics (if applicable) ---
-    if info.model_type == 'module_network' and info.n_ctx > 1 and context_output is not None and contexts is not None:
+    if info.model_type in ['module_network', 'population_network'] and info.n_ctx > 1 and ctx_prob is not None and contexts is not None:
         results['learning_objective'] = info.learning_objective
         results['kappa'] = info.kappa
         results['bottleneck_dim'] = info.bottleneck_dim
         
-        # Context predictions aligned to evaluation range
-        context_logits_full = context_output.detach().cpu().numpy()
-        context_logits = context_logits_full[:, model_start_idx:model_start_idx + eval_len]
+        # Context probabilities and predictions aligned to evaluation range
+        ctx_prob_aligned = ctx_prob[:, model_start_idx:model_start_idx + eval_len]
+        ctx_pred_aligned = ctx_pred[:, model_start_idx:model_start_idx + eval_len]
         
         # True contexts for evaluation range
         # Context at time t corresponds to observation y[t]
         contexts_target = contexts[:, min_obs_for_em:min_obs_for_em + eval_len]
         
-        # Context accuracy
-        results['context_accuracy'] = compute_context_accuracy(contexts_target, context_logits, reduce=reduce)
+        # Context accuracy (using predicted labels directly)
+        results['context_accuracy'] = compute_context_accuracy(contexts_target, ctx_pred_aligned, reduce=reduce)
         
-        # Context log-probability
-        results['context_log_prob'] = compute_context_log_prob(contexts_target, context_logits, reduce=reduce)
+        # Context log-likelihood (using probabilities)
+        results['context_loglik'] = compute_context_log_likelihood(contexts_target, ctx_prob_aligned, reduce=reduce)
     
     return results
 
@@ -1447,7 +1614,7 @@ def assess_models_against_benchmarks(
         print("=" * 70)
         
         display_cols = ['model_type', 'hidden_dim', 'mse', 'mse_kf', 'mse_ratio', 
-                        'log_likelihood', 'log_likelihood_kf', 'ks_statistic', 'ks_ratio']
+                        'obs_loglik', 'obs_loglik_kf', 'ks_statistic', 'ks_ratio']
         if 'context_accuracy' in df.columns:
             display_cols.append('context_accuracy')
         
@@ -1629,9 +1796,9 @@ def evaluate_models(
         print("=" * 70)
         
         # Display key metrics
-        display_cols = ['model_type', 'hidden_dim', 'mse', 'log_likelihood', 'ks_statistic']
+        display_cols = ['model_type', 'hidden_dim', 'mse', 'obs_loglik', 'ks_statistic']
         if 'context_accuracy' in df.columns:
-            display_cols.extend(['context_accuracy', 'context_log_prob'])
+            display_cols.extend(['context_accuracy', 'context_loglik'])
         
         available_cols = [c for c in display_cols if c in df.columns]
         print(df[available_cols].to_string(index=False))

@@ -329,7 +329,7 @@ def main():
     data = DataConfig(
         gm_name=args.gm_name,
         N_ctx=args.n_ctx,
-        N_tones=training.batch_size,  # Sequence length matches batch size
+        N_tones=training.batch_size,  # Sequence length matches batch size # TODO: What???
     )
     
     # Apply HierarchicalGM-specific defaults if needed
@@ -338,7 +338,7 @@ def main():
         data = DataConfig(
             gm_name='HierarchicalGM',
             N_ctx=args.n_ctx,
-            N_tones=training.batch_size,
+            N_tones=training.batch_size, # TODO:What????
             # HierarchicalGM-specific parameters
             si_d_coef=0.05,
             d_bounds={'high': 4, 'low': 0.1},

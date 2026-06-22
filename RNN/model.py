@@ -418,7 +418,7 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         )        
 
 
-    def forward(self, x, q):
+    def forward(self, x, q, return_hidden=False):
         """
         Timestep-synchronous forward computation with bidirectional information flow.
         At each timestep t, the full forward+feedback cycle is executed before moving to t+1.
@@ -428,6 +428,16 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         - dpos:  input_dim=N_dpos,    output_dim=N_dpos
         - ctx:   input_dim=N_ctx,     output_dim=N_ctx
         - obs:   input_dim=obs_dim,   output_dim=2
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            Observations of shape (batch, seq_len, obs_dim)
+        q : torch.Tensor
+            Cues of shape (batch, seq_len, cue_dim)
+        return_hidden : bool, optional
+            If True, also return hidden states for all modules at each timestep.
+            Default is False for backward compatibility.
         """
         batch_size, seq_len, _ = x.size()
 
@@ -442,6 +452,13 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         ctx_outputs  = []
         dpos_outputs = []
         rule_outputs = []
+        
+        # Accumulators for hidden states across time (if requested)
+        if return_hidden:
+            obs_hidden_states  = []
+            ctx_hidden_states  = []
+            dpos_hidden_states = []
+            rule_hidden_states = []
 
         for t in range(seq_len):
             x_t = x[:, t:t+1, :]   # (batch, 1, obs_dim)   -- keeps 3-D shape for GRU
@@ -486,6 +503,13 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             ctx_outputs.append(posterior_ctx_output_ext)
             dpos_outputs.append(posterior_dpos_output_ext)
             rule_outputs.append(posterior_rule_output_ext)
+            
+            # Collect hidden states if requested
+            if return_hidden:
+                obs_hidden_states.append(obs_hx.detach())
+                ctx_hidden_states.append(ctx_hx.detach())
+                dpos_hidden_states.append(dpos_hx.detach())
+                rule_hidden_states.append(rule_hx.detach())
 
         # Stack along the time dimension → (batch, seq_len, output_dim)
         obs_outputs  = torch.cat(obs_outputs,  dim=1)
@@ -493,6 +517,17 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         dpos_outputs = torch.cat(dpos_outputs, dim=1)
         rule_outputs = torch.cat(rule_outputs, dim=1)
 
+        if return_hidden:
+            # Stack hidden states along time dimension
+            # Hidden states have shape (n_layers, batch, hidden_dim), stack along time gives (seq_len, n_layers, batch, hidden_dim)
+            obs_hidden_states  = torch.stack(obs_hidden_states,  dim=0)
+            ctx_hidden_states  = torch.stack(ctx_hidden_states,  dim=0)
+            dpos_hidden_states = torch.stack(dpos_hidden_states, dim=0)
+            rule_hidden_states = torch.stack(rule_hidden_states, dim=0)
+            
+            return (obs_outputs, ctx_outputs, dpos_outputs, rule_outputs,
+                    obs_hidden_states, ctx_hidden_states, dpos_hidden_states, rule_hidden_states)
+        
         return obs_outputs, ctx_outputs, dpos_outputs, rule_outputs
 
 

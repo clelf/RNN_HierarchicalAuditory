@@ -69,7 +69,7 @@ class ModelArchConfig:
 @dataclass(frozen=True)
 class DataConfig:
     """Data generation parameters."""
-    gm_name: GMType = 'NonHierarchicalGM'
+    gm_name: GMType = 'NonHierarchicalGM' # TODO: What?
     N_ctx: int = 1
     N_tones: int = 1000  # Sequence length
     N_blocks: int = 1
@@ -211,7 +211,7 @@ class RunConfig:
     model_type: ModelType
     hidden_dim: Optional[int] = None   # RNN hidden dimension (for RNN/VRNN, None for ModuleNetwork/PopulationNetwork)
     learning_rate: float = 0.01
-    lr_id: int = 0                     # Index for file naming
+    lr_id: int = None                     # Index for file naming
     
     # ModuleNetwork/PopulationNetwork-specific
     learning_objective: LearningObjective = 'all'
@@ -309,13 +309,13 @@ class RunConfig:
         Save config to JSON file.
         
         Args:
-            path: Optional path. If None, saves to save_dir/lr{lr_id}_config.json
+            path: Optional path. If None, saves to save_dir/lr{learning_rate}_config.json
         
         Returns:
             Path to saved config file.
         """
         if path is None:
-            path = self.save_dir / f'lr{self.lr_id}_config.json'
+            path = self.save_dir / f'lr{self.learning_rate}_config.json'
         
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
