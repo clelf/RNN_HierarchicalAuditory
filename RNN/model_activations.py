@@ -189,47 +189,78 @@ def compute_pairwise_sample_correlations(norms):
     return 0.0, 0.0
 
 
-def compute_intermodule_correlations(module_norms_dict, use_derivatives=False):
-    """Compute average pairwise correlations between modules.
-    
+def compute_pairwise_module_correlations(module_norms_dict, use_derivatives=False):
+    """Pearson correlation between every (unordered) pair of modules.
+
+    Parameters
+    ----------
+    module_norms_dict : dict
+        Keys are module names, values are norms arrays of shape (seq_len, batch)
+        (or 1D). Flattened across time and samples before correlating.
+    use_derivatives : bool
+        If True, correlate the temporal derivatives instead of the raw activity.
+
+    Returns
+    -------
+    dict mapping "<name_i>_<name_j>" -> Pearson r (float), for i < j in the
+    order the modules appear in `module_norms_dict`. A pair with a constant
+    (zero-variance) vector gets a correlation of 0.0 instead of NaN.
+    """
+    module_names = list(module_norms_dict.keys())
+    pair_correlations = {}
+
+    for i, name_i in enumerate(module_names):
+        for j, name_j in enumerate(module_names):
+            if i < j:
+                activity_i = module_norms_dict[name_i]
+                activity_j = module_norms_dict[name_j]
+
+                if use_derivatives:
+                    activity_i = compute_derivatives(activity_i)
+                    activity_j = compute_derivatives(activity_j)
+
+                flat_i = activity_i.reshape(-1)
+                flat_j = activity_j.reshape(-1)
+
+                # pearsonr is undefined for a constant input; treat that as no correlation.
+                if flat_i.std() == 0 or flat_j.std() == 0:
+                    corr = 0.0
+                else:
+                    corr = pearsonr(flat_i, flat_j)[0]
+
+                pair_correlations[f"{name_i}_{name_j}"] = float(corr)
+
+    return pair_correlations
+
+
+def compute_intermodule_correlations(module_norms_dict, use_derivatives=False, absolute=False):
+    """Average pairwise Pearson correlation between modules.
+
     Parameters
     ----------
     module_norms_dict : dict
         Keys are module names, values are norms arrays
     use_derivatives : bool
         If True, compute correlations on derivatives instead of raw activity
-    
+    absolute : bool
+        If True, average the absolute value of each pairwise correlation (a
+        redundancy/coupling-strength metric, where +0.8 and -0.8 both count as
+        strong). If False (default), average the signed correlations, so
+        positive and negative pairs can cancel.
+
     Returns
     -------
     float - average correlation between modules
     """
-    module_names = list(module_norms_dict.keys())
-    correlations = []
-    
-    for i, name_i in enumerate(module_names):
-        for j, name_j in enumerate(module_names):
-            if i < j:
-                # Get activity or derivatives
-                activity_i = module_norms_dict[name_i]
-                activity_j = module_norms_dict[name_j]
-                
-                if use_derivatives:
-                    activity_i = compute_derivatives(activity_i)
-                    activity_j = compute_derivatives(activity_j)
-                
-                # Flatten and normalize both modules
-                flat_i = activity_i.reshape(-1)
-                flat_j = activity_j.reshape(-1)
-                
-                flat_i_norm = (flat_i - flat_i.mean()) / (flat_i.std() + 1e-8)
-                flat_j_norm = (flat_j - flat_j.mean()) / (flat_j.std() + 1e-8)
-                
-                corr = np.mean(flat_i_norm * flat_j_norm)
-                correlations.append(corr)
-    
-    if correlations:
-        return np.mean(correlations)
-    return 0.0
+    pair_correlations = compute_pairwise_module_correlations(
+        module_norms_dict, use_derivatives=use_derivatives
+    )
+    values = list(pair_correlations.values())
+    if not values:
+        return 0.0
+    if absolute:
+        values = [abs(v) for v in values]
+    return float(np.mean(values))
 
 
 def extract_sample_parameters(pars, sample_idx):
