@@ -22,7 +22,10 @@ def load_trial_sequence(filepath):
     label_to_idx = {label: i for i, label in enumerate(CUE_LABELS)}
     cue_idx = np.vectorize(label_to_idx.get)(cue_raw)
     cue = np.eye(len(CUE_LABELS), dtype=np.float32)[cue_idx]  # (T, 2)
-    return obs, cue
+    lim_std = df['lim_std'].iloc[0]
+    d = df['d'].iloc[0]
+    tau_std = df['tau_std'].iloc[0]
+    return obs, cue, lim_std, d, tau_std
 
 
 def to_model_tensors(obs, cue):

@@ -45,7 +45,7 @@ def plot_score_histograms(df, output_path, bins=30):
     Every column except 'sequence_name' is treated as a score column; each gets
     its own histogram over all sequences.
     """
-    score_cols = [c for c in df.columns if c != 'sequence_name']
+    score_cols = [c for c in df.columns if ('norm' in c or 'deriv' in c)]
     n = len(score_cols)
     ncols = 3
     nrows = ceil(n / ncols)
@@ -87,7 +87,11 @@ if __name__ == '__main__':
         activity_dict = load_module_dict(df, 'norm')
         deriv_dict = load_module_dict(df, 'deriv')
 
-        row = {'sequence_name': csv_file.stem}
+        row = {'sequence_name': csv_file.stem,
+               'lim_std': df['lim_std'].iloc[0],
+               'd': df['d'].iloc[0],
+               'tau_std': df['tau_std'].iloc[0]
+        }
         for kind, module_dict in [('activity', activity_dict), ('derivative', deriv_dict)]:
             pair_correlations = compute_pairwise_module_correlations(module_dict, use_derivatives=False)
             # Per-pair scores, e.g. 'activity_obs_ctx', 'derivative_dpos_rule'
@@ -110,3 +114,4 @@ if __name__ == '__main__':
 
     # Histogram of every score column across sequences
     plot_score_histograms(out_df, out_file.with_name("score_histograms.png"))
+    pass
