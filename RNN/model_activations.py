@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import evaluate_models as eval
 import torch
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr, spearmanr
@@ -14,8 +15,28 @@ from sklearn.cross_decomposition import CCA as SklearnCCA
 
 CUE_LABELS = ['cue_1', 'cue_2']
 
-def load_trial_sequence(filepath):
-    """Load a trial CSV and return observation array and one-hot cue array (T, 2)."""
+def load_trial_sequence(filepath, return_hierarch=False):
+    """Load a trial CSV and return observation array and one-hot cue array (T, 2).
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the trial sequence CSV.
+    return_labels : bool
+        If True, also return the ground-truth class labels for the categorical
+        modules, inserted right after the cue array:
+        (obs, cue, ctx, dpos, rule, lim_std, d, tau_std).
+        - ctx comes from the 'trial_type' column (the context label)
+        - dpos comes from the 'dpos' column (raw deviant positions, not yet
+          shifted to 0-based class indices)
+        - rule comes from the 'rule' column
+        Each is an int64 array of shape (T,).
+
+    Returns
+    -------
+    By default: (obs, cue, lim_std, d, tau_std).
+    With return_labels=True: (obs, cue, ctx, dpos, rule, lim_std, d, tau_std).
+    """
     df = pd.read_csv(filepath)
     obs = df['observation'].to_numpy(dtype=np.float32)
     cue_raw = df['cue'].to_numpy()
@@ -25,6 +46,11 @@ def load_trial_sequence(filepath):
     lim_std = df['lim_std'].iloc[0]
     d = df['d'].iloc[0]
     tau_std = df['tau_std'].iloc[0]
+    if return_hierarch:
+        ctx = df['trial_type'].to_numpy(dtype=np.int64)   # context label
+        dpos = df['dpos'].to_numpy(dtype=np.int64)        # raw deviant position
+        rule = df['rule'].to_numpy(dtype=np.int64)
+        return obs, cue, ctx, dpos, rule, lim_std, d, tau_std
     return obs, cue, lim_std, d, tau_std
 
 
@@ -85,12 +111,22 @@ def run_forward_pass(model, y, q):
         obs_outputs, ctx_outputs, dpos_outputs, rule_outputs, \
             obs_hidden, ctx_hidden, dpos_hidden, rule_hidden = \
             model(y[:, :-1, :], q[:, :-1, :], return_hidden=True)
-    return {
+    
+    prob_output = {
+        'obs':  obs_outputs,
+        'ctx':  ctx_outputs,
+        'dpos': dpos_outputs,
+        'rule': rule_outputs,
+    }
+
+    hidden_states ={
         'obs':  obs_hidden,
         'ctx':  ctx_hidden,
         'dpos': dpos_hidden,
         'rule': rule_hidden,
     }
+
+    return prob_output, hidden_states
 
 
 def compute_hidden_norms(hidden_states, layer_idx=-1):
@@ -115,7 +151,7 @@ def compute_hidden_norms(hidden_states, layer_idx=-1):
     return norms
 
 
-def get_module_hidden_activity(model, y, q, layer_idx=-1):
+def get_module_output_and_activity(model, y, q, layer_idx=-1):
     """Return per-module hidden activity norms and their temporal derivatives.
 
     Runs a single forward pass with return_hidden=True, selects the requested
@@ -139,10 +175,130 @@ def get_module_hidden_activity(model, y, q, layer_idx=-1):
     hidden_derivatives : dict
         Module name → ndarray of shape (seq_len-1, batch).
     """
-    hidden_states = run_forward_pass(model, y, q)
+    prob_output, hidden_states = run_forward_pass(model, y, q)
     hidden_activity = compute_hidden_norms(hidden_states, layer_idx=layer_idx)
     hidden_derivatives = {name: compute_derivatives(norms) for name, norms in hidden_activity.items()}
-    return hidden_activity, hidden_derivatives
+    return prob_output, hidden_activity, hidden_derivatives
+
+
+def compute_module_probabilities(raw_outputs):
+    """Convert raw module outputs into per-module probability/distribution arrays.
+
+    The model returns *unprocessed* outputs when called with return_hidden=True
+    (see run_forward_pass). This mirrors the post-processing in
+    pipeline_core_v2.get_model_predictions:
+
+    - 'obs' is a regressor: its two output dimensions are the mean and the
+      pre-softplus variance of a Gaussian. The variance is recovered with
+      softplus(x) + 1e-6, so the returned columns are (mean, variance).
+    - the remaining modules are classifiers: their logits are turned into class
+      probabilities with a softmax over the last dimension.
+
+    Parameters
+    ----------
+    raw_outputs : dict
+        Module name → raw output tensor of shape (batch, seq_len, dim), as
+        returned by run_forward_pass (its first return value).
+
+    Returns
+    -------
+    dict
+        Module name → ndarray of shape (seq_len, batch, dim):
+        - 'obs':  dim = 2, columns are (mean, variance)
+        - others: dim = n_classes, softmax class probabilities
+    """
+    probabilities = {}
+    for name, raw in raw_outputs.items():
+        if name == 'obs':
+            mu = raw[..., 0:1]
+            var = F.softplus(raw[..., 1:2]) + 1e-6
+            arr = torch.cat([mu, var], dim=-1).detach().cpu().numpy()
+        else:
+            arr = torch.softmax(raw, dim=-1).detach().cpu().numpy()
+        # (batch, seq_len, dim) → (seq_len, batch, dim) to match the hidden-state
+        # convention used elsewhere (time-major, batch second).
+        probabilities[name] = np.transpose(arr, (1, 0, 2))
+    return probabilities
+
+
+def get_module_probabilities(model, y, q):
+    """Return per-module output probabilities/distribution parameters.
+
+    Runs a single forward pass with return_hidden=True and post-processes the
+    raw module outputs into interpretable probabilities (see
+    compute_module_probabilities).
+
+    Parameters
+    ----------
+    model : nn.Module
+        Trained model that accepts return_hidden=True.
+    y : torch.Tensor
+        Observation sequences, shape (batch, seq_len, obs_dim).
+    q : torch.Tensor
+        Query sequences, shape (batch, seq_len, q_dim).
+
+    Returns
+    -------
+    dict
+        Module name → ndarray of shape (seq_len, batch, dim). See
+        compute_module_probabilities for the per-module column meaning.
+    """
+    raw_outputs, _ = run_forward_pass(model, y, q)
+    return compute_module_probabilities(raw_outputs)
+
+
+def gaussian_likelihood(observations, mean, variance):
+    """Likelihood (density) of each observation under a Gaussian.
+
+    Evaluates N(observation | mean, variance) elementwise, i.e. the value of the
+    Gaussian probability density at each observation. This is the likelihood of
+    the ground-truth observation under the obs module's predicted distribution.
+
+    Parameters
+    ----------
+    observations, mean, variance : array-like, same shape
+        Ground-truth observations and the predicted Gaussian mean/variance.
+
+    Returns
+    -------
+    np.ndarray
+        Per-element likelihood, same shape as the inputs.
+    """
+    obs = np.asarray(observations, dtype=np.float64)
+    mu = np.asarray(mean, dtype=np.float64)
+    var = np.asarray(variance, dtype=np.float64)
+    return np.exp(-0.5 * (obs - mu) ** 2 / var) / np.sqrt(2.0 * np.pi * var)
+
+
+def class_likelihood(class_probs, labels):
+    """Likelihood of the true class label under predicted class probabilities.
+
+    For a (K, C) matrix ``lambda`` of class probabilities and 0-based ground-truth
+    labels c, returns ``lambda[k, labels[k]]`` for each row k — the probability the
+    model assigns to the true class. For a categorical distribution this *is* the
+    likelihood of the observed class, which is why no other transform is needed.
+
+    Parameters
+    ----------
+    class_probs : np.ndarray, shape (K, C)
+        Per-row class probabilities (softmax outputs).
+    labels : array-like of int, shape (K,)
+        Zero-based ground-truth class indices, one per row.
+
+    Returns
+    -------
+    np.ndarray, shape (K,)
+        Likelihood of the true class at each row.
+    """
+    class_probs = np.asarray(class_probs)
+    labels = np.asarray(labels, dtype=int)
+    if labels.min() < 0 or labels.max() >= class_probs.shape[1]:
+        raise IndexError(
+            f"labels out of range [0, {class_probs.shape[1] - 1}]: "
+            f"got min={labels.min()}, max={labels.max()}. "
+            "Did you forget to shift to 0-based class indices (e.g. dpos)?"
+        )
+    return class_probs[np.arange(class_probs.shape[0]), labels]
 
 
 def compute_derivatives(norms):

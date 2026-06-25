@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import evaluate_models as eval
 import numpy as np
 
-from model_activations import get_module_hidden_activity, plot_individual_trajectories, plot_averaged_activity, compute_sample_difference_all_modules, compute_module_independence
+from model_activations import get_module_output_and_activity, plot_individual_trajectories, plot_averaged_activity, compute_sample_difference_all_modules, compute_module_independence
 
 
 if __name__ == "__main__":
@@ -74,7 +74,7 @@ if __name__ == "__main__":
         model_name = info.model_dir.name
         print(f"Plotting hidden activity for model: {model_name}")
 
-        module_norms_dict, module_derivatives_dict = get_module_hidden_activity(model, y_sel, q_sel)
+        prob_output, module_norms_dict, module_derivatives_dict = get_module_output_and_activity(model, y_sel, q_sel)
 
         module_titles = {
             'obs':  'Observation module',

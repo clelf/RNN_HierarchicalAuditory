@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import evaluate_models as eval
 
-from model_activations import get_module_hidden_activity, load_trial_sequence, to_model_tensors
+from model_activations import get_module_output_and_activity, load_trial_sequence, to_model_tensors
 
 
 
@@ -44,7 +44,7 @@ if __name__ == '__main__':
 
         # hidden_activity:    dict module → (T-1, 1)
         # hidden_derivatives: dict module → (T-2, 1)
-        hidden_activity, hidden_derivatives = get_module_hidden_activity(model, y, q)
+        prob_output, hidden_activity, hidden_derivatives = get_module_output_and_activity(model, y, q)
 
         # Number of timesteps in the output: T-1 (matching norms length)
         n_out = next(iter(hidden_activity.values())).shape[0]

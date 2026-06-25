@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import evaluate_models as eval
 
 from model_activations import (
-    get_module_hidden_activity,
+    get_module_output_and_activity,
     load_trial_sequence,
     load_trial_params,
     to_model_tensors,
@@ -92,7 +92,7 @@ if __name__ == '__main__':
     # =============================================================================
     # Run forward pass — returns norms (T-1, N) and derivatives (T-2, N)
     # =============================================================================
-    module_norms_dict, module_derivatives_dict = get_module_hidden_activity(model, y, q)
+    prob_output, module_norms_dict, module_derivatives_dict = get_module_output_and_activity(model, y, q)
 
     module_titles = {
         'obs':  'Observation module',
