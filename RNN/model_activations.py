@@ -5,6 +5,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import evaluate_models as eval
+from pipeline_core_v2 import get_model_predictions
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -181,57 +182,24 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1):
     return prob_output, hidden_activity, hidden_derivatives
 
 
-def compute_module_probabilities(raw_outputs):
-    """Convert raw module outputs into per-module probability/distribution arrays.
-
-    The model returns *unprocessed* outputs when called with return_hidden=True
-    (see run_forward_pass). This mirrors the post-processing in
-    pipeline_core_v2.get_model_predictions:
-
-    - 'obs' is a regressor: its two output dimensions are the mean and the
-      pre-softplus variance of a Gaussian. The variance is recovered with
-      softplus(x) + 1e-6, so the returned columns are (mean, variance).
-    - the remaining modules are classifiers: their logits are turned into class
-      probabilities with a softmax over the last dimension.
-
-    Parameters
-    ----------
-    raw_outputs : dict
-        Module name → raw output tensor of shape (batch, seq_len, dim), as
-        returned by run_forward_pass (its first return value).
-
-    Returns
-    -------
-    dict
-        Module name → ndarray of shape (seq_len, batch, dim):
-        - 'obs':  dim = 2, columns are (mean, variance)
-        - others: dim = n_classes, softmax class probabilities
-    """
-    probabilities = {}
-    for name, raw in raw_outputs.items():
-        if name == 'obs':
-            mu = raw[..., 0:1]
-            var = F.softplus(raw[..., 1:2]) + 1e-6
-            arr = torch.cat([mu, var], dim=-1).detach().cpu().numpy()
-        else:
-            arr = torch.softmax(raw, dim=-1).detach().cpu().numpy()
-        # (batch, seq_len, dim) → (seq_len, batch, dim) to match the hidden-state
-        # convention used elsewhere (time-major, batch second).
-        probabilities[name] = np.transpose(arr, (1, 0, 2))
-    return probabilities
-
-
 def get_module_probabilities(model, y, q):
     """Return per-module output probabilities/distribution parameters.
 
-    Runs a single forward pass with return_hidden=True and post-processes the
-    raw module outputs into interpretable probabilities (see
-    compute_module_probabilities).
+    Runs a standard forward pass and delegates the output post-processing to
+    pipeline_core_v2.get_model_predictions, so the observation mean/variance and
+    the class probabilities are computed exactly as in training and evaluation
+    (single source of truth). In particular:
+
+    - 'obs' is a regressor: the returned columns are (mean, variance), where the
+      variance is get_model_predictions' var_estim = softplus(raw) + 1e-6. This
+      is a *variance* (the same quantity passed to GaussianNLLLoss at training
+      time), not a standard deviation.
+    - the remaining modules are classifiers: softmax class probabilities.
 
     Parameters
     ----------
     model : nn.Module
-        Trained model that accepts return_hidden=True.
+        Trained model.
     y : torch.Tensor
         Observation sequences, shape (batch, seq_len, obs_dim).
     q : torch.Tensor
@@ -240,11 +208,28 @@ def get_module_probabilities(model, y, q):
     Returns
     -------
     dict
-        Module name → ndarray of shape (seq_len, batch, dim). See
-        compute_module_probabilities for the per-module column meaning.
+        Module name → ndarray of shape (seq_len, batch, dim):
+        - 'obs':  dim = 2, columns are (mean, variance)
+        - others: dim = n_classes, softmax class probabilities
     """
-    raw_outputs, _ = run_forward_pass(model, y, q)
-    return compute_module_probabilities(raw_outputs)
+    with torch.no_grad():
+        model_output = model(y[:, :-1, :], q[:, :-1, :])
+    pred = get_model_predictions(model, model_output)
+
+    # get_model_predictions returns batch-major arrays:
+    #   mu_estim / var_estim : (batch, seq_len)
+    #   *_prob               : (batch, seq_len, n_classes)
+    # Stack obs into (batch, seq_len, 2) then move to the (seq_len, batch, dim)
+    # convention used elsewhere (time-major, batch second).
+    obs = np.stack([pred['mu_estim'], pred['var_estim']], axis=-1)  # (batch, seq_len, 2)
+
+    probabilities = {
+        'obs':  np.transpose(obs, (1, 0, 2)),
+        'ctx':  np.transpose(pred['ctx_prob'], (1, 0, 2)),
+        'dpos': np.transpose(pred['dpos_prob'], (1, 0, 2)),
+        'rule': np.transpose(pred['rule_prob'], (1, 0, 2)),
+    }
+    return probabilities
 
 
 def gaussian_likelihood(observations, mean, variance):
