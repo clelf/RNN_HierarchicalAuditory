@@ -34,8 +34,8 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 # For full training, use: UNIT_TEST=False python experiment.py (or just python experiment.py)
 # ========================================
 
-# Navigate to the refactored directory
-cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/refactored
+# Navigate to the train directory
+cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/train
 
 # Run experiment.py with full training (UNIT_TEST=False)
 # This uses all the HierarchicalGM parameters configured in experiment.py

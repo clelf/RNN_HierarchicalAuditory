@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --qos=xlong
-#SBATCH --job-name=onectx_rnn
+#SBATCH --job-name=modnet_bn
 #SBATCH --nodes=1              # Use single node to avoid distributed complexity
 #SBATCH --ntasks=1             # Single task (your Python script)
 #SBATCH --cpus-per-task=8      # CPUs for parallel data generation
@@ -27,23 +27,21 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 # Add --kappa_values for obs_ctx objective weighting
 # =================================================
 
-# Navigate to the refactored directory
-cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
+# Navigate to the train directory
+cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/train
 
-
-
-# 1 context
+# Run the pipeline with module_network models only
 /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
-    --models rnn vrnn \
+    --models module_network \
     --learning_rates 0.01 \
-    --hidden_dims 32 64 \
-    --objectives obs ctx \
-    --n_ctx 1 \
+    --hidden_dims 64 \
+    --bottleneck_dims 2 4 8 16 \
+    --objectives obs ctx obs_ctx \
+    --n_ctx 2 \
     --gm_name NonHierarchicalGM \
     --skip_benchmarks \
     --train_only
-
-
+    
 
 # Verify Python version and activated environment
 echo "Python version: $(python --version)"

@@ -30,14 +30,17 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 # =================================================
 
 # Navigate to the RNN directory
-cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
+cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/train
 
-# Compute HierarchicalGM test benchmarks (1000 samples)
-# For benchmark computation, only data configuration is needed
-/scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
-    --n_ctx 2 \
-    --gm_name HierarchicalGM \
-    --benchmark_only
+# Compute HierarchicalGM test benchmarks (1000 samples).
+# Dedicated benchmark entry point: reuses the SAME data config as training
+# (DataConfig.for_hierarchical_experiment) so benchmarks match trained models.
+#
+# --tag identifies BOTH the KF input data and the outputs. The suffix machinery
+# prepends an underscore, so "--tag newdataconfig" yields files/dirs named
+# ..._test_newdataconfig(.pkl / _individual/). This keeps this run's data isolated
+# from any benchmarks produced with the previous (mismatched) hyperparameters.
+/scratch/clevyfidel/conda_env/rnn2/bin/python benchmark_experiment.py --tag newdataconfig
 
 
 # Verify Python version and activated environment

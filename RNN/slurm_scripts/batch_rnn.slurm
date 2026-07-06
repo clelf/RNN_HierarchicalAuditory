@@ -16,10 +16,10 @@
 module load Miniforge3
 
 # Delete the existing environment
-conda env remove -p /scratch/clevyfidel/conda_env/rnn
+# conda env remove -p /scratch/clevyfidel/conda_env/rnn
 
 # Create and activate conda env
-conda env create -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml -p /scratch/clevyfidel/conda_env/rnn
+# conda env create -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml -p /scratch/clevyfidel/conda_env/rnn
 
 # To update existing env with new packages from yml:
 # conda env update -p /scratch/clevyfidel/conda_env/rnn -f /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/rnn.yml --prune

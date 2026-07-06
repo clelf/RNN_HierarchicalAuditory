@@ -28,9 +28,12 @@ if __name__=='__main__':
 
     return_pars = True
     if return_pars:
-        _, _, ys, pars = gm.generate_batch(return_pars=return_pars)
+        batch = gm.generate_batch(return_pars=return_pars)
+        ys = batch['obs']
+        pars = batch['pars']
     else:
-        _, _, ys = gm.generate_batch(return_pars=return_pars)
+        batch = gm.generate_batch(return_pars=return_pars)
+        ys = batch['obs']
 
     # for y, par in zip(ys, pars):
     #     # y_hat, s_hat = kalman_A(y, A=1, Q=2, R=2, x0=y[0], s0=0)

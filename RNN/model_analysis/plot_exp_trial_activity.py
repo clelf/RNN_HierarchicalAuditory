@@ -66,7 +66,7 @@ if __name__ == '__main__':
     # =============================================================================
     obs_list, cue_list, params_list = [], [], []
     for f in selected_files:
-        obs, cue = load_trial_sequence(f)
+        obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(f)
         obs_list.append(obs)
         cue_list.append(cue)
         params_list.append(load_trial_params(f))

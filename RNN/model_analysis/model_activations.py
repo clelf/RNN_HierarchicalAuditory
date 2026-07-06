@@ -4,6 +4,14 @@ import sys
 from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+
+# pipeline_core_v2 is in RNN/train/; evaluate_models is a sibling in model_analysis/
+_here = os.path.abspath(os.path.dirname(__file__))
+_train_dir = os.path.abspath(os.path.join(_here, '..', 'train'))
+for _p in [_train_dir, _here]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import evaluate_models as eval
 from pipeline_core_v2 import get_model_predictions
 import torch
@@ -14,7 +22,32 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import CCA as SklearnCCA
 
-CUE_LABELS = ['cue_1', 'cue_2']
+# CUE_LABELS = ['cue_1', 'cue_2']
+CUE_LABELS = ['cue_2', 'cue_1']
+
+# Minimum deviant position labelled in the experimental sequence files (generated with
+# rules_dpos_set=[[2,3,4],[4,5,6]], so dpos in {2..6}). This is a property of the files,
+# not of any model.
+EXPERIMENTAL_DPOS_MIN = 2
+
+
+def dpos_conventions(info, experimental_dpos_min=EXPERIMENTAL_DPOS_MIN):
+    """dpos alignment offsets between a trained model and the experimental files.
+
+    A model's dpos output class ``c`` encodes deviant position ``c + dpos_min``, where
+    ``dpos_min = min(rules_dpos_set)`` is read from the model's saved config
+    (``info.data_config_dict``). Returns ``(dpos_min, shift)`` with
+    ``shift = dpos_min - experimental_dpos_min``: add ``shift`` to an experimental dpos
+    to express it in the model's convention, and the class index of a model-convention
+    dpos is ``dpos - dpos_min``.
+
+    Self-adjusting: the old lr0 model (rules_dpos_set=[[3,4,5],[5,6,7]]) yields (3, 1);
+    a model retrained on [[2,3,4],[4,5,6]] yields (2, 0).
+    """
+    rules_dpos_set = np.asarray(info.data_config_dict['rules_dpos_set'])
+    dpos_min = int(rules_dpos_set.min())
+    return dpos_min, dpos_min - experimental_dpos_min
+
 
 def load_trial_sequence(filepath, return_hierarch=False):
     """Load a trial CSV and return observation array and one-hot cue array (T, 2).
@@ -26,7 +59,7 @@ def load_trial_sequence(filepath, return_hierarch=False):
     return_labels : bool
         If True, also return the ground-truth class labels for the categorical
         modules, inserted right after the cue array:
-        (obs, cue, ctx, dpos, rule, lim_std, d, tau_std).
+        (obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n).
         - ctx comes from the 'trial_type' column (the context label)
         - dpos comes from the 'dpos' column (raw deviant positions, not yet
           shifted to 0-based class indices)
@@ -35,8 +68,8 @@ def load_trial_sequence(filepath, return_hierarch=False):
 
     Returns
     -------
-    By default: (obs, cue, lim_std, d, tau_std).
-    With return_labels=True: (obs, cue, ctx, dpos, rule, lim_std, d, tau_std).
+    By default: (obs, cue, lim_std, d, tau_std, trial_n).
+    With return_labels=True: (obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n).
     """
     df = pd.read_csv(filepath)
     obs = df['observation'].to_numpy(dtype=np.float32)
@@ -44,6 +77,7 @@ def load_trial_sequence(filepath, return_hierarch=False):
     label_to_idx = {label: i for i, label in enumerate(CUE_LABELS)}
     cue_idx = np.vectorize(label_to_idx.get)(cue_raw)
     cue = np.eye(len(CUE_LABELS), dtype=np.float32)[cue_idx]  # (T, 2)
+    trial_n = df['trial_n']
     lim_std = df['lim_std'].iloc[0]
     d = df['d'].iloc[0]
     tau_std = df['tau_std'].iloc[0]
@@ -51,8 +85,8 @@ def load_trial_sequence(filepath, return_hierarch=False):
         ctx = df['trial_type'].to_numpy(dtype=np.int64)   # context label
         dpos = df['dpos'].to_numpy(dtype=np.int64)        # raw deviant position
         rule = df['rule'].to_numpy(dtype=np.int64)
-        return obs, cue, ctx, dpos, rule, lim_std, d, tau_std
-    return obs, cue, lim_std, d, tau_std
+        return obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n
+    return obs, cue, lim_std, d, tau_std, trial_n
 
 
 def to_model_tensors(obs, cue):
@@ -632,6 +666,276 @@ def plot_averaged_activity(module_norms_dict, module_titles, timesteps, output_d
     return fig
 
 
+def reshape_norms_by_position(data, period=8):
+    """Split a (seq_len, batch) activity array into within-trial positions.
+
+    Every timestep ``t`` is assigned a within-trial position ``t % period`` and a
+    trial index ``t // period``. Because every trial spans exactly ``period``
+    consecutive timesteps (and the sequence starts at trial 0, position 0), this
+    is equivalent to ``df.groupby('trial_n').cumcount()`` used elsewhere, but
+    works directly on the batched norms array without needing the trial_n column.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Shape (seq_len, batch) — e.g. a module's activity norms or derivatives.
+    period : int
+        Number of timesteps per trial (within-trial positions). Default 8.
+
+    Returns
+    -------
+    dict
+        Maps a 0-based within-trial position to a dict with:
+          - 'trials' : np.ndarray (n_trials_p,)        trial index per point (x-axis)
+          - 'values' : np.ndarray (n_trials_p, batch)  activity at this position
+        Trailing positions may cover one fewer trial when seq_len is not an exact
+        multiple of period.
+    """
+    seq_len = data.shape[0]
+    by_pos = {}
+    for p in range(period):
+        ts = np.arange(p, seq_len, period)
+        if ts.size == 0:
+            continue
+        by_pos[p] = {
+            'trials': ts // period,
+            'values': data[ts, :],
+        }
+    return by_pos
+
+
+def plot_averaged_activity_by_position(module_norms_dict, module_titles, output_dir,
+                                       model_name, n_samples, period=8,
+                                       include_derivatives=False, show_std=True):
+    """Plot per-module activity averaged over sequences, split by within-trial position.
+
+    Unlike :func:`plot_averaged_activity` (timestep on the x-axis), this puts the
+    *trial* index on the x-axis and draws one series per within-trial position
+    (0..period-1). Each point is the activity at a given (trial, position)
+    averaged over all sequences/samples, so there are ``period`` dots above every
+    trial x-tick. Plotting against the trial index keeps each position's curve
+    continuous (consecutive trials are adjacent), which a timestep x-axis would
+    not — there the same position only recurs every ``period`` steps.
+
+    Parameters
+    ----------
+    module_norms_dict : dict
+        Module name → norms array of shape (seq_len, batch). batch is the number
+        of sequences being averaged over.
+    module_titles : dict
+        Module name → display title.
+    output_dir : Path
+        Output directory (kept for signature parity; saving is done by the caller).
+    model_name : str
+        Model name (used only for context; the caller handles file names).
+    n_samples : int
+        Number of sequences averaged over (shown in the title).
+    period : int
+        Timesteps per trial / number of within-trial positions. Default 8.
+    include_derivatives : bool
+        If True, plot temporal derivatives instead of raw activity.
+    show_std : bool
+        If True (default), shade ±STD across sequences around each position's
+        mean, like :func:`plot_averaged_activity`. Set False if the per-position
+        bands overlap too much to read.
+    """
+    n_modules = len(module_norms_dict)
+
+    fig, axes = plt.subplots(n_modules, 1, figsize=(10, 3 * n_modules), sharex=True)
+    if n_modules == 1:
+        axes = [axes]
+
+    title_suffix = "derivatives " if include_derivatives else ""
+    fig.suptitle(
+        f'Average hidden activity {title_suffix}across {n_samples} sequences\n'
+        f'(separated by within-trial position; trial index on x-axis)',
+        fontsize=16,
+    )
+
+    cmap = plt.get_cmap('tab10')
+
+    for ax, (module_name, norms) in zip(axes, module_norms_dict.items()):
+        if include_derivatives:
+            data = compute_derivatives(norms)
+            ylabel = 'dActivity/dt'
+        else:
+            data = norms
+            ylabel = 'Activity (L2 norm)'
+
+        by_pos = reshape_norms_by_position(data, period=period)
+        for p in sorted(by_pos):
+            trials = by_pos[p]['trials']
+            values = by_pos[p]['values']          # (n_trials_p, batch)
+            mean_data = values.mean(axis=1)
+            color = cmap(p % 10)
+            ax.plot(trials, mean_data, '-', linewidth=1.5,
+                    color=color, label=f'pos {p + 1}')
+            if show_std:
+                std_data = values.std(axis=1)
+                ax.fill_between(trials, mean_data - std_data, mean_data + std_data,
+                                color=color, alpha=0.2)
+
+        if include_derivatives:
+            ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+
+        ax.set_ylabel(ylabel)
+        ax.set_title(module_titles[module_name])
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel('Trial (trial_n)')
+
+    # One shared legend to the right of the subplots.
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, title='within-trial\nposition',
+               loc='center left', bbox_to_anchor=(0.98, 0.5))
+    plt.tight_layout(rect=[0, 0, 0.97, 1])
+    return fig
+
+
+def extract_deviant_activity(data, dev_pos, period=8):
+    """Pick the activity at each trial's deviant position, grouped by deviant value.
+
+    For every trial the deviant tone sits at within-trial position ``dev_pos`` (a
+    0-based index, constant within the trial). The activity at that deviant is the
+    timestep ``trial * period + dev_pos`` of ``data``. Trials are grouped by the
+    *value* of their deviant position and, for each (trial, value) cell, averaged
+    over the sequences whose deviant fell on that position at that trial.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Shape (seq_len, n_seq) — a module's activity norms or derivatives.
+    dev_pos : np.ndarray
+        Shape (n_seq, n_trials) — 0-based within-trial deviant position for every
+        sequence and trial.
+    period : int
+        Timesteps per trial. Default 8.
+
+    Returns
+    -------
+    dict
+        deviant-position value (int) → dict of equal-length arrays:
+          - 'trials' : trial index per point (x-axis)
+          - 'mean'   : activity at the deviant, averaged over contributing sequences
+          - 'std'    : std across those sequences
+          - 'count'  : number of contributing sequences
+        A (trial, value) point is dropped when no sequence has that deviant value
+        at that trial, or when its timestep falls past ``seq_len`` (e.g. the very
+        last position of the last trial after the ``y[:, :-1]`` slice).
+    """
+    seq_len = data.shape[0]
+    n_trials = dev_pos.shape[1]
+    trials = np.arange(n_trials)
+
+    out = {}
+    for v in np.unique(dev_pos):
+        v = int(v)
+        rec = {'trials': [], 'mean': [], 'std': [], 'count': []}
+        for t in trials:
+            g = t * period + v
+            if g >= seq_len:
+                continue
+            mask = dev_pos[:, t] == v          # sequences with deviant at v in trial t
+            if not mask.any():
+                continue
+            vals = data[g, mask]
+            rec['trials'].append(t)
+            rec['mean'].append(vals.mean())
+            rec['std'].append(vals.std())
+            rec['count'].append(int(mask.sum()))
+        out[v] = {k: np.asarray(val) for k, val in rec.items()}
+    return out
+
+
+def plot_deviant_activity_by_position(module_norms_dict, dev_pos, module_titles,
+                                      output_dir, model_name, n_samples, period=8,
+                                      include_derivatives=False, show_std=True):
+    """Plot per-module activity at each trial's deviant position, grouped by deviant value.
+
+    Like :func:`plot_averaged_activity_by_position` the x-axis is the trial index,
+    but instead of drawing every within-trial position this keeps only the single
+    timestep that is the deviant in each trial. Trials are grouped (coloured) by
+    the value of their deviant position, and each point is the activity at that
+    deviant timestep averaged over the sequences whose deviant fell on that
+    position at that trial — one dot per trial per deviant-position value. Colours
+    match :func:`plot_averaged_activity_by_position` (same within-trial position →
+    same colour), so the two figures are directly comparable.
+
+    Parameters
+    ----------
+    module_norms_dict : dict
+        Module name → norms array of shape (seq_len, n_seq).
+    dev_pos : np.ndarray
+        Shape (n_seq, n_trials) — 0-based within-trial deviant position per
+        sequence and trial.
+    module_titles : dict
+        Module name → display title.
+    output_dir : Path
+        Output directory (kept for signature parity; saving is done by the caller).
+    model_name : str
+        Model name (used only for context; the caller handles file names).
+    n_samples : int
+        Number of sequences (shown in the title).
+    period : int
+        Timesteps per trial. Default 8.
+    include_derivatives : bool
+        If True, plot temporal derivatives instead of raw activity.
+    show_std : bool
+        If True (default), shade ±STD across the contributing sequences around
+        each deviant-value series. Set False if the bands overlap too much.
+    """
+    n_modules = len(module_norms_dict)
+
+    fig, axes = plt.subplots(n_modules, 1, figsize=(10, 3 * n_modules), sharex=True)
+    if n_modules == 1:
+        axes = [axes]
+
+    title_suffix = "derivatives " if include_derivatives else ""
+    fig.suptitle(
+        f'Hidden activity {title_suffix}at the deviant position, across {n_samples} sequences\n'
+        f'(grouped by deviant-position value; trial index on x-axis)',
+        fontsize=16,
+    )
+
+    cmap = plt.get_cmap('tab10')
+
+    for ax, (module_name, norms) in zip(axes, module_norms_dict.items()):
+        if include_derivatives:
+            data = compute_derivatives(norms)
+            ylabel = 'dActivity/dt'
+        else:
+            data = norms
+            ylabel = 'Activity (L2 norm)'
+
+        by_dev = extract_deviant_activity(data, dev_pos, period=period)
+        for v in sorted(by_dev):
+            rec = by_dev[v]
+            if rec['trials'].size == 0:
+                continue
+            color = cmap(v % 10)
+            ax.plot(rec['trials'], rec['mean'], linestyle='-',
+                    color=color, label=f'pos {v + 1}')
+            if show_std:
+                ax.fill_between(rec['trials'], rec['mean'] - rec['std'],
+                                rec['mean'] + rec['std'], color=color, alpha=0.15)
+
+        if include_derivatives:
+            ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+
+        ax.set_ylabel(ylabel)
+        ax.set_title(module_titles[module_name])
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel('Trial (trial_n)')
+
+    # One shared legend to the right of the subplots.
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, title='deviant\nposition',
+               loc='center left', bbox_to_anchor=(0.98, 0.5))
+    plt.tight_layout(rect=[0, 0, 0.97, 1])
+    return fig
+
+
 def compute_sample_difference_single_module(norms, sample_idx_1, sample_idx_2):
     """Compute difference in activity between two samples for a single module.
     
@@ -788,3 +1092,215 @@ def compute_module_independence(module_norms_dict):
         'effective_dimensions': effective_dims,
         'mean_linear_predictability': mean_r_squared,  # 0-1, lower = more independent
     }
+
+
+# ---------------------------------------------------------------------------
+# Joining per-trial deviant activity with the likelihood at the deviant.
+#
+# These helpers consume the per-file CSVs produced by
+#   - model_act_exp_trials_deviant.py  -> activations_deviant/*_deviant_trial.csv
+#       one row per trial: <module>_norm / <module>_deriv sampled at the deviant
+#   - model_prob_exp_trials.py         -> probabilities/*_probabilities.csv
+#       one row per timestep, including lik_<module> (likelihood of the ground
+#       truth under each module's predicted distribution).
+# and study how module activity at the deviant relates to how (un)likely the
+# model found that deviant.
+# ---------------------------------------------------------------------------
+
+MODULE_NAMES = ['obs', 'ctx', 'dpos', 'rule']
+
+
+def load_deviant_activity(act_csv):
+    """Load a per-trial deviant-activity CSV (model_act_exp_trials_deviant.py).
+
+    Returns the DataFrame as written: one row per trial with columns
+    trial_n, deviant_pos, <module>_norm, <module>_deriv, lim_std, d, tau_std.
+    """
+    return pd.read_csv(act_csv)
+
+
+def load_deviant_likelihoods(prob_csv, context_label=1, module_names=MODULE_NAMES):
+    """Per-trial likelihoods at the deviant position from a *_probabilities.csv.
+
+    The probabilities file has one row per timestep, where the ``ctx`` column is
+    the next-step ground-truth context label (1 marks the deviant tone). Filtering
+    to ``ctx == context_label`` therefore keeps exactly the deviant of each trial,
+    and ``lik_<module>`` on that row is the likelihood the model assigned to the
+    deviant. There is one such row per trial (verified on the data), but if a file
+    ever had more, duplicates are averaged within a trial.
+
+    Parameters
+    ----------
+    prob_csv : str or Path
+        Path to a *_probabilities.csv file.
+    context_label : int
+        Context label marking the deviant tone (default 1).
+    module_names : list of str
+        Modules whose likelihood columns (``lik_<module>``) to keep.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns: trial_n, deviant_pos, lik_<module> for each module.
+    """
+    df = pd.read_csv(prob_csv)
+    dev = df[df['ctx'] == context_label].copy()
+    lik_cols = [f'lik_{m}' for m in module_names]
+    keep = ['trial_n', 'dpos'] + lik_cols
+    dev = dev[keep].rename(columns={'dpos': 'deviant_pos'})
+    dev = dev.groupby(['trial_n', 'deviant_pos'], as_index=False)[lik_cols].mean()
+    return dev
+
+
+def join_activity_likelihood(act_df, lik_df, module_names=MODULE_NAMES):
+    """Merge per-trial deviant activity and deviant likelihoods on trial_n.
+
+    Adds a ``mean_norm`` column: the mean activity across modules at the deviant
+    (the average module activity referred to in the analysis). The merge is an
+    inner join on trial_n, so only trials present in both frames are kept.
+
+    Parameters
+    ----------
+    act_df : pandas.DataFrame
+        Output of :func:`load_deviant_activity`.
+    lik_df : pandas.DataFrame
+        Output of :func:`load_deviant_likelihoods`.
+    module_names : list of str
+        Modules to average over for ``mean_norm``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The merged per-trial frame with an added ``mean_norm`` column.
+    """
+    merged = pd.merge(act_df, lik_df, on='trial_n', how='inner',
+                      suffixes=('', '_lik'))
+    norm_cols = [f'{m}_norm' for m in module_names]
+    merged['mean_norm'] = merged[norm_cols].mean(axis=1)
+    return merged
+
+
+def compute_activity_likelihood_correlations(df, activity_cols, likelihood_cols,
+                                             method='pearson'):
+    """Correlation of every activity column with every likelihood column.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Joined per-trial frame.
+    activity_cols, likelihood_cols : list of str
+        Column names to cross-correlate (activity on rows, likelihood on columns).
+    method : {'pearson', 'spearman'}
+        Correlation coefficient to use.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Correlation matrix indexed by activity_cols, columns likelihood_cols.
+        Pairs with fewer than 3 finite points or a constant column are NaN.
+    """
+    func = pearsonr if method == 'pearson' else spearmanr
+    corr = pd.DataFrame(index=activity_cols, columns=likelihood_cols, dtype=float)
+    for a in activity_cols:
+        for l in likelihood_cols:
+            x = df[a].to_numpy(dtype=float)
+            y = df[l].to_numpy(dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            x, y = x[mask], y[mask]
+            if x.size >= 3 and x.std() > 0 and y.std() > 0:
+                corr.loc[a, l] = float(func(x, y)[0])
+            else:
+                corr.loc[a, l] = np.nan
+    return corr
+
+
+def plot_activity_likelihood_grid(df, activity_cols, likelihood_cols,
+                                  activity_labels=None, likelihood_labels=None,
+                                  add_fit=True, color='steelblue'):
+    """Scatter grid of activity (columns) vs likelihood (rows) with fit + r.
+
+    Each panel scatters one activity column against one likelihood column, draws a
+    least-squares line, and annotates Pearson r and Spearman rho. Deliberately
+    plain: small markers, thin black fit line, no bold fonts.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    activity_labels = activity_labels or activity_cols
+    likelihood_labels = likelihood_labels or likelihood_cols
+    n_rows, n_cols = len(likelihood_cols), len(activity_cols)
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(2.8 * n_cols, 2.8 * n_rows),
+                             squeeze=False)
+    for i, lcol in enumerate(likelihood_cols):
+        for j, acol in enumerate(activity_cols):
+            ax = axes[i][j]
+            x = df[acol].to_numpy(dtype=float)
+            y = df[lcol].to_numpy(dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            x, y = x[mask], y[mask]
+
+            ax.scatter(x, y, s=10, alpha=0.45, color=color, edgecolors='none')
+
+            if x.size >= 3 and x.std() > 0 and y.std() > 0:
+                r = pearsonr(x, y)[0]
+                rho = spearmanr(x, y)[0]
+                if add_fit:
+                    b1, b0 = np.polyfit(x, y, 1)
+                    xs = np.array([x.min(), x.max()])
+                    ax.plot(xs, b0 + b1 * xs, color='black', linewidth=1)
+                ax.set_title(f'r={r:.2f}, ρ={rho:.2f}', fontsize=9)
+
+            if i == n_rows - 1:
+                ax.set_xlabel(activity_labels[j], fontsize=9)
+            if j == 0:
+                ax.set_ylabel(likelihood_labels[i], fontsize=9)
+            ax.tick_params(labelsize=8)
+            ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_correlation_heatmap(corr, title='', value_fmt='{:.2f}'):
+    """Heatmap of an activity-vs-likelihood correlation matrix.
+
+    Parameters
+    ----------
+    corr : pandas.DataFrame
+        Output of :func:`compute_activity_likelihood_correlations`.
+    title : str
+        Axes title.
+    value_fmt : str
+        Format string for the per-cell annotations.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    values = corr.to_numpy(dtype=float)
+    n_rows, n_cols = values.shape
+
+    fig, ax = plt.subplots(figsize=(1.1 * n_cols + 2.5, 0.6 * n_rows + 2.0))
+    im = ax.imshow(values, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
+
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(list(corr.columns), rotation=45, ha='right', fontsize=9)
+    ax.set_yticks(range(n_rows))
+    ax.set_yticklabels(list(corr.index), fontsize=9)
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            v = values[i, j]
+            if np.isfinite(v):
+                ax.text(j, i, value_fmt.format(v), ha='center', va='center',
+                        fontsize=8, color='black')
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=8)
+    if title:
+        ax.set_title(title, fontsize=10)
+    fig.tight_layout()
+    return fig

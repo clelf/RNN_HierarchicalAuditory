@@ -1,5 +1,5 @@
 """
-Unified model evaluation script.
+Tools for model evaluation.
 
 This script loads multiple trained models and evaluates them on the same
 generated test dataset, computing:
@@ -60,17 +60,43 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 
-# Local imports (files are now in the same directory)
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+# Set up sys.path before all local imports:
+#   model_analysis/ — this file's own directory (for sibling modules)
+#   RNN/            — parent, contains model.py
+#   RNN/train/      — contains pipeline_core_v2.py and config_v2.py
+#   Workspace/      — root for PreProParadigm and Kalman packages
+_here = os.path.abspath(os.path.dirname(__file__))
+_rnn_dir = os.path.abspath(os.path.join(_here, '..'))
+_train_dir = os.path.abspath(os.path.join(_here, '..', 'train'))
+_workspace = os.path.abspath(os.path.join(_here, '..', '..', '..'))
+for _p in [_workspace, _train_dir, _rnn_dir, _here]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from model import SimpleRNN, VRNN, ObsCtxModuleNetwork, PopulationNetwork
 from pipeline_core_v2 import get_model_predictions, prepare_batch_data, _create_module_network_config, _create_population_network_config
 
 # Local config (for loading saved configs)
 from config_v2 import RunConfig, TrainingConfig, ModelArchConfig, DataConfig as TrainDataConfig
 
-# Generative models (PreProParadigm is one level up from RNN/)
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Generative models
 from PreProParadigm.audit_gm import NonHierarchicalAuditGM, HierarchicalAuditGM
+
+# Kalman-filter benchmark machinery (config-agnostic numerics).
+from Kalman.kalman import (
+    MIN_OBS_FOR_EM,
+    kalman_online_fit_predict_multicontext,
+    likelihood_observation,
+    contexts_to_probabilities,
+)
+# The deviant-position conditional and its marginalization over rules are REUSED
+# from PreProParadigm/model_RTs.py (single source of truth). They now accept a
+# `valid_positions` arg so the same math applies to the RNN HierarchicalGM's
+# rules_dpos_set instead of the old hard-coded positions.
+from PreProParadigm.model_RTs import (
+    prior_dpos_given_prev_rule,
+    pior_dpos_given_prev_rule_and_stds,
+)
 
 
 # =============================================================================
@@ -1083,6 +1109,252 @@ def compute_rule_log_prob(rules_true: np.ndarray, rule_probs: np.ndarray,
     else:
         # Mean over sequence dimension, keep sample dimension
         return np.mean(log_probs, axis=1)
+
+
+# =============================================================================
+# Hierarchical Kalman-filter benchmark: the marginal predictive likelihood
+# p(y_t | H) over all four levels, at every timestep (not only deviant positions).
+#
+# Kalman-filter analogue of the RNN's marginal predictive distribution. It
+# combines two ingredients:
+#   * the conditional per-context predictive distributions from the multi-context
+#       KF,  N(y_t; mu_std_t, var_std_t)  and  N(y_t; mu_dev_t, var_dev_t),
+#     estimated under the assumption that the context labels are known (the KF is
+#     fit on the known standard/deviant labels, as the existing pipeline already
+#     does). The deviant-context prediction is defined at every timestep (held
+#     constant between deviants), non-NaN once >= MIN_OBS_FOR_EM deviants have been
+#     observed; with
+#   * the marginal context probabilities P(std|H), P(dev|H), obtained by
+#     marginalizing the deviant-position and rule levels. This REUSES the
+#     deviant-position conditional (prior_dpos_given_prev_rule) and its
+#     marginalization over rules (pior_dpos_given_prev_rule_and_stds) from
+#     PreProParadigm.model_RTs (generalized with `valid_positions`).
+#
+#   p(y_t | H) = P(std|H) N(y_t; mu_std, var_std) + P(dev|H) N(y_t; mu_dev, var_dev)
+#
+# Evaluating this marginal predictive density at the realized observation y_t
+# yields the marginal likelihood of that observation.
+#
+# Variance vs std: likelihood_observation(y, mu, sigma) and the multi-context KF
+# both use VARIANCES, so the per-context variances are passed straight through.
+# =============================================================================
+
+def compute_dev_probabilities(dpos_long, rules_long, n_tones, rules_dpos_set,
+                              pi_rules=None, mu_rho_rules=None,
+                              post_dev_standards=True):
+    """Marginal probability of the deviant context, P(context_t = dev | H), at
+    every timestep.
+
+    This is the structural part of the benchmark: it depends only on the sequence
+    labels (deviant position and rule), not on the observations or any KF
+    estimation. It marginalizes the deviant-position and rule levels, reusing
+    prior_dpos_given_prev_rule (the position conditional within a rule) and
+    pior_dpos_given_prev_rule_and_stds (its marginalization over rules) from
+    PreProParadigm.model_RTs.
+
+    Index convention: index t corresponds to predicting y[t]; j = t % n_tones is
+    the within-trial position.
+
+    Parameters
+    ----------
+    dpos_long, rules_long : np.ndarray, shape (N, T) or (T,)
+        Per-tone deviant position and rule (generate_test_data's 'dpos_np' /
+        'rules_np', or the equivalent columns of the dataset).
+    n_tones : int
+        Tones per trial (e.g. 8).
+    rules_dpos_set : list
+        Rule -> valid deviant positions (the data config's rules_dpos_set), used
+        directly as the {rule: positions} map.
+    pi_rules : np.ndarray, optional
+        Assumed (n_rules, n_rules) rule-transition matrix, pi_rules[r_prev, r]. If
+        None, build it from `mu_rho_rules` (2 rules only;
+        = compute_fixed_pi([mu_rho_rules])).
+    post_dev_standards : bool
+        If True, encode that the positions following a trial's deviant are
+        standards (one deviant per trial), i.e. set P(dev|H)=0 there.
+
+    Returns
+    -------
+    np.ndarray of P(dev|H), same leading shape as the inputs ((N, T) or (T,)).
+    """
+    dpos_long = np.asarray(dpos_long)
+    rules_long = np.asarray(rules_long)
+    single = dpos_long.ndim == 1
+    if single:
+        dpos_long, rules_long = dpos_long[None], rules_long[None]
+
+    n_rules = len(rules_dpos_set)
+    valid_positions = {r: list(positions) for r, positions in enumerate(rules_dpos_set)
+                       if positions is not None}
+    if pi_rules is None:
+        if n_rules != 2:
+            raise ValueError(f"Auto-built pi_rules only supports 2 rules; got {n_rules}. "
+                             "Pass pi_rules explicitly.")
+        if mu_rho_rules is None:
+            raise ValueError("Provide either pi_rules or mu_rho_rules.")
+        rho = float(mu_rho_rules)
+        pi_rules = np.array([[rho, 1 - rho], [1 - rho, rho]])
+
+    N, T = dpos_long.shape
+    p_dev = np.zeros((N, T))
+    for i in range(N):
+        for t in range(T):
+            trial, j = divmod(t, n_tones)
+            if post_dev_standards and j > int(dpos_long[i, trial * n_tones]):
+                continue  # one deviant per trial: positions after it are standards
+            if trial == 0:
+                # first trial: no previous rule observed -> uniform rule prior
+                p_dev[i, t] = sum(prior_dpos_given_prev_rule(j, r, valid_positions)
+                                  for r in valid_positions) / n_rules
+            else:
+                prev_rule = int(rules_long[i, trial * n_tones - 1])
+                p_dev[i, t] = pior_dpos_given_prev_rule_and_stds(
+                    j, pi_rules, prev_rule, valid_positions)
+    return p_dev[0] if single else p_dev
+
+
+def marginal_obs_likelihood(y, p_dev, mu_std, var_std, mu_dev, var_dev):
+    """Marginal likelihood of each observation under the two-context predictive
+    mixture, combining precomputed conditional per-context predictions with the
+    marginal context probabilities:
+
+        P(y_t | H) = (1 - p_dev) N(y_t; mu_std, var_std) + p_dev N(y_t; mu_dev, var_dev)
+
+    The entry point when conditional KF per-context estimations are already
+    available for a dataset (this function does not fit the KF itself). All inputs
+    are elementwise-broadcastable arrays (e.g. (N, T)). var_std / var_dev are
+    VARIANCES (as returned by the multi-context KF and as consumed by
+    likelihood_observation), NOT standard deviations.
+
+    Each conditional per-context likelihood (lik_std = N(y; mu_std, var_std),
+    lik_dev = N(y; mu_dev, var_dev)) is multiplied by its context probability
+    (1 - p_dev for standard, p_dev for deviant). Where a context probability is
+    zero the corresponding term is set to zero outright, so a NaN returned by the
+    KF for a context it cannot yet estimate (too few observations of that context
+    so far) does not propagate into P(y|H) when that context carries zero weight.
+    A NaN that survives in lik_obs therefore flags a context that is both weighted
+    and not yet estimable (mask it downstream, e.g. via reduce_benchmark_loglik).
+
+    Returns
+    -------
+    dict with arrays:
+      lik_obs  : marginal likelihood of the realized y_t, P(y_t | H)
+      p_std    : standard-context probability, 1 - p_dev
+      lik_std  : conditional likelihood P(y_t | std, H)
+      lik_dev  : conditional likelihood P(y_t | dev, H)
+    """
+    y = np.asarray(y, dtype=float)
+    p_dev = np.asarray(p_dev, dtype=float)
+    p_std = 1.0 - p_dev
+    lik_std = likelihood_observation(y=y, mu=mu_std, sigma=var_std)
+    lik_dev = likelihood_observation(y=y, mu=mu_dev, sigma=var_dev)
+    with np.errstate(invalid='ignore'):
+        term_std = np.where(p_std > 0, p_std * lik_std, 0.0)
+        term_dev = np.where(p_dev > 0, p_dev * lik_dev, 0.0)
+    return {'lik_obs': term_std + term_dev, 'p_std': p_std,
+            'lik_std': lik_std, 'lik_dev': lik_dev}
+
+
+def kf_per_context_predictions(y, contexts, n_iter=5, observation_noise=None):
+    """Conditional per-context one-step KF predictions for ONE sequence, estimated
+    under the assumption that the context labels are known.
+
+    The costly step (EM refit at every timestep); when a dataset already carries KF
+    estimations, skip it and call marginal_obs_likelihood directly.
+
+    Returns (mu_std, var_std, mu_dev, var_dev), each length T (NaN before the KF
+    can be estimated; var_* are VARIANCES). Index t predicts y[t] from y[0:t-1].
+    """
+    y = np.asarray(y, dtype=float)
+    ctx_prob = contexts_to_probabilities(np.asarray(contexts), n_ctx=2)  # (T, 2) one-hot
+    _, _, _, per_ctx_mu, per_ctx_var = kalman_online_fit_predict_multicontext(
+        y, ctx_prob, n_iter=n_iter, return_per_ctx=True,
+        observation_noise=observation_noise,
+    )
+    return per_ctx_mu[:, 0], per_ctx_var[:, 0], per_ctx_mu[:, 1], per_ctx_var[:, 1]
+
+
+def compute_kf_hierarchical_benchmark(test_data, data_config_dict, n_iter=5,
+                                      observation_noise=None, post_dev_standards=True,
+                                      max_samples=None, pi_rules=None, verbose=True):
+    """From-scratch hierarchical KF benchmark of P(y|H) for a whole test set.
+
+    Convenience wrapper that FITS the per-context KF itself (the costly step). It
+    chains compute_dev_probabilities (marginal context probabilities) +
+    kf_per_context_predictions (conditional KF estimation) + marginal_obs_likelihood
+    (the mixture). When conditional KF estimations already exist for a dataset,
+    call compute_dev_probabilities + marginal_obs_likelihood directly instead.
+
+    Parameters
+    ----------
+    test_data : dict
+        generate_test_data output for a HierarchicalGM; needs 'y_np',
+        'contexts_np', 'dpos_np', 'rules_np'.
+    data_config_dict : dict
+        to_gm_dict output, providing 'N_tones', 'rules_dpos_set', 'mu_rho_rules'.
+    max_samples : int, optional
+        Process only the first `max_samples` sequences (the EM refit is slow).
+
+    Returns
+    -------
+    dict of (N, T) arrays: p_dev, p_std, mu_std, var_std, mu_dev, var_dev,
+    lik_std, lik_dev, lik_obs (N capped by max_samples).
+    """
+    y = test_data['y_np']
+    contexts = test_data.get('contexts_np')
+    dpos_long = test_data.get('dpos_np')
+    rules_long = test_data.get('rules_np')
+    if contexts is None or dpos_long is None or rules_long is None:
+        raise ValueError("Hierarchical KF benchmark needs 'contexts_np', 'dpos_np' and "
+                         "'rules_np' in test_data (a HierarchicalGM test set).")
+
+    n_tones = int(data_config_dict['N_tones'])
+    rules_dpos_set = data_config_dict['rules_dpos_set']
+
+    N, T = y.shape
+    if max_samples is not None:
+        N = min(N, int(max_samples))
+
+    # Marginal context probabilities for all (selected) sequences at once — no KF.
+    p_dev = compute_dev_probabilities(
+        dpos_long[:N], rules_long[:N], n_tones, rules_dpos_set,
+        pi_rules=pi_rules, mu_rho_rules=data_config_dict.get('mu_rho_rules'),
+        post_dev_standards=post_dev_standards,
+    )
+
+    keys = ['p_dev', 'p_std', 'mu_std', 'var_std', 'mu_dev', 'var_dev',
+            'lik_std', 'lik_dev', 'lik_obs']
+    out = {k: np.full((N, T), np.nan) for k in keys}
+
+    iterator = tqdm(range(N), desc="KF hierarchical benchmark") if verbose else range(N)
+    for i in iterator:
+        mu_std, var_std, mu_dev, var_dev = kf_per_context_predictions(
+            y[i], contexts[i], n_iter=n_iter, observation_noise=observation_noise)
+        mix = marginal_obs_likelihood(y[i], p_dev[i], mu_std, var_std, mu_dev, var_dev)
+        out['p_dev'][i] = p_dev[i]
+        out['p_std'][i] = mix['p_std']
+        out['mu_std'][i], out['var_std'][i] = mu_std, var_std
+        out['mu_dev'][i], out['var_dev'][i] = mu_dev, var_dev
+        out['lik_std'][i], out['lik_dev'][i] = mix['lik_std'], mix['lik_dev']
+        out['lik_obs'][i] = mix['lik_obs']
+    return out
+
+
+def reduce_benchmark_loglik(lik_obs, start=1, min_obs_for_em=None, reduce=True):
+    """Per-sample mean log marginal likelihood of the realized observations.
+
+    Averages log P(y_t | H) over time, aligned to the model's targets y[1:]
+    (start=1). Pass min_obs_for_em to start at the KF estimation boundary instead.
+    NaN timesteps (no KF estimate yet) are ignored by the nanmean.
+
+    Returns (N,) per-sample means (reduce=True) or the (N, T-start) log values.
+    """
+    s = min_obs_for_em if min_obs_for_em is not None else start
+    with np.errstate(divide='ignore'):
+        logp = np.log(np.maximum(lik_obs[:, s:], 1e-300))
+    if reduce:
+        return np.nanmean(logp, axis=1)
+    return logp
 
 
 # =============================================================================

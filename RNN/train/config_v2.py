@@ -42,9 +42,15 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     epoch_res: int = 20      # Report every N epochs
     batch_res: int = 16      # Report every N batches
-    
+
+    # Training strategy: when True, the dpos module is only supervised within a
+    # per-trial response window (from the start of each trial up to one timestep
+    # after the ground-truth deviant). When False, dpos is supervised at every
+    # timestep like the other modules. Only affects PopulationNetwork + HierarchicalGM.
+    constrained_dpos_response_window: bool = False
+
     @classmethod
-    def for_unit_test(cls) -> 'TrainingConfig':
+    def for_unit_test(cls, constrained_dpos_response_window: bool = False) -> 'TrainingConfig':
         """Create a minimal config for unit testing."""
         return cls(
             num_epochs=10,
@@ -52,7 +58,8 @@ class TrainingConfig:
             batch_size=8,
             batch_size_test=8,
             epoch_res=10,
-            batch_res=2
+            batch_res=2,
+            constrained_dpos_response_window=constrained_dpos_response_window,
         )
 
 
@@ -81,7 +88,15 @@ class DataConfig:
     # Process parameters
     si_lim: float = 5.0
     si_tau: float = 0.5
-    
+
+    # HierarchicalGM (N_ctx == 2): couple the two process timescales so the sampled
+    # base is the deviant timescale and tau_std = N_tones * tau_dev (i.e.
+    # tau_dev = tau_std / N_tones), matching the experimental sequences. When True,
+    # mu_tau_bounds bounds the BASE tau_dev (so tau_std spans N_tones * that range).
+    # Has no effect when N_ctx != 2. Default True; set False to keep the timescales
+    # independent/equal.
+    couple_tau: bool = True
+
     # Parameter testing bounds
     params_testing: bool = True
     mu_tau_bounds: dict = field(default_factory=lambda: {'low': 1, 'high': 250})
@@ -100,7 +115,17 @@ class DataConfig:
 
     # Optional hierarchical GM parameters (only used when gm_name == 'HierarchicalGM')
     p_cues: Optional[np.ndarray] = None
-    cues_set: Optional[list] = None
+    cues_set: Optional[list] = None  # Full pool of possible cue values (one-hot dim = len(cues_set))
+    N_cues_per_seq: int = 2          # Number of distinct cues drawn from the pool per sequence
+
+    # Optional inter-trial silences ("temporal dimension"). DISABLED by default so all
+    # existing use cases are unaffected. When enabled (HierarchicalGM only), each trial
+    # is followed by a variable number of silence timesteps and every discrete level
+    # gains one extra "silence" class (see the *_classes / n_cue_dims properties).
+    iti: bool = False
+    tone_dur: float = 0.1            # tone duration in seconds (1 timestep = tone_dur + tone_isi)
+    tone_isi: float = 0.65           # inter-tone interval in seconds
+    iti_bounds: dict = field(default_factory=lambda: {'rate': 0.9, 'low': 2.25, 'high': 4.0})
 
     # Processing
     max_cores: Optional[int] = None
@@ -114,6 +139,90 @@ class DataConfig:
             object.__setattr__(self, 'max_cores', 
                 int(slurm_cpus) if slurm_cpus else 1)
     
+    @classmethod
+    def for_hierarchical_experiment(cls, N_ctx: int = 2,
+                                    N_blocks: int = 125,
+                                    max_cores: Optional[int] = None,
+                                    iti: bool = False) -> 'DataConfig':
+        """Canonical HierarchicalGM data configuration.
+
+        SINGLE SOURCE OF TRUTH for the hierarchical data-generation
+        hyperparameters, shared by model training (experiment.py) and Kalman
+        filter benchmark computation (benchmark_experiment.py). Tune data
+        hyperparameters HERE so that models and their KF benchmarks are always
+        generated from the same distribution.
+
+        Sequence length = N_tones * N_blocks (default 8 * 125 = 1000). Pass a
+        smaller N_blocks for fast smoke tests (KF benchmarking is O(T^2) in the
+        sequence length, so shrinking N_blocks is the way to get a quick run).
+        """
+        return cls(
+            gm_name='HierarchicalGM',
+            N_ctx=N_ctx,
+            N_tones=8,        # tones per block (total seq length = N_tones * N_blocks)
+            N_blocks=N_blocks,
+            si_d_coef=0.05,
+            # Deviant effect size: center on d=1 (the experimental value), still allowing
+            # the full [0.1, 4] range around it.
+            d_bounds={'high': 4, 'low': 0.1},
+            mu_d=1,
+            # Deviant positions match the experimental sequences (rule 0 -> {2,3,4},
+            # rule 1 -> {4,5,6}); model dpos classes 0..4 then map to positions 2..6.
+            rules_dpos_set=np.array([[2, 3, 4], [4, 5, 6]]),
+            mu_rho_rules=0.9,
+            si_rho_rules=0.05,
+            si_lim=5,
+            # With couple_tau=True these bounds apply to the BASE tau_dev; the standard
+            # timescale follows as N_tones * tau_dev, so tau_std spans ~[8, 250] for
+            # N_tones=8 (experimental: tau_std in {16..240}, tau_dev = tau_std / 8).
+            couple_tau=True,
+            mu_tau_bounds={'low': 1, 'high': 250 / 8},
+            # Noise bounds bracket the experimental regime (si_stat~0.1, si_r~0.02) so
+            # those sequences are in-distribution rather than below the training floor.
+            si_stat_bounds={'low': 0.05, 'high': 0.5},
+            si_r_bounds={'low': 0.01, 'high': 0.1},
+            p_cues=np.array([0.8, 0.2]),
+            # cues_set is the full pool of possible cue values; each sequence samples a
+            # subset of N_cues_per_seq cues from it. One-hot dim = len(cues_set), derived
+            # automatically at model instantiation.
+            cues_set=list(range(12)),
+            N_cues_per_seq=2,
+            iti=iti,   # optional inter-trial silences (temporal dimension); OFF by default
+            max_cores=max_cores,
+        )
+
+    @classmethod
+    def for_nonhierarchical_experiment(cls, N_ctx: int = 2,
+                                       N_tones: int = 1000,
+                                       max_cores: Optional[int] = None,
+                                       iti: bool = False) -> 'DataConfig':
+        """Canonical NonHierarchicalGM data configuration.
+
+        Companion to for_hierarchical_experiment: SINGLE SOURCE OF TRUTH for the
+        non-hierarchical data-generation hyperparameters, shared by training
+        (experiment.py) and KF benchmark computation (benchmark_experiment.py).
+
+        NonHierarchicalAuditGM forces N_blocks = 1 internally, so the full
+        sequence length is simply N_tones. Noise bounds mirror
+        for_hierarchical_experiment so the two GMs stay directly comparable;
+        tune NonHierarchicalGM-specific values HERE.
+        """
+        return cls(
+            gm_name='NonHierarchicalGM',
+            N_ctx=N_ctx,
+            N_tones=N_tones,   # NonHierarchicalGM forces N_blocks=1 => seq length = N_tones
+            # Multi-context params (used when N_ctx > 1)
+            si_d_coef=0.05,
+            d_bounds={'high': 4, 'low': 0.1},
+            mu_d=2,
+            si_lim=5,
+            mu_tau_bounds={'low': 1, 'high': 250},
+            si_stat_bounds={'low': 0.01, 'high': 0.2},
+            si_r_bounds={'low': 0.001, 'high': 0.02},
+            iti=iti,   # optional inter-trial silences (temporal dimension); OFF by default
+            max_cores=max_cores,
+        )
+
     @property
     def data_mode(self) -> DataMode:
         """Derive data_mode from N_ctx."""
@@ -144,7 +253,37 @@ class DataConfig:
         if self.cues_set is None:
             return None
         return len(self.cues_set)
-    
+
+    # ------------------------------------------------------------------
+    # Classifier dimensions used to instantiate the model.
+    # When inter-trial silences are enabled, each discrete level gains one extra
+    # "silence" class/dimension. When iti is False these reduce to the raw counts,
+    # so model instantiation is unchanged for all existing use cases.
+    # ------------------------------------------------------------------
+    @property
+    def _silence_extra(self) -> int:
+        return 1 if self.iti else 0
+
+    @property
+    def n_ctx_classes(self):
+        """Context output classes for the model (N_ctx, +1 for silence when iti)."""
+        return self.N_ctx + self._silence_extra
+
+    @property
+    def n_dpos_classes(self):
+        """Deviant-position output classes (N_dpos, +1 for silence when iti)."""
+        return None if self.N_dpos is None else self.N_dpos + self._silence_extra
+
+    @property
+    def n_rule_classes(self):
+        """Rule output classes (N_rules, +1 for silence when iti)."""
+        return None if self.N_rules is None else self.N_rules + self._silence_extra
+
+    @property
+    def n_cue_dims(self):
+        """Cue one-hot / rule-module input dimension (N_cues, +1 for silence when iti)."""
+        return None if self.N_cues is None else self.N_cues + self._silence_extra
+
     def to_gm_dict(self, batch_size: int) -> dict:
         """Convert to dictionary format expected by GenerativeModel classes."""
         d = {
@@ -180,13 +319,23 @@ class DataConfig:
                 'rules_dpos_set': self.rules_dpos_set,
                 'mu_rho_rules': self.mu_rho_rules,
                 'si_rho_rules': self.si_rho_rules,
+                'couple_tau': self.couple_tau,
             })
             if self.p_cues is not None and self.cues_set is not None:
                 d.update({
                     'p_cues': self.p_cues,
-                    'cues_set': self.cues_set
+                    'cues_set': self.cues_set,
+                    'N_cues_per_seq': self.N_cues_per_seq
                 })
-        
+            # Optional inter-trial silences
+            d['iti'] = self.iti
+            if self.iti:
+                d.update({
+                    'tone_dur': self.tone_dur,
+                    'tone_isi': self.tone_isi,
+                    'iti_bounds': self.iti_bounds,
+                })
+
         # Convert non-JSON-serializable objects
         return _serialize_for_json(d)
 
@@ -364,7 +513,7 @@ class HyperparameterGrid:
     data: DataConfig = field(default_factory=DataConfig)
     
     # Output settings
-    base_output_dir: Path = field(default_factory=lambda: Path(os.path.dirname(__file__)) / 'training_results')
+    base_output_dir: Path = field(default_factory=lambda: Path(os.path.dirname(__file__)) / '..' / 'training_results')
     run_id: Optional[str] = None
     
     def _get_objectives_and_kappas(self, model_type: ModelType) -> List[Tuple[str, Optional[float]]]:

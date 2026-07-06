@@ -3,12 +3,21 @@ import random
 import sys
 from pathlib import Path
 import matplotlib.pyplot as plt
-import evaluate_models as eval
 import torch
 import numpy as np
 
-# Local imports from pipeline_core_v2
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+# Set up sys.path before local imports:
+#   model_analysis/ — sibling modules (evaluate_models)
+#   RNN/train/      — pipeline_core_v2
+#   Workspace/      — Kalman package
+_here = os.path.abspath(os.path.dirname(__file__))
+_train_dir = os.path.abspath(os.path.join(_here, '..', 'train'))
+_workspace = os.path.abspath(os.path.join(_here, '..', '..', '..'))
+for _p in [_workspace, _train_dir, _here]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import evaluate_models as eval
 from pipeline_core_v2 import plot_samples, get_model_predictions
 
 # Import Kalman constants for benchmark data

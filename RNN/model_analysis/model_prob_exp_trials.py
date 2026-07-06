@@ -19,6 +19,7 @@ from model_activations import (
     to_model_tensors,
     gaussian_likelihood,
     class_likelihood,
+    dpos_conventions,
 )
 
 
@@ -55,21 +56,27 @@ if __name__ == '__main__':
         trial_files = sorted(trials_path.glob("*.txt"))
     print(f"Found {len(trial_files)} trial sequence files in {trials_path}")
 
-    # Determine the dpos→class-index offset once, globally across all files.
-    # The model's dpos classes are 0-based; the dataset's raw deviant positions
-    # start at some minimum (e.g. 2). Using the global minimum (rather than a
-    # single sequence's minimum) matches the dataset-wide dpos_min convention used
-    # in training/eval and is robust to a sequence missing the lowest position.
-    dpos_min = 2
-    # dpos_min = min(int(pd.read_csv(f, usecols=['dpos'])['dpos'].min()) for f in trial_files)
-    print(f"Global dpos_min (class-index offset): {dpos_min}")
+    # dpos alignment, read from the model's saved config (rules_dpos_set): dpos_min is
+    # the model's class-index offset (class c <-> position c+dpos_min), and
+    # EXPERIMENTAL_DPOS_SHIFT maps the on-disk experimental dpos into the model's
+    # convention. Self-adjusting: lr0 -> (3, 1); a model retrained on [[2,3,4],[4,5,6]]
+    # -> (2, 0). The sequence files are never edited.
+    dpos_min, EXPERIMENTAL_DPOS_SHIFT = dpos_conventions(info)
+    print(f"dpos class-index offset (model convention): {dpos_min}; "
+          f"experimental dpos shift: +{EXPERIMENTAL_DPOS_SHIFT}")
 
     for trial_file in trial_files:
         # ctx/dpos/rule are the ground-truth labels from the original sequence.
-        # dpos is the raw deviant position (e.g. 2..6), not yet a 0-based class index.
-        obs, cue, ctx, dpos, rule, lim_std, d, tau_std = load_trial_sequence(
+        # dpos is the raw deviant position on disk (e.g. 2..6), not yet a 0-based class index.
+        obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n = load_trial_sequence(
             trial_file, return_hierarch=True
         )
+
+        # Shift the experimental deviant-position labels into the model's training
+        # convention ({2..6} -> {3..7}); the on-disk files are left untouched. From here
+        # on, dpos is in the model's convention and dpos-dpos_min is a valid 0-based class.
+        dpos = dpos + EXPERIMENTAL_DPOS_SHIFT
+
         y, q = to_model_tensors(obs, cue)
 
         # probs: dict module → (seq_len, batch, dim)
@@ -130,7 +137,8 @@ if __name__ == '__main__':
         out_df['lim_std'] = lim_std
         out_df['d'] = d
         out_df['tau_std'] = tau_std
-
+        out_df['trial_n'] = trial_n.values[1:n_out + 1]
+        
         out_file = output_path / (trial_file.stem + '_probabilities.csv')
         out_df.to_csv(out_file, index=False)
         print(f"  Saved: {out_file.name}")

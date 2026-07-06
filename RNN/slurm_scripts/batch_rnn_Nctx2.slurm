@@ -28,7 +28,7 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 # =================================================
 
 # Navigate to the refactored directory
-cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/
+cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/train
 
 # Run the pipeline with module_network models only: learning obj=obs & ctx, bottleneck dims=2, 4, 8, 16
 /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \

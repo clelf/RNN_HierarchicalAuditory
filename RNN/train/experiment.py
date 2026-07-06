@@ -21,46 +21,32 @@ if '--no-unit-test' in sys.argv:
     sys.argv.remove('--no-unit-test')
 
 # Custom training config
+# constrained_dpos_response_window: only supervise the dpos module from the start of
+# each trial up to one timestep after the ground-truth deviant (set False to supervise
+# dpos at every timestep like the other modules).
 if UNIT_TEST:
-    training = TrainingConfig.for_unit_test()
+    training = TrainingConfig.for_unit_test(constrained_dpos_response_window=True)
 else:
-    training = TrainingConfig(num_epochs=200)
+    training = TrainingConfig(num_epochs=200, constrained_dpos_response_window=True)
 
 
-# Custom data config
-# data = DataConfig(
-#     gm_name='NonHierarchicalGM',
-#     N_ctx=2,
-#     N_tones=500,
-#     mu_tau_bounds={'low': 5, 'high': 100},  # Narrower tau range
-# )
-data = DataConfig(
-    gm_name='HierarchicalGM',
+# Data config (single source of truth shared with benchmark_experiment.py).
+# HierarchicalGM (default). Tune hyperparameters in the factory itself.
+data = DataConfig.for_hierarchical_experiment(
     N_ctx=2,
-    # Need extra parameters for hierarchical GM
-    si_d_coef= 0.05,
-    d_bounds = {"high": 4, "low": 0.1},
-    mu_d = 2, # TODO: also test with [1, 2]
-    N_blocks = 125,
-    N_tones = 8,
-    rules_dpos_set = np.array([[3, 4, 5], [5, 6, 7]]),
-    mu_rho_rules = 0.9,
-    si_rho_rules = 0.05,
-    si_lim = 5,
-    mu_tau_bounds = {'low': 1, 'high': 250},
-    si_stat_bounds = {'low': 0.1, 'high': 2},
-    si_r_bounds = {'low': 0.1, 'high': 2},
-    p_cues = np.array([0.8, 0.2]),
-    cues_set = [0, 1],
     max_cores=1 if UNIT_TEST else None,  # Disable parallel processing during tests
-
 )
+# --- To use NonHierarchicalGM instead, comment the block above and uncomment: ---
+# data = DataConfig.for_nonhierarchical_experiment(
+#     N_ctx=2,
+#     max_cores=1 if UNIT_TEST else None,
+# )
 
 
 # Custom hyperparameter grid
 param_grid = HyperparameterGrid(
     model_types=['population_network'], # population_network , module_network
-    learning_rates=[0.005, 0.01, 0.001] if not UNIT_TEST else [0.01], # Removed 0.05 and 0.1 to prevent gradient explosion
+    learning_rates=[0.005], #, 0.01, 0.001] if not UNIT_TEST else [0.01], # Removed 0.05 and 0.1 to prevent gradient explosion
     # hidden_dims=[64],  # Fixed for ModuleNetwork anyway # TODO: look into this
     hidden_dims={'obs': [64], 'ctx': [64], 'dpos': [64], 'rule': [64]}, # TODO: look into this, possibly no need to decrease hidden dims...
     # learning_objectives=['all'], # 'obs', 'ctx', 'all'

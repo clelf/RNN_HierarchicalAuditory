@@ -32,7 +32,7 @@ import gc
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
-
+import numpy as np
 import torch
 
 # Add current directory to path for local imports
@@ -52,76 +52,11 @@ from pipeline_core_v2 import (
     run_single_config,
     load_or_compute_benchmarks,
     create_generative_model,
+    run_benchmarks,  # re-exported for backward compatibility (defined in pipeline_core_v2)
 )
 
 # # Import benchmark functions from original pipeline (reusing, not rewriting)
 # from pipeline_next import get_ctx_gm_subpath, compute_benchmarks, benchmarks_pars_viz
-
-
-# =============================================================================
-# Benchmark-Only Pipeline
-# =============================================================================
-
-def run_benchmarks(
-    data_config: DataConfig,
-    training_config: TrainingConfig,
-    visualize: bool = True,
-    verbose: bool = True,
-    suffix_tag: str = '',
-):
-    """
-    Compute Kalman filter test benchmarks only (no model training/testing).
-    
-    This is useful for:
-    - Pre-computing expensive test benchmarks before evaluating trained models
-    - Analyzing Kalman filter performance on different data configurations
-    - Generating benchmark visualizations
-    
-    Args:
-        data_config: Data configuration object
-        training_config: Training configuration object (for batch sizes)
-        visualize: If True, generate parameter distribution plots
-        verbose: If True, print progress information
-        suffix_tag: Optional tag appended to benchmark filenames
-    
-    Returns:
-        Test benchmarks dictionary
-    """
-    if verbose:
-        print("\n" + "=" * 70)
-        print("BENCHMARK COMPUTATION (TEST DATA)")
-        print("=" * 70)
-        print(f"N_ctx: {data_config.N_ctx}, GM: {data_config.gm_name}")
-        print(f"Batch size (test): {training_config.batch_size_test}")
-        print(f"Max cores: {data_config.max_cores}")
-        print("=" * 70)
-    
-    # Build config dicts for backward compatibility with load_or_compute_benchmarks
-    model_config = {
-        'batch_size': training_config.batch_size,
-        'batch_size_test': training_config.batch_size_test,
-    }
-    data_config_dict = data_config.to_gm_dict(training_config.batch_size)
-    
-    benchmarks_test = load_or_compute_benchmarks(
-        data_config_dict,
-        model_config,
-        data_config.N_ctx,
-        data_config.gm_name,
-        visualize=visualize,
-        max_cores=data_config.max_cores,
-        suffix_tag=suffix_tag,
-    )
-    
-    if verbose:
-        print("\n" + "=" * 70)
-        print("BENCHMARK COMPUTATION COMPLETE")
-        if benchmarks_test is not None:
-            print(f"Test benchmarks: {benchmarks_test['y'].shape[0]} samples")
-            print(f"  KF MSE (mean): {benchmarks_test['perf'].mean():.4f}")
-        print("=" * 70)
-    
-    return benchmarks_test
 
 
 # =============================================================================
@@ -332,28 +267,11 @@ def main():
         N_tones=training.batch_size,  # Sequence length matches batch size # TODO: What???
     )
     
-    # Apply HierarchicalGM-specific defaults if needed
+    # Apply HierarchicalGM-specific defaults if needed.
+    # Uses the shared single source of truth so this path stays in sync with
+    # experiment.py (training) and benchmark_experiment.py (KF benchmarks).
     if args.gm_name == 'HierarchicalGM':
-        import numpy as np
-        data = DataConfig(
-            gm_name='HierarchicalGM',
-            N_ctx=args.n_ctx,
-            N_tones=training.batch_size, # TODO:What????
-            # HierarchicalGM-specific parameters
-            si_d_coef=0.05,
-            d_bounds={'high': 4, 'low': 0.1},
-            mu_d=2,
-            N_blocks=125,
-            rules_dpos_set=np.array([[3, 4, 5], [5, 6, 7]]),
-            mu_rho_rules=0.9,
-            si_rho_rules=0.05,
-            si_lim=5,
-            mu_tau_bounds={'low': 1, 'high': 250},
-            si_stat_bounds={'low': 0.1, 'high': 2},
-            si_r_bounds={'low': 0.1, 'high': 2},
-            p_cues=np.array([0.8, 0.2]),
-            cues_set=[0, 1],
-        )
+        data = DataConfig.for_hierarchical_experiment(N_ctx=args.n_ctx)
     
     # =========================================================================
     # BENCHMARK-ONLY MODE: Early exit, no model grid needed

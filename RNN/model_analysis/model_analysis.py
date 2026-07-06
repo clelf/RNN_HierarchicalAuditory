@@ -1,3 +1,18 @@
+"""
+A script that performs analysis of trained models. It computes:
+- log probability (log liklihoods) of tone estimations
+- log probability (log liklihoods) of context estimations
+- calibration statistics
+
+The model gets tested on a test dataset generated in the scope of the script-
+If provided, it also displays the Kalman filter derived likelihoods for the tone level
+
+Versions:
+- was suited for 2-level model (ModuleNetwork), trained/tested
+"""
+
+
+
 import pandas as pd
 import numpy as np
 import seaborn as sns
@@ -22,6 +37,7 @@ if __name__ == "__main__":
 
     # models_dir = Path(__file__).parent.resolve() / Path('training_results/N_ctx_2/NonHierarchicalGM')
     models_dir = Path(__file__).parent.resolve() / Path('training_results/N_ctx_2/HierarchicalGM')
+    # output_dir = Path(__file__).parent.resolve() / Path('evaluation_results/model_comparison/NonHierarchicalGM')
     output_dir = Path(__file__).parent.resolve() / Path('evaluation_results/model_comparison/HierarchicalGM')
     output_dir.mkdir(parents=True, exist_ok=True)
     benchmark_results_path = (
@@ -87,7 +103,8 @@ if __name__ == "__main__":
         kf_metrics = {'mse': kf_mse, 'log_likelihood': kf_ll, 'ks_statistic': kf_ks}
 
     # Metrics names
-    metrics_names = ['mse', 'log_likelihood', 'ks_statistic', 'context_accuracy', 'context_log_prob']
+    # metrics_names = ['mse', 'log_lik', 'ks_statistic', 'context_accuracy', 'context_log_lik']
+    metrics_names = ['obs_loglik', 'context_loglik', 'dpos_loglik', 'rule_loglik']
 
     # Shorter name for model
     names_short = ['Obj=' + (results[mod]['learning_objective'] if 'learning_objective' in results[mod] else '') + ' ' + (f"(k={results[mod]['kappa']}) " if 'learning_objective' in results[mod] and results[mod]['learning_objective']=='obs_ctx' else '') + 'bdim=' + f"{results[mod]['bottleneck_dim']}" for mod in results.keys()]
@@ -136,27 +153,27 @@ if __name__ == "__main__":
     # =========================================================================
     # Figure 3 – KS Calibration curves for all models
     # =========================================================================
-    for mod_name in results_ord:
-        # Find corresponding ModelInfo
-        mod_info = next((info for info in models_info if info.model_dir.name == mod_name), None)
-        if mod_info is None:
-            continue
-        # Re-run forward pass to get raw predictions (needed for the plot)
-        model = eval.load_model(mod_info)
-        with torch.no_grad():
-            model_output = model(test_data['y'][:, :-1, :])
-            mu_pred, var_pred, _ = eval.extract_model_predictions(model, model_output)
+    # for mod_name in results_ord:
+    #     # Find corresponding ModelInfo
+    #     mod_info = next((info for info in models_info if info.model_dir.name == mod_name), None)
+    #     if mod_info is None:
+    #         continue
+    #     # Re-run forward pass to get raw predictions (needed for the plot)
+    #     model = eval.load_model(mod_info)
+    #     with torch.no_grad():
+    #         model_output = model(test_data['y'][:, :-1, :])
+    #         mu_pred, var_pred, _ = eval.extract_model_predictions(model, model_output)
 
-        y_target = test_data['y_np'][:, 1:]   # same alignment as evaluate_model
+    #     y_target = test_data['y_np'][:, 1:]   # same alignment as evaluate_model
 
-        disp = results_ord[mod_name]['disp_name']
-        cal_save = output_dir / f"calibration_curve_{mod_name}.png"
-        eval.plot_calibration_curve(
-            y_target, mu_pred, var_pred,
-            save_path=cal_save,
-            title=f"KS Calibration – {disp}",
-            color=results_ord[mod_name].get('color', '#1f77b4'),
-        )
+    #     disp = results_ord[mod_name]['disp_name']
+    #     cal_save = output_dir / f"calibration_curve_{mod_name}.png"
+    #     eval.plot_calibration_curve(
+    #         y_target, mu_pred, var_pred,
+    #         save_path=cal_save,
+    #         title=f"KS Calibration – {disp}",
+    #         color=results_ord[mod_name].get('color', '#1f77b4'),
+    #     )
     
     #========================================================================
     # Figure 1 – Comparison of metrics across models (violin plots)
@@ -205,7 +222,6 @@ if __name__ == "__main__":
             model_arrays = [kf_metrics[metric]] + model_arrays
             col_names    = ['Kalman Filter'] + col_names
             palette      = ['#9B59B6'] + palette  # purple
-
 
         df_metric = pd.DataFrame(
             np.array(model_arrays).T,

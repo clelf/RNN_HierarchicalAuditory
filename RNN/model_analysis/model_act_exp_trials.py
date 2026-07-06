@@ -24,7 +24,7 @@ if __name__ == '__main__':
     trials_path = Path("/home/clevyfidel/Documents/Workspace/Jasmin/trialsequences2clem")
 
     # Specify output directory path
-    output_path = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output") / model_name
+    output_path = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output") / model_name / "activations"
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Load model
@@ -39,7 +39,7 @@ if __name__ == '__main__':
     print(f"Found {len(trial_files)} trial sequence files in {trials_path}")
 
     for trial_file in trial_files:
-        obs, cue, lim_std, d, tau_std = load_trial_sequence(trial_file)
+        obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(trial_file)
         y, q = to_model_tensors(obs, cue)
 
         # hidden_activity:    dict module → (T-1, 1)
@@ -78,6 +78,7 @@ if __name__ == '__main__':
         out_df['lim_std'] = lim_std
         out_df['d'] = d
         out_df['tau_std'] = tau_std
+        out_df['trial_n'] = trial_n.values[:n_out]
 
         out_file = output_path / (trial_file.stem + '_activations.csv')
         out_df.to_csv(out_file, index=False)

@@ -16,8 +16,12 @@ Usage:
 
 import torch
 import os
+import sys
 import argparse
 import numpy as np
+
+# pipeline_next and config live in RNN/ (parent of train/)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from pipeline_next import load_or_compute_benchmarks
 from config import get_base_model_config, get_data_config, get_module_network_config
 
@@ -56,15 +60,14 @@ if __name__ == '__main__':
         unit_test=unit_test
     )
 
-    # COMPUTE TESTING BENCHMARKS ONLY 
-    _, benchmarks_test_2 = load_or_compute_benchmarks(
+    # COMPUTE TEST BENCHMARKS
+    benchmarks_test_2 = load_or_compute_benchmarks(
         data_config=data_config_2,
         model_config=model_config_2,
         N_ctx=N_ctx,
         gm_name=gm_name,
         visualize=True,
         max_cores=data_config_2.get("max_cores", None),
-        benchmark_mode='test_only',  # Only compute test benchmarks
     )
     
     print(f"✓ N_ctx=2 test benchmarks computed: {benchmarks_test_2['y'].shape[0]} samples")
@@ -93,15 +96,14 @@ if __name__ == '__main__':
         unit_test=unit_test
     )
 
-    # COMPUTE TESTING BENCHMARKS ONLY 
-    _, benchmarks_test_1 = load_or_compute_benchmarks(
+    # COMPUTE TEST BENCHMARKS
+    benchmarks_test_1 = load_or_compute_benchmarks(
         data_config=data_config_1,
         model_config=model_config_1,
         N_ctx=N_ctx,
         gm_name=gm_name,
         visualize=True,
         max_cores=data_config_1.get("max_cores", None),
-        benchmark_mode='test_only',  # Only compute test benchmarks
     )
     
     print(f"✓ N_ctx=1 test benchmarks computed: {benchmarks_test_1['y'].shape[0]} samples")

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --qos=xlong
-#SBATCH --job-name=modnet_bn
+#SBATCH --job-name=modnet
 #SBATCH --nodes=1              # Use single node to avoid distributed complexity
 #SBATCH --ntasks=1             # Single task (your Python script)
 #SBATCH --cpus-per-task=8      # CPUs for parallel data generation
@@ -28,9 +28,9 @@ conda activate /scratch/clevyfidel/conda_env/rnn2
 # =================================================
 
 # Navigate to the refactored directory
-cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/refactored
+cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/train
 
-# Run the pipeline with module_network models only: learning obj=obs & ctx, bottleneck dims=2, 4, 8, 16
+# Run the pipeline with module_network models only: learning obj=obs & ctx, bottleneck dim  s=2, 4, 8, 16
 /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
     --models module_network \
     --learning_rates 0.01 \
@@ -39,20 +39,9 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/refactored
     --objectives obs_ctx \
     --n_ctx 2 \
     --gm_name NonHierarchicalGM \
-    --skip_benchmarks \
-    --train_only
+    --benchmark_only
 
-# Run the pipeline with module_network models only: learning ob= obs OR ctx, bottleneck dim=8
-/scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
-    --models module_network \
-    --learning_rates 0.01 \
-    --hidden_dims 64 \
-    --bottleneck_dims 8 \
-    --objectives obs ctx \
-    --n_ctx 2 \
-    --gm_name NonHierarchicalGM \
-    --skip_benchmarks \
-    --train_only
+
 
 # 1 context
 /scratch/clevyfidel/conda_env/rnn2/bin/python pipeline_runner_v2.py \
@@ -62,8 +51,9 @@ cd /scratch/clevyfidel/Workspace/RNN_HierarchicalAuditory/RNN/refactored
     --objectives obs ctx \
     --n_ctx 1 \
     --gm_name NonHierarchicalGM \
-    --skip_benchmarks \
-    --train_only
+    --benchmark_only
+
+
 
 # Verify Python version and activated environment
 echo "Python version: $(python --version)"

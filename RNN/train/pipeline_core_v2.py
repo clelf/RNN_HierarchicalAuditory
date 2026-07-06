@@ -44,22 +44,29 @@ try:
 except ImportError:
     HAS_PATHOS = False
 
-# Local imports - reuse existing code (files are now in the same directory)
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+# Local imports — train/ is one level below RNN/, so add both to sys.path
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))                           # RNN/train/
+sys.path.insert(1, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))       # RNN/
 from model import SimpleRNN, VRNN, ObsCtxModuleNetwork, PopulationNetwork
 from objectives import Objective
 
 
-# Generative models (PreProParadigm is one level up from RNN/)
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+# PreProParadigm and Kalman live at the workspace root (three levels up from RNN/train/)
+_workspace = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
+sys.path.append(_workspace)
 from PreProParadigm.audit_gm import NonHierarchicalAuditGM, HierarchicalAuditGM
 
-# Local config (config_v2 is now in the same directory)
-from config_v2 import RunConfig, run_config_to_model_dict, run_config_to_training_dict
+# Local config (config_v2 is in the same directory)
+from config_v2 import (
+    RunConfig,
+    DataConfig,
+    TrainingConfig,
+    run_config_to_model_dict,
+    run_config_to_training_dict,
+)
 
-# Check which folder exists and append the correct path
-base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+# Check which Kalman folder exists
+base_path = _workspace
 if os.path.exists(os.path.join(base_path, 'Kalman')):
     from Kalman.kalman import MIN_OBS_FOR_EM, kalman_online_fit_predict, kalman_online_fit_predict_multicontext, contexts_to_probabilities
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
@@ -163,15 +170,25 @@ def prepare_batch_data(gm, gm_name, data_mode, device, return_pars=False):
                 'rules': torch.tensor(batch['rules_long'], dtype=torch.long, requires_grad=False).unsqueeze(2).to(device),
                 'dpos': torch.tensor(batch['dpos_long'], dtype=torch.long, requires_grad=False).unsqueeze(2).to(device),
             })
+            # When inter-trial silences are enabled, each discrete level carries one
+            # extra "silence" class, so the cue one-hot needs one additional dimension.
+            silence_extra = 1 if getattr(gm, 'iti', False) else 0
             # Transform cues to one-hot encoding for rule module input (shape: batch, seq_len, N_cues)
             q_onehot = torch.nn.functional.one_hot(
-                    torch.tensor(batch['cues_long'], dtype=torch.long, requires_grad=False), 
-                    num_classes=gm.N_cues
+                    torch.tensor(batch['cues_long'], dtype=torch.long, requires_grad=False),
+                    num_classes=gm.N_cues + silence_extra
                 ).float().to(device)
             batch_data.update({
                 'q': q_onehot # Now (T, N, N_cat)
             })
-    
+            # Optional per-timestep silence bookkeeping (only present when iti is on).
+            # Used downstream to restrict the dpos response window to real tones.
+            if 'is_silence' in batch:
+                batch_data.update({
+                    'is_silence': torch.tensor(batch['is_silence'], dtype=torch.bool, requires_grad=False).to(device),
+                    'within_trial_pos': torch.tensor(batch['within_trial_pos'], dtype=torch.long, requires_grad=False).to(device),
+                })
+
     return batch_data
 
 def prepare_benchmark_data(benchmarks, data_mode, device):
@@ -234,9 +251,9 @@ def get_ctx_gm_subpath(N_ctx, gm_name):
 # Loss and prediction extraction
 # =============================================================================
 
-def compute_model_loss(model, objective, y_tensor, model_output, data_mode, 
-                       learning_objective='obs_ctx', contexts_tensor=None, 
-                       dpos_tensor=None, rules_tensor=None, kappa=0.5):
+def compute_model_loss(model, objective, y_tensor, model_output, data_mode,
+                       learning_objective='obs_ctx', contexts_tensor=None,
+                       dpos_tensor=None, rules_tensor=None, kappa=0.5, dpos_mask=None):
     """
     Compute loss based on model type, data mode, and learning objective.
     
@@ -276,7 +293,7 @@ def compute_model_loss(model, objective, y_tensor, model_output, data_mode,
         return objective.loss(model, y_tensor[:, 1:, :], model_output,
                               target_ctx=contexts_tensor[:, 1:],
                               target_dpos=dpos_tensor[:, 1:], target_rule=rules_tensor[:, 1:],
-                              learning_objective=learning_objective)
+                              learning_objective=learning_objective, dpos_mask=dpos_mask)
     else:
         # Standard RNN/VRNN loss
         return objective.loss(model, y_tensor[:, 1:, :], model_output)
@@ -412,10 +429,17 @@ def _process_single_kf_sample(args):
                 y_i, responsibilities_i, n_iter=n_iter, return_per_ctx=True
             )
     
-    # Compute MSE for this sample
-    # Use only the valid predictions (skip first MIN_OBS_FOR_EM NaN values)
+    # Compute MSE for this sample.
+    # Predictions are NaN wherever the KF cannot yet predict (e.g. a context has
+    # not accumulated MIN_OBS_FOR_EM observations). We deliberately KEEP those NaNs
+    # in mu_kal_pred so unpredictable timesteps stay identifiable, and use nanmean
+    # here so perf reflects only the timesteps the KF could actually predict.
     valid_slice = slice(MIN_OBS_FOR_EM, len(mu_pred_i))
-    mse_i = ((mu_pred_i[valid_slice] - y_i[valid_slice]) ** 2).mean()
+    sq_err_i = (mu_pred_i[valid_slice] - y_i[valid_slice]) ** 2
+    # nanmean warns ("Mean of empty slice") when a sample is entirely unpredictable
+    # (all-NaN). Since this module runs warnings-as-errors, guard explicitly and keep
+    # such samples flagged as NaN rather than crashing.
+    mse_i = np.nan if np.all(np.isnan(sq_err_i)) else np.nanmean(sq_err_i)
     
     # Build sample data
     sample_data = {
@@ -526,20 +550,22 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     """
     param_bins = bin_params(data_config)
     y = benchmarks['y']
-    # Use prediction estimates for MSE computation (matches model evaluation)
-    # mu_kal has shape (N_samples, T-MIN_OBS_FOR_EM) and predicts y[:, MIN_OBS_FOR_EM:]
+    # Use prediction estimates for MSE computation (matches model evaluation).
+    # mu_kal_pred has full length T with the first min_obs entries NaN (predictions
+    # start at index min_obs); align both y and mu_kal to [:, min_obs:], exactly as
+    # 'perf' is computed in _process_single_kf_sample.
     min_obs = benchmarks.get('min_obs_for_em', MIN_OBS_FOR_EM)
     mu_kal = benchmarks['mu_kal_pred']
     sigma_kal = benchmarks['sigma_kal_pred']
     mse_kal = benchmarks['perf']
     pars_kal = benchmarks['pars']
-    
-    # Compute binned metrics - use y[:, min_obs:] to match mu_kal dimensions
-    binned_metrics_df = map_binned_params_2_metrics(param_bins, y[:, min_obs:], mu_kal, pars_kal)
+
+    # Compute binned metrics - slice both to [:, min_obs:] so shapes match
+    binned_metrics_df = map_binned_params_2_metrics(param_bins, y[:, min_obs:], mu_kal[:, min_obs:], pars_kal)
     
     # Set up save path - include gm_name only when N_ctx > 1 to distinguish different GMs
     if save_path is None:
-        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks' / get_ctx_gm_subpath(N_ctx, gm_name) / f'visualizations{data_config["N_samples"]}'
+        save_path = Path(os.path.abspath(os.path.dirname(__file__))) / '..' / 'benchmarks' / get_ctx_gm_subpath(N_ctx, gm_name) / f'visualizations{data_config["N_samples"]}'
     os.makedirs(save_path, exist_ok=True)
     
     # Add suffix to filename if provided
@@ -749,7 +775,7 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
     Returns:
         benchmarks_test: Test benchmarks dictionary
     """
-    benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / 'benchmarks'
+    benchmarkpath = Path(os.path.abspath(os.path.dirname(__file__))) / '..' / 'benchmarks'
     tag = f'_{suffix_tag}' if suffix_tag else ''
     suffix_test = f'test{tag}'
     benchmarkfile_test = benchmark_filename(benchmarkpath, N_ctx, gm_name, data_config["N_samples"], suffix=suffix_test)
@@ -774,7 +800,69 @@ def load_or_compute_benchmarks(data_config, model_config, N_ctx, gm_name, visual
         benchmarks_test = compute_benchmarks(data_config, N_ctx, gm_name, N_samples=model_config['batch_size_test'], n_iter=5, benchmarkpath=benchmarkpath, save=True, suffix=suffix_test, individual=True, max_cores=max_cores)
         if visualize:
             benchmarks_pars_viz(benchmarks_test, data_config, N_ctx, gm_name, suffix=suffix_test)
-    
+
+    return benchmarks_test
+
+
+def run_benchmarks(
+    data_config: DataConfig,
+    training_config: TrainingConfig,
+    visualize: bool = True,
+    verbose: bool = True,
+    suffix_tag: str = '',
+):
+    """
+    Compute Kalman filter test benchmarks only (no model training/testing).
+
+    This is useful for:
+    - Pre-computing expensive test benchmarks before evaluating trained models
+    - Analyzing Kalman filter performance on different data configurations
+    - Generating benchmark visualizations
+
+    Args:
+        data_config: Data configuration object
+        training_config: Training configuration object (for batch sizes)
+        visualize: If True, generate parameter distribution plots
+        verbose: If True, print progress information
+        suffix_tag: Optional tag appended to benchmark filenames
+
+    Returns:
+        Test benchmarks dictionary
+    """
+    if verbose:
+        print("\n" + "=" * 70)
+        print("BENCHMARK COMPUTATION (TEST DATA)")
+        print("=" * 70)
+        print(f"N_ctx: {data_config.N_ctx}, GM: {data_config.gm_name}")
+        print(f"Batch size (test): {training_config.batch_size_test}")
+        print(f"Max cores: {data_config.max_cores}")
+        print("=" * 70)
+
+    # Build config dicts for backward compatibility with load_or_compute_benchmarks
+    model_config = {
+        'batch_size': training_config.batch_size,
+        'batch_size_test': training_config.batch_size_test,
+    }
+    data_config_dict = data_config.to_gm_dict(training_config.batch_size)
+
+    benchmarks_test = load_or_compute_benchmarks(
+        data_config_dict,
+        model_config,
+        data_config.N_ctx,
+        data_config.gm_name,
+        visualize=visualize,
+        max_cores=data_config.max_cores,
+        suffix_tag=suffix_tag,
+    )
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print("BENCHMARK COMPUTATION COMPLETE")
+        if benchmarks_test is not None:
+            print(f"Test benchmarks: {benchmarks_test['y'].shape[0]} samples")
+            print(f"  KF MSE (mean): {benchmarks_test['perf'].mean():.4f}")
+        print("=" * 70)
+
     return benchmarks_test
 
 
@@ -841,13 +929,19 @@ def map_binned_params_2_metrics(param_bins, y, mu_estim, pars, mu_kal=None):
     # Use the bins found to get the corresponding combination of parameters
     param_combination = (param_bins['tau'][tau_bin_id], param_bins['si_stat'][si_stat_bin_id], param_bins['si_r'][si_r_bin_id])
     
-    # Get MSE per sample in batch (model vs target)
-    mse_per_sample = ((mu_estim-y)**2).mean(axis=1)
-    
-    # Compute KF metrics if KF predictions provided
-    if mu_kal is not None:
-        mse_kal_per_sample = ((mu_kal-y)**2).mean(axis=1)  # KF vs target
-        mse_model2kal_per_sample = ((mu_estim-mu_kal)**2).mean(axis=1)  # Model vs KF
+    # Get MSE per sample in batch (model vs target).
+    # nanmean so timesteps the KF/model could not predict (NaN) are excluded rather
+    # than poisoning the whole sample's MSE. See _process_single_kf_sample. Suppress
+    # the "Mean of empty slice" RuntimeWarning (module runs warnings-as-errors) so an
+    # entirely-unpredictable sample stays NaN instead of crashing.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)
+        mse_per_sample = np.nanmean((mu_estim-y)**2, axis=1)
+
+        # Compute KF metrics if KF predictions provided
+        if mu_kal is not None:
+            mse_kal_per_sample = np.nanmean((mu_kal-y)**2, axis=1)  # KF vs target
+            mse_model2kal_per_sample = np.nanmean((mu_estim-mu_kal)**2, axis=1)  # Model vs KF
 
     # Then, zip batch's param_combination array and MSE arrays and store
     if mu_kal is not None:
@@ -1616,15 +1710,20 @@ def plot_samples(sample_metrics, save_path, title=None, params=None, seq_start=N
         else: 
             rule_colors = None
 
-        # Get color mapping for cues (Accent colormap, starting from index 1)
+        # Get color mapping for cues. A sequence only uses a subset of cues, but cue
+        # values are drawn from the full pool, so build a color for every possible cue
+        # index (derived from the one-hot dimension) to stay robust to the pool size.
         if cues is not None:
-            cue_colors = {}
-            if cues is not None:
-                # cues has shape (N, T, N_cues) - need to find which cue is active at each timestep
-                n_cues = 2 # cues.shape[2]
-                cue_cmap = plt.get_cmap('tab10')
-                cue_colors = {i: cue_cmap((i*4)+2) for i in range(n_cues)}
-        else: cue_colors = None
+            # cues has shape (N, T, N_cues) one-hot, or (N, T) with integer indices
+            if cues.ndim > 2:
+                n_cues = cues.shape[-1]
+            else:
+                n_cues = int(np.max(cues)) + 1
+            # Sample a continuous colormap so any number of cues gets a distinct color
+            cue_cmap = plt.get_cmap('tab20' if n_cues <= 20 else 'hsv')
+            cue_colors = {i: cue_cmap(i / max(n_cues - 1, 1)) for i in range(n_cues)}
+        else:
+            cue_colors = None
 
         # Plot each selected sample using plot_sample
         for id, i in enumerate(selected_indices):
@@ -1761,37 +1860,42 @@ def _create_population_network_config(config: RunConfig) -> dict:
         'kappa': config.kappa,
     }
     
+    # NOTE: the *_classes / n_cue_dims properties equal the raw counts when
+    # inter-trial silences are disabled, and add one "silence" class/dimension per
+    # level when enabled. Using them here keeps model instantiation unchanged for all
+    # existing (iti=False) use cases while staying correct when iti is turned on.
+
     # Build rule module config (processes visual cues q)
     # rule receives q (1D) in forward pass and enc_dpos2rule (2D) in feedback pass
-    # So input_dim = 1, output_dim = N_rules (asymmetric)
+    # So input_dim = n_cue_dims, output_dim = n_rule_classes (asymmetric)
     module_config['rule_module'] = {
-        'input_dim': config.data.N_cues,  # Matches q dimension
-        'output_dim': config.data.N_rules,
-        'output_ext_dim': config.data.N_rules,
+        'input_dim': config.data.n_cue_dims,  # Matches q dimension
+        'output_dim': config.data.n_rule_classes,
+        'output_ext_dim': config.data.n_rule_classes,
         'rnn_hidden_dim': module_dims['rule'],
         'rnn_n_layers': config.model_arch.rnn_n_layers,
         'bottleneck_dim': config.bottleneck_dim,
     }
-    
+
     # Build dpos module config (deviant position identifier)
     # dpos receives enc_rule2dpos (N_dpos) in forward pass and enc_ctx2dpos (N_dpos) in feedback pass
-    # So input_dim = output_dim = N_dpos (symmetric)
+    # So input_dim = output_dim = n_dpos_classes (symmetric)
     module_config['dpos_module'] = {
-        'input_dim': config.data.N_dpos,
-        'output_dim': config.data.N_dpos,
-        'output_ext_dim': config.data.N_dpos,
+        'input_dim': config.data.n_dpos_classes,
+        'output_dim': config.data.n_dpos_classes,
+        'output_ext_dim': config.data.n_dpos_classes,
         'rnn_hidden_dim': module_dims['dpos'],
         'rnn_n_layers': config.model_arch.rnn_n_layers,
         'bottleneck_dim': config.bottleneck_dim,
     }
-    
+
     # Build context module config (context identifier)
     # ctx receives enc_dpos2ctx (N_ctx) in forward pass and enc_obs2ctx (N_ctx) in feedback pass
-    # So input_dim = output_dim = N_ctx (symmetric)
+    # So input_dim = output_dim = n_ctx_classes (symmetric)
     module_config['context_module'] = {
-        'input_dim': config.data.N_ctx,
-        'output_dim': config.data.N_ctx,
-        'output_ext_dim': config.data.N_ctx,
+        'input_dim': config.data.n_ctx_classes,
+        'output_dim': config.data.n_ctx_classes,
+        'output_ext_dim': config.data.n_ctx_classes,
         'rnn_hidden_dim': module_dims['ctx'],
         'rnn_n_layers': config.model_arch.rnn_n_layers,
         'bottleneck_dim': config.bottleneck_dim,
@@ -1861,12 +1965,40 @@ def _compute_forward_and_loss(
         dpos = batch_data['dpos'] - batch_data['dpos'].min().item() # NOTE: converting dpos values to indices
         rules = batch_data['rules']
         model_output = model(y[:, :-1, :], q[:, :-1, :])
+
+        # Optionally constrain the dpos module: when enabled, it is only supervised
+        # from the start of each trial up to one timestep after the ground-truth
+        # deviant. All other modules remain supervised at every timestep. When
+        # disabled (default), dpos is supervised at every timestep (dpos_mask=None).
+        # Targets correspond to global timesteps 1..T-1 (next-step prediction), so the
+        # window compares the within-trial position of each target to (deviant + 1).
+        # The deviant position of each target's block is batch_data['dpos'][:, 1:]
+        # (raw, un-indexed positions).
+        dpos_mask = None
+        if config.training.constrained_dpos_response_window:
+            dvt_pos = batch_data['dpos'][:, 1:, 0]                             # (N, T-1)
+            if 'within_trial_pos' in batch_data:
+                # Inter-trial silences on: trials are not evenly spaced, so use the
+                # GM-provided per-timestep within-trial index and silence flags.
+                # Silence timesteps are excluded from the dpos response window.
+                within_trial_pos = batch_data['within_trial_pos'][:, 1:]       # (N, T-1)
+                is_silence = batch_data['is_silence'][:, 1:]                   # (N, T-1)
+                dpos_mask = (~is_silence) & (within_trial_pos >= 0) & (within_trial_pos <= dvt_pos + 1)
+            else:
+                # No silences: trials are contiguous blocks of N_tones tones, so the
+                # within-trial position of target i is (i + 1) % N_tones.
+                N_tones = config.data.N_tones
+                T = y.shape[1]
+                within_trial_pos = torch.arange(1, T, device=y.device) % N_tones  # (T-1,)
+                dpos_mask = within_trial_pos.unsqueeze(0) <= (dvt_pos + 1)        # (N, T-1) bool
+
         loss = compute_model_loss(
             model, objective, y, model_output, data_mode,
             learning_objective=config.learning_objective,
             contexts_tensor=contexts,
             dpos_tensor=dpos,
-            rules_tensor=rules
+            rules_tensor=rules,
+            dpos_mask=dpos_mask
         )
     else:
         model_output = model(y[:, :-1, :])
