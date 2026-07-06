@@ -543,7 +543,8 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     Args:
         benchmarks: Dictionary with 'y', 'mu_kal_pred', 'sigma_kal_pred', 'perf', 'pars'
                    where 'pars' is a dictionary with keys: 'tau', 'lim', 'si_stat', 'si_q', 'si_r'
-                   Note: 'mu_kal_pred' has shape (N_samples, T-3) - predictions for y[:, 3:]
+                   Note: 'mu_kal_pred' has shape (N_samples, T) and is index-aligned with y
+                   (mu_kal_pred[:, t] predicts y[:, t]); the KF warm-up region is left as NaN.
         data_config: Data configuration dictionary
         save_path: Optional path to save visualizations (defaults to benchmarks/ folder)
         suffix: Optional suffix to add to filenames (e.g., 'train', 'test')
