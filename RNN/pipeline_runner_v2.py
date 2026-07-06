@@ -32,7 +32,7 @@ import gc
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
-
+import numpy as np
 import torch
 
 # Add current directory to path for local imports
@@ -334,11 +334,10 @@ def main():
     
     # Apply HierarchicalGM-specific defaults if needed
     if args.gm_name == 'HierarchicalGM':
-        import numpy as np
         data = DataConfig(
             gm_name='HierarchicalGM',
             N_ctx=args.n_ctx,
-            N_tones=training.batch_size, # TODO:What????
+            N_tones=8,
             # HierarchicalGM-specific parameters
             si_d_coef=0.05,
             d_bounds={'high': 4, 'low': 0.1},

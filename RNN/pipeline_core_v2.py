@@ -412,10 +412,13 @@ def _process_single_kf_sample(args):
                 y_i, responsibilities_i, n_iter=n_iter, return_per_ctx=True
             )
     
-    # Compute MSE for this sample
-    # Use only the valid predictions (skip first MIN_OBS_FOR_EM NaN values)
+    # Compute MSE for this sample.
+    # Use nanmean to skip the KF warm-up region: mu_pred_i is NaN until the KF has enough
+    # observations to predict. For the multi-context KF this warm-up is longer than
+    # MIN_OBS_FOR_EM (each context must independently reach MIN_OBS_FOR_EM), so a fixed
+    # MIN_OBS_FOR_EM slice still leaves NaNs and a plain .mean() collapses to NaN.
     valid_slice = slice(MIN_OBS_FOR_EM, len(mu_pred_i))
-    mse_i = ((mu_pred_i[valid_slice] - y_i[valid_slice]) ** 2).mean()
+    mse_i = np.nanmean((mu_pred_i[valid_slice] - y_i[valid_slice]) ** 2)
     
     # Build sample data
     sample_data = {
@@ -519,7 +522,8 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     Args:
         benchmarks: Dictionary with 'y', 'mu_kal_pred', 'sigma_kal_pred', 'perf', 'pars'
                    where 'pars' is a dictionary with keys: 'tau', 'lim', 'si_stat', 'si_q', 'si_r'
-                   Note: 'mu_kal_pred' has shape (N_samples, T-3) - predictions for y[:, 3:]
+                   Note: 'mu_kal_pred' has shape (N_samples, T) and is index-aligned with y
+                   (mu_kal_pred[:, t] predicts y[:, t]); the KF warm-up region is left as NaN.
         data_config: Data configuration dictionary
         save_path: Optional path to save visualizations (defaults to benchmarks/ folder)
         suffix: Optional suffix to add to filenames (e.g., 'train', 'test')
@@ -527,15 +531,18 @@ def benchmarks_pars_viz(benchmarks, data_config, N_ctx, gm_name, save_path=None,
     param_bins = bin_params(data_config)
     y = benchmarks['y']
     # Use prediction estimates for MSE computation (matches model evaluation)
-    # mu_kal has shape (N_samples, T-MIN_OBS_FOR_EM) and predicts y[:, MIN_OBS_FOR_EM:]
+    # mu_kal has shape (N_samples, T) and is index-aligned with y (mu_kal[:, t] predicts
+    # y[:, t]). The KF warm-up region is NaN and is ignored by the nanmean-based reductions
+    # in map_binned_params_2_metrics (the warm-up length varies per sample for the
+    # multi-context KF, so it cannot be dropped with a single MIN_OBS_FOR_EM slice).
     min_obs = benchmarks.get('min_obs_for_em', MIN_OBS_FOR_EM)
     mu_kal = benchmarks['mu_kal_pred']
     sigma_kal = benchmarks['sigma_kal_pred']
     mse_kal = benchmarks['perf']
     pars_kal = benchmarks['pars']
-    
-    # Compute binned metrics - use y[:, min_obs:] to match mu_kal dimensions
-    binned_metrics_df = map_binned_params_2_metrics(param_bins, y[:, min_obs:], mu_kal, pars_kal)
+
+    # Compute binned metrics - y and mu_kal are full length (N, T) and index-aligned
+    binned_metrics_df = map_binned_params_2_metrics(param_bins, y, mu_kal, pars_kal)
     
     # Set up save path - include gm_name only when N_ctx > 1 to distinguish different GMs
     if save_path is None:
@@ -841,13 +848,14 @@ def map_binned_params_2_metrics(param_bins, y, mu_estim, pars, mu_kal=None):
     # Use the bins found to get the corresponding combination of parameters
     param_combination = (param_bins['tau'][tau_bin_id], param_bins['si_stat'][si_stat_bin_id], param_bins['si_r'][si_r_bin_id])
     
-    # Get MSE per sample in batch (model vs target)
-    mse_per_sample = ((mu_estim-y)**2).mean(axis=1)
-    
+    # Get MSE per sample in batch (model vs target). Use nanmean so the KF warm-up region
+    # (leading NaNs in mu_kal_pred, variable length for the multi-context KF) is ignored.
+    mse_per_sample = np.nanmean((mu_estim-y)**2, axis=1)
+
     # Compute KF metrics if KF predictions provided
     if mu_kal is not None:
-        mse_kal_per_sample = ((mu_kal-y)**2).mean(axis=1)  # KF vs target
-        mse_model2kal_per_sample = ((mu_estim-mu_kal)**2).mean(axis=1)  # Model vs KF
+        mse_kal_per_sample = np.nanmean((mu_kal-y)**2, axis=1)  # KF vs target
+        mse_model2kal_per_sample = np.nanmean((mu_estim-mu_kal)**2, axis=1)  # Model vs KF
 
     # Then, zip batch's param_combination array and MSE arrays and store
     if mu_kal is not None:
