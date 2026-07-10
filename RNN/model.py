@@ -23,14 +23,30 @@ class SimpleRNN(nn.Module):
         self.hidden_dim = config['hidden_dim']
         self.n_layers = config['n_layers']
         self.device = config.get('device', torch.device('cpu'))
+        # Optionally learn the initial hidden state h0 instead of starting from zeros.
+        self.train_h0 = config.get('train_h0', False)
 
         self.rnn = nn.GRU(self.input_dim, self.hidden_dim, self.n_layers, batch_first=True, device=self.device) # expect x of size (batch_size, seq_len, input_dim)
         self.output_layer = nn.Linear(self.hidden_dim, self.output_dim, device=self.device)
         if self.ext:
             self.output_layer_ext = nn.Linear(self.hidden_dim, self.output_ext_dim, device=self.device)
 
+        # Trainable initial state: a single (n_layers, 1, hidden_dim) vector, shared across
+        # the batch and broadcast in init_hidden. Registered as an nn.Parameter, so it is
+        # picked up by model.parameters() and optimised like any other weight. Small init
+        # (scaled by 1/sqrt(hidden_dim)) keeps early training stable.
+        if self.train_h0:
+            h0 = torch.randn(self.n_layers, 1, self.hidden_dim, device=self.device) / (self.hidden_dim ** 0.5)
+            self.h0 = nn.Parameter(h0)
+        else:
+            self.h0 = None
+
     def init_hidden(self, batch_size):
-        return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
+        if self.h0 is None:
+            return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
+        # Broadcast the single learned state across the batch; repeat is differentiable so
+        # gradients from the whole unrolled sequence flow back into h0.
+        return self.h0.repeat(1, batch_size, 1)
 
     def forward(self, x, hx=None, return_hidden=False):
         if hx is None:
@@ -296,17 +312,19 @@ class ObsCtxModuleNetwork(nn.Module):
             'output_ext_dim': config['observation_module']['output_ext_dim'],
             'hidden_dim': config['observation_module']['rnn_hidden_dim'],
             'n_layers': config['observation_module']['rnn_n_layers'],
+            'train_h0': config['observation_module'].get('train_h0', False),
             'device': config.get('device', torch.device('cpu'))
         }) # can be replaced with VRNN
-        
+
         self.context_module = SimpleRNN({
             'input_dim': config['context_module']['input_dim'],
             'output_dim': config['context_module']['output_dim'],
             'output_ext_dim': config['context_module']['output_ext_dim'],
             'hidden_dim': config['context_module']['rnn_hidden_dim'],
             'n_layers': config['context_module']['rnn_n_layers'],
+            'train_h0': config['context_module'].get('train_h0', False),
             'device': config.get('device', torch.device('cpu'))
-        })        
+        })
         
         self.readout_obs2ctx = self.inter_module_readout(
             in_dim=config['observation_module']['output_dim'],
@@ -381,6 +399,7 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             'output_ext_dim': config['dpos_module']['output_ext_dim'],
             'hidden_dim': config['dpos_module']['rnn_hidden_dim'],
             'n_layers': config['dpos_module']['rnn_n_layers'],
+            'train_h0': config['dpos_module'].get('train_h0', False),
             'device': config.get('device', torch.device('cpu'))
         })
 
@@ -390,6 +409,7 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             'output_ext_dim': config['rule_module']['output_ext_dim'],
             'hidden_dim': config['rule_module']['rnn_hidden_dim'],
             'n_layers': config['rule_module']['rnn_n_layers'],
+            'train_h0': config['rule_module'].get('train_h0', False),
             'device': config.get('device', torch.device('cpu'))
         })
 

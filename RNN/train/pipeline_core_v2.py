@@ -1059,7 +1059,7 @@ def plot_losses(train_steps, valid_steps, train_losses_report, valid_losses_repo
     plt.savefig(save_path)
     plt.close()
 
-def _get_dpos_color_map(n_dpos_classes=5, id_min=3):
+def _get_dpos_color_map(n_dpos_classes=5, id_min=2):
     """
     Create a color mapping for deviant positions using jet colormap.
     Maps min value -> light, max value -> dark.
@@ -1824,6 +1824,7 @@ def _create_module_network_config(config: RunConfig) -> dict:
             'output_dim': config.model_arch.output_dim,
             'rnn_hidden_dim': module_dims['obs'],
             'rnn_n_layers': config.model_arch.rnn_n_layers,
+            'train_h0': config.training.train_h0,
             'bottleneck_dim': config.bottleneck_dim or 16,
         }
     
@@ -1834,6 +1835,7 @@ def _create_module_network_config(config: RunConfig) -> dict:
             'output_dim': config.data.N_ctx,
             'rnn_hidden_dim': module_dims['ctx'],
             'rnn_n_layers': config.model_arch.rnn_n_layers,
+            'train_h0': config.training.train_h0,
             'bottleneck_dim': config.bottleneck_dim or 16,
         }
     
@@ -1875,6 +1877,7 @@ def _create_population_network_config(config: RunConfig) -> dict:
         'output_ext_dim': config.data.n_rule_classes,
         'rnn_hidden_dim': module_dims['rule'],
         'rnn_n_layers': config.model_arch.rnn_n_layers,
+        'train_h0': config.training.train_h0,
         'bottleneck_dim': config.bottleneck_dim,
     }
 
@@ -1887,6 +1890,7 @@ def _create_population_network_config(config: RunConfig) -> dict:
         'output_ext_dim': config.data.n_dpos_classes,
         'rnn_hidden_dim': module_dims['dpos'],
         'rnn_n_layers': config.model_arch.rnn_n_layers,
+        'train_h0': config.training.train_h0,
         'bottleneck_dim': config.bottleneck_dim,
     }
 
@@ -1899,6 +1903,7 @@ def _create_population_network_config(config: RunConfig) -> dict:
         'output_ext_dim': config.data.n_ctx_classes,
         'rnn_hidden_dim': module_dims['ctx'],
         'rnn_n_layers': config.model_arch.rnn_n_layers,
+        'train_h0': config.training.train_h0,
         'bottleneck_dim': config.bottleneck_dim,
     }
     
@@ -1911,6 +1916,7 @@ def _create_population_network_config(config: RunConfig) -> dict:
         'output_ext_dim': config.model_arch.output_dim,
         'rnn_hidden_dim': module_dims['obs'],
         'rnn_n_layers': config.model_arch.rnn_n_layers,
+        'train_h0': config.training.train_h0,
         'bottleneck_dim': config.bottleneck_dim,
     }
     

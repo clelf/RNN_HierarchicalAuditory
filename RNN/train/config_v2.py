@@ -58,8 +58,15 @@ class TrainingConfig:
     w_dev: float = 1.0
     w_next: float = 2.0
 
+    # When True, each RNN module learns its initial hidden state h0 (a trainable
+    # nn.Parameter) instead of starting every sequence from zeros. The single learned
+    # state is broadcast across the batch. Applies to every SimpleRNN-based module
+    # (obs/ctx/dpos/rule) in SimpleRNN, ObsCtxModuleNetwork and PopulationNetwork.
+    train_h0: bool = False
+
     @classmethod
-    def for_unit_test(cls, constrained_dpos_response_window: bool = False) -> 'TrainingConfig':
+    def for_unit_test(cls, constrained_dpos_response_window: bool = False,
+                      train_h0: bool = False) -> 'TrainingConfig':
         """Create a minimal config for unit testing."""
         return cls(
             num_epochs=10,
@@ -69,6 +76,7 @@ class TrainingConfig:
             epoch_res=10,
             batch_res=2,
             constrained_dpos_response_window=constrained_dpos_response_window,
+            train_h0=train_h0,
         )
 
 
@@ -580,7 +588,13 @@ class HyperparameterGrid:
         # Build name with module dims
         dims_str = '_'.join(f"{k}{v}" for k, v in sorted(module_hidden_dims.items()))
         name_parts.append(dims_str)
-        
+
+        # Distinguish runs with trainable initial states so they don't overwrite the
+        # zeros-init runs that share the same configuration otherwise.
+        if self.training.train_h0:
+            folder_parts.append('trainh0')
+            name_parts.append('trainh0')
+
         folder_name = '_'.join(folder_parts)
         config_name = '_'.join(name_parts)
         
@@ -671,10 +685,12 @@ class HyperparameterGrid:
                             f"got {type(self.hidden_dims)}. Use format like [16, 32, 64]"
                         )
                     
+                    # Suffix to keep trainable-h0 runs from overwriting zeros-init runs.
+                    h0_sfx = '_trainh0' if self.training.train_h0 else ''
                     for h_dim in self.hidden_dims:
                         configs.append(RunConfig(
-                            name=f"{model_type}_h{h_dim}_lr{lr}",
-                            save_dir=output_base / ctx_subpath / f"{model_type}_h{h_dim}",
+                            name=f"{model_type}_h{h_dim}_lr{lr}{h0_sfx}",
+                            save_dir=output_base / ctx_subpath / f"{model_type}_h{h_dim}{h0_sfx}",
                             model_type=model_type,
                             hidden_dim=h_dim,
                             learning_rate=lr,
@@ -744,6 +760,7 @@ def run_config_to_model_dict(config: RunConfig) -> dict:
         'hidden_dim': config.hidden_dim,
         'n_layers': config.model_arch.rnn_n_layers,
         'device': config.device,
+        'train_h0': config.training.train_h0,
         # VRNN-specific (uses same dim for all latent spaces)
         'latent_dim': config.hidden_dim,
         'phi_x_dim': config.hidden_dim,

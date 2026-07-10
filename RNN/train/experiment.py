@@ -25,10 +25,13 @@ if '--no-unit-test' in sys.argv:
 # emphasize (add weight to) the deviant timestep and the one just after it, biasing it to
 # commit to the correct position as soon as it is knowable (tune w_dev/w_next in
 # TrainingConfig). To be set to False to supervise dpos uniformly like the other modules.
+# train_h0: when True, each RNN module learns its initial hidden state h0 (a trainable
+# parameter, broadcast across the batch) instead of always starting from zeros. Off by
+# default to preserve existing behaviour; flip to True to enable.
 if UNIT_TEST:
-    training = TrainingConfig.for_unit_test(constrained_dpos_response_window=True)
+    training = TrainingConfig.for_unit_test(constrained_dpos_response_window=True, train_h0=False)
 else:
-    training = TrainingConfig(num_epochs=200, constrained_dpos_response_window=True)
+    training = TrainingConfig(num_epochs=200, constrained_dpos_response_window=True, train_h0=False)
 
 
 # Data config (single source of truth shared with benchmark_experiment.py).
