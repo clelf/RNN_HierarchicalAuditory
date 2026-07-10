@@ -43,11 +43,20 @@ class TrainingConfig:
     epoch_res: int = 20      # Report every N epochs
     batch_res: int = 16      # Report every N batches
 
-    # Training strategy: when True, the dpos module is only supervised within a
-    # per-trial response window (from the start of each trial up to one timestep
-    # after the ground-truth deviant). When False, dpos is supervised at every
-    # timestep like the other modules. Only affects PopulationNetwork + HierarchicalGM.
+    # Training strategy: when True, the dpos module is supervised at every (real)
+    # timestep but with per-timestep weights that emphasize the deviant timestep
+    # (extra weight w_dev) and the one just after it (extra weight w_next), biasing
+    # learning toward committing to the correct position as soon as it is knowable.
+    # When False, dpos is supervised uniformly like the other modules.
+    # Only affects PopulationNetwork + HierarchicalGM.
     constrained_dpos_response_window: bool = False
+    # Extra emphasis (added on top of the baseline weight of 1) on the deviant
+    # timestep and the timestep just after it, respectively. Only used when
+    # constrained_dpos_response_window is True. w_next >= w_dev prioritizes the
+    # post-deviant step. Final weights: 1+w_dev at the deviant, 1+w_next just after,
+    # 1 elsewhere, 0 on silence timesteps.
+    w_dev: float = 1.0
+    w_next: float = 2.0
 
     @classmethod
     def for_unit_test(cls, constrained_dpos_response_window: bool = False) -> 'TrainingConfig':

@@ -181,7 +181,7 @@ def prepare_batch_data(gm, gm_name, data_mode, device, return_pars=False):
             batch_data.update({
                 'q': q_onehot # Now (T, N, N_cat)
             })
-            # Optional per-timestep silence bookkeeping (only present when iti is on).
+            # Optional per-timestep silence memory keeping (only present when iti is on).
             # Used downstream to restrict the dpos response window to real tones.
             if 'is_silence' in batch:
                 batch_data.update({
@@ -253,7 +253,7 @@ def get_ctx_gm_subpath(N_ctx, gm_name):
 
 def compute_model_loss(model, objective, y_tensor, model_output, data_mode,
                        learning_objective='obs_ctx', contexts_tensor=None,
-                       dpos_tensor=None, rules_tensor=None, kappa=0.5, dpos_mask=None):
+                       dpos_tensor=None, rules_tensor=None, kappa=0.5, dpos_weight=None):
     """
     Compute loss based on model type, data mode, and learning objective.
     
@@ -293,7 +293,7 @@ def compute_model_loss(model, objective, y_tensor, model_output, data_mode,
         return objective.loss(model, y_tensor[:, 1:, :], model_output,
                               target_ctx=contexts_tensor[:, 1:],
                               target_dpos=dpos_tensor[:, 1:], target_rule=rules_tensor[:, 1:],
-                              learning_objective=learning_objective, dpos_mask=dpos_mask)
+                              learning_objective=learning_objective, dpos_weight=dpos_weight)
     else:
         # Standard RNN/VRNN loss
         return objective.loss(model, y_tensor[:, 1:, :], model_output)
@@ -1967,31 +1967,44 @@ def _compute_forward_and_loss(
         rules = batch_data['rules']
         model_output = model(y[:, :-1, :], q[:, :-1, :])
 
-        # Optionally constrain the dpos module: when enabled, it is only supervised
-        # from the start of each trial up to one timestep after the ground-truth
-        # deviant. All other modules remain supervised at every timestep. When
-        # disabled (default), dpos is supervised at every timestep (dpos_mask=None).
+        # Optionally constrain the dpos module's response window: when enabled, dpos
+        # is still supervised at every (real) timestep, but with per-timestep weights
+        # that add weight to the deviant timestep (w_dev) and the one just after it
+        # (w_next), so learning is biased toward committing to the correct position as
+        # soon as it becomes detectable. All other timesteps keep baseline weight 1;
+        # silence timesteps get weight 0 (excluded). When disabled (default), dpos is
+        # supervised uniformly (dpos_weight=None).
         # Targets correspond to global timesteps 1..T-1 (next-step prediction), so the
-        # window compares the within-trial position of each target to (deviant + 1).
+        # within-trial position of each target is compared to the deviant position.
         # The deviant position of each target's block is batch_data['dpos'][:, 1:]
         # (raw, un-indexed positions).
-        dpos_mask = None
+        dpos_weight = None
         if config.training.constrained_dpos_response_window:
             dvt_pos = batch_data['dpos'][:, 1:, 0]                             # (N, T-1)
+            w_dev = config.training.w_dev
+            w_next = config.training.w_next
             if 'within_trial_pos' in batch_data:
                 # Inter-trial silences on: trials are not evenly spaced, so use the
                 # GM-provided per-timestep within-trial index and silence flags.
-                # Silence timesteps are excluded from the dpos response window.
                 within_trial_pos = batch_data['within_trial_pos'][:, 1:]       # (N, T-1)
                 is_silence = batch_data['is_silence'][:, 1:]                   # (N, T-1)
-                dpos_mask = (~is_silence) & (within_trial_pos >= 0) & (within_trial_pos <= dvt_pos + 1)
+                valid = (~is_silence) & (within_trial_pos >= 0)               # (N, T-1) bool
+                rel = within_trial_pos - dvt_pos                              # (N, T-1)
             else:
                 # No silences: trials are contiguous blocks of N_tones tones, so the
                 # within-trial position of target i is (i + 1) % N_tones.
                 N_tones = config.data.N_tones
                 T = y.shape[1]
                 within_trial_pos = torch.arange(1, T, device=y.device) % N_tones  # (T-1,)
-                dpos_mask = within_trial_pos.unsqueeze(0) <= (dvt_pos + 1)        # (N, T-1) bool
+                valid = torch.ones_like(dvt_pos, dtype=torch.bool)                # (N, T-1)
+                rel = within_trial_pos.unsqueeze(0) - dvt_pos                     # (N, T-1)
+
+            # Extra emphasis on the two commitment timesteps (0 elsewhere), then
+            # baseline 1 everywhere valid; silence/invalid timesteps get weight 0.
+            emphasis = torch.zeros_like(dvt_pos, dtype=y.dtype)               # (N, T-1)
+            emphasis = torch.where(rel == 0, torch.full_like(emphasis, w_dev), emphasis)
+            emphasis = torch.where(rel == 1, torch.full_like(emphasis, w_next), emphasis)
+            dpos_weight = torch.where(valid, 1.0 + emphasis, torch.zeros_like(emphasis))
 
         loss = compute_model_loss(
             model, objective, y, model_output, data_mode,
@@ -1999,7 +2012,7 @@ def _compute_forward_and_loss(
             contexts_tensor=contexts,
             dpos_tensor=dpos,
             rules_tensor=rules,
-            dpos_mask=dpos_mask
+            dpos_weight=dpos_weight
         )
     else:
         model_output = model(y[:, :-1, :])

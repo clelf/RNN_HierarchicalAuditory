@@ -21,9 +21,10 @@ if '--no-unit-test' in sys.argv:
     sys.argv.remove('--no-unit-test')
 
 # Custom training config
-# constrained_dpos_response_window: only supervise the dpos module from the start of
-# each trial up to one timestep after the ground-truth deviant (set False to supervise
-# dpos at every timestep like the other modules).
+# constrained_dpos_response_window: supervise the dpos module at every timestep but
+# emphasize (add weight to) the deviant timestep and the one just after it, biasing it to
+# commit to the correct position as soon as it is knowable (tune w_dev/w_next in
+# TrainingConfig). To be set to False to supervise dpos uniformly like the other modules.
 if UNIT_TEST:
     training = TrainingConfig.for_unit_test(constrained_dpos_response_window=True)
 else:
@@ -46,7 +47,7 @@ data = DataConfig.for_hierarchical_experiment(
 # Custom hyperparameter grid
 param_grid = HyperparameterGrid(
     model_types=['population_network'], # population_network , module_network
-    learning_rates=[0.005], #, 0.01, 0.001] if not UNIT_TEST else [0.01], # Removed 0.05 and 0.1 to prevent gradient explosion
+    learning_rates=[0.001], #, 0.01, 0.001] if not UNIT_TEST else [0.01], # Removed 0.05 and 0.1 to prevent gradient explosion
     # hidden_dims=[64],  # Fixed for ModuleNetwork anyway # TODO: look into this
     hidden_dims={'obs': [64], 'ctx': [64], 'dpos': [64], 'rule': [64]}, # TODO: look into this, possibly no need to decrease hidden dims...
     # learning_objectives=['all'], # 'obs', 'ctx', 'all'

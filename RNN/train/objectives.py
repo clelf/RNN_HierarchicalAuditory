@@ -41,7 +41,7 @@ class Objective:
         self.loss_func_ctx = loss_func_ctx # will be None if not used
     
     
-    def loss(self, model, target, model_output, target_ctx=None, target_dpos=None, target_rule=None, kappa=0.5, learning_objective='all', dpos_mask=None):
+    def loss(self, model, target, model_output, target_ctx=None, target_dpos=None, target_rule=None, kappa=0.5, learning_objective='all', dpos_weight=None):
         """Compute the loss for a given model and its output.
         
         Parameters
@@ -88,7 +88,7 @@ class Objective:
             return self._population_network_loss(module_type, target_obs=target, target_ctx=target_ctx,
                                                  target_dpos=target_dpos, target_rule=target_rule,
                                                  model_output=model_output, learning_objective=learning_objective,
-                                                 dpos_mask=dpos_mask)
+                                                 dpos_weight=dpos_weight)
         else:
             raise ValueError(f"Unsupported model type: {model_name}")
     
@@ -209,7 +209,43 @@ class Objective:
         per_element = F.cross_entropy(output, target, reduction='none')
         denom = mask.sum().clamp(min=1.0)
         return (per_element * mask).sum() / denom
-    
+
+    def _weighted_classification_loss(self, target, output, weight):
+        """Cross-entropy as a weighted mean over per-timestep weights.
+
+        Generalizes ``_masked_classification_loss``: instead of a boolean
+        include/exclude mask, each timestep contributes to the loss in proportion
+        to ``weight`` (a float tensor). A weight of 0 excludes a timestep (as a
+        masked-out step would), 1 is the baseline contribution, and >1 emphasizes a
+        timestep (its errors are penalized more heavily, so learning prioritizes it).
+        Used to constrain the dpos module to commit at the deviant / next timesteps.
+
+        Parameters
+        ----------
+        target : torch.Tensor
+            Target class labels, shape (batch, seq_len) or (batch, seq_len, 1).
+        output : torch.Tensor
+            Model logits, shape (batch, seq_len, n_classes).
+        weight : torch.Tensor
+            Non-negative per-timestep weights of shape (batch, seq_len).
+
+        Returns
+        -------
+        torch.Tensor
+            Cross-entropy averaged over timesteps, weighted by ``weight``.
+        """
+        # Flattens
+        if output.ndim == 3:
+            _, _, n_classes = output.shape
+            output = output.reshape(-1, n_classes)
+            target = target.reshape(-1)
+        weight = weight.reshape(-1).to(output.dtype)
+
+        # Per-element cross-entropy (mirrors the CrossEntropyLoss used elsewhere)
+        per_element = F.cross_entropy(output, target, reduction='none')
+        denom = weight.sum().clamp(min=1.0)
+        return (per_element * weight).sum() / denom
+
     def _reconstruction_loss(self, target, x_output, loss_func=None):
         """Compute reconstruction loss with softplus variance transformation."""
         out_estim_mu = x_output[:, :, [0]]
@@ -291,7 +327,7 @@ class Objective:
         return loss
     
 
-    def _population_network_loss(self, module_type, target_obs, target_ctx, target_dpos, target_rule, model_output, learning_objective='all', dpos_mask=None):
+    def _population_network_loss(self, module_type, target_obs, target_ctx, target_dpos, target_rule, model_output, learning_objective='all', dpos_weight=None):
         # one loss per module, no competition between them
 
         # Get outputs
@@ -304,11 +340,12 @@ class Objective:
         ctx_loss = self._classification_loss(target_ctx, ctx_output)
 
         # Deviant position loss (classification task: deviant position inference).
-        # The dpos module is constrained to only be supervised within a temporal
-        # window within each trial (from the start of the trial up to one timestep after
-        # the ground-truth deviant), so its loss is masked when a mask is provided.
-        if dpos_mask is not None:
-            dpos_loss = self._masked_classification_loss(target_dpos, dpos_output, dpos_mask)
+        # The dpos module is supervised at every (real) timestep, but with per-timestep
+        # weights that pressure the deviant timestep and the one just after it, so
+        # learning is biased toward committing to the correct position as soon as it
+        # becomes detectable, while still supervising the rest of the trial.
+        if dpos_weight is not None:
+            dpos_loss = self._weighted_classification_loss(target_dpos, dpos_output, dpos_weight)
         else:
             dpos_loss = self._classification_loss(target_dpos, dpos_output)
 

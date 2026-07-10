@@ -74,7 +74,6 @@ def run_pipeline(
     """
     Run the full training/testing pipeline for all configurations in the grid.
     
-    This is the MAIN ENTRY POINT. The flow is:
     1. Expand grid into flat list of RunConfigs
     2. Compute/load benchmarks (once, shared by all runs)
     3. Loop over configs and run each one
