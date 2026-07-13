@@ -119,6 +119,13 @@ class DataConfig:
     mu_tau_bounds: dict = field(default_factory=lambda: {'low': 1, 'high': 250})
     si_stat_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
     si_r_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
+
+    # Optional override: pin the observation noise sigma_r to a single value instead of
+    # sampling it from si_r_bounds. All other generative parameters keep being sampled
+    # normally. Implemented by emitting degenerate si_r_bounds (low == high == si_r_fixed)
+    # in to_gm_dict, so the GM sampling code is untouched. When set, runs get a
+    # '_fixedsir' folder/name suffix so they don't overwrite the sampled-sigma_r runs.
+    si_r_fixed: Optional[float] = None
     
     # Multi-context parameters (only used when N_ctx > 1)
     si_d_coef: float = 0.05
@@ -160,7 +167,8 @@ class DataConfig:
     def for_hierarchical_experiment(cls, N_ctx: int = 2,
                                     N_blocks: int = 125,
                                     max_cores: Optional[int] = None,
-                                    iti: bool = False) -> 'DataConfig':
+                                    iti: bool = False,
+                                    si_r_fixed: Optional[float] = None) -> 'DataConfig':
         """Canonical HierarchicalGM data configuration.
 
         SINGLE SOURCE OF TRUTH for the hierarchical data-generation
@@ -205,6 +213,7 @@ class DataConfig:
             cues_set=list(range(12)),
             N_cues_per_seq=2,
             iti=iti,   # optional inter-trial silences (temporal dimension); OFF by default
+            si_r_fixed=si_r_fixed,  # optional: pin sigma_r instead of sampling it
             max_cores=max_cores,
         )
 
@@ -212,7 +221,8 @@ class DataConfig:
     def for_nonhierarchical_experiment(cls, N_ctx: int = 2,
                                        N_tones: int = 1000,
                                        max_cores: Optional[int] = None,
-                                       iti: bool = False) -> 'DataConfig':
+                                       iti: bool = False,
+                                       si_r_fixed: Optional[float] = None) -> 'DataConfig':
         """Canonical NonHierarchicalGM data configuration.
 
         Companion to for_hierarchical_experiment: SINGLE SOURCE OF TRUTH for the
@@ -237,6 +247,7 @@ class DataConfig:
             si_stat_bounds={'low': 0.01, 'high': 0.2},
             si_r_bounds={'low': 0.001, 'high': 0.02},
             iti=iti,   # optional inter-trial silences (temporal dimension); OFF by default
+            si_r_fixed=si_r_fixed,  # optional: pin sigma_r instead of sampling it
             max_cores=max_cores,
         )
 
@@ -318,10 +329,18 @@ class DataConfig:
         }
         
         if self.params_testing:
+            # Pin sigma_r via degenerate bounds when si_r_fixed is set; np.random.uniform
+            # (used by the GM) returns the bound when low == high, so this fixes sigma_r
+            # while every other parameter is still sampled from its own bounds.
+            si_r_bounds = (
+                {'low': self.si_r_fixed, 'high': self.si_r_fixed}
+                if self.si_r_fixed is not None
+                else self.si_r_bounds
+            )
             d.update({
                 'mu_tau_bounds': self.mu_tau_bounds,
                 'si_stat_bounds': self.si_stat_bounds,
-                'si_r_bounds': self.si_r_bounds,
+                'si_r_bounds': si_r_bounds,
             })
         
         if self.N_ctx > 1:
@@ -595,6 +614,12 @@ class HyperparameterGrid:
             folder_parts.append('trainh0')
             name_parts.append('trainh0')
 
+        # Distinguish runs whose sigma_r was pinned (si_r_fixed) so they don't overwrite
+        # the sampled-sigma_r runs that are otherwise identically configured.
+        if self.data.si_r_fixed is not None:
+            folder_parts.append('fixedsir')
+            name_parts.append('fixedsir')
+
         folder_name = '_'.join(folder_parts)
         config_name = '_'.join(name_parts)
         
@@ -685,12 +710,14 @@ class HyperparameterGrid:
                             f"got {type(self.hidden_dims)}. Use format like [16, 32, 64]"
                         )
                     
-                    # Suffix to keep trainable-h0 runs from overwriting zeros-init runs.
+                    # Suffix to keep trainable-h0 runs from overwriting zeros-init runs,
+                    # and pinned-sigma_r runs from overwriting sampled-sigma_r runs.
                     h0_sfx = '_trainh0' if self.training.train_h0 else ''
+                    sir_sfx = '_fixedsir' if self.data.si_r_fixed is not None else ''
                     for h_dim in self.hidden_dims:
                         configs.append(RunConfig(
-                            name=f"{model_type}_h{h_dim}_lr{lr}{h0_sfx}",
-                            save_dir=output_base / ctx_subpath / f"{model_type}_h{h_dim}{h0_sfx}",
+                            name=f"{model_type}_h{h_dim}_lr{lr}{h0_sfx}{sir_sfx}",
+                            save_dir=output_base / ctx_subpath / f"{model_type}_h{h_dim}{h0_sfx}{sir_sfx}",
                             model_type=model_type,
                             hidden_dim=h_dim,
                             learning_rate=lr,

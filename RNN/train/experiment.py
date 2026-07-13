@@ -39,6 +39,7 @@ else:
 data = DataConfig.for_hierarchical_experiment(
     N_ctx=2,
     max_cores=1 if UNIT_TEST else None,  # Disable parallel processing during tests
+    si_r_fixed=0.02,
 )
 # --- To use NonHierarchicalGM instead, comment the block above and uncomment: ---
 # data = DataConfig.for_nonhierarchical_experiment(
