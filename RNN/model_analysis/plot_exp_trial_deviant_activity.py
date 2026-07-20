@@ -11,13 +11,17 @@ from model_activations import (
 import torch
 
 
-def compute_norms_and_devpos_for_files(model, files, period=8, chunk_size=128):
+def compute_norms_and_devpos_for_files(model, files, period=8, chunk_size=128,
+                                       n_cue_classes=None, cue_seed=None):
     """Run the model over many sequence files; return per-module norms and deviant positions.
 
     Mirrors ``compute_norms_for_files`` (chunked forward passes to bound memory)
     but also collects, for every sequence, the 0-based within-trial deviant
     position of each trial. ``dpos`` is constant within a trial, so one value per
     trial is taken (``dpos[::period]``).
+
+    ``n_cue_classes`` / ``cue_seed`` are forwarded to ``load_trial_sequence`` so the two
+    experimental cues can be re-encoded into the model's cue vocabulary.
 
     Returns
     -------
@@ -34,7 +38,8 @@ def compute_norms_and_devpos_for_files(model, files, period=8, chunk_size=128):
         obs_list, cue_list = [], []
         for f in chunk:
             obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n = \
-                load_trial_sequence(f, return_hierarch=True)
+                load_trial_sequence(f, return_hierarch=True,
+                                    n_cue_classes=n_cue_classes, cue_seed=cue_seed)
             obs_list.append(obs)
             cue_list.append(cue)
             # RAW physical within-trial position {2..6}: kept raw because it indexes
@@ -46,10 +51,10 @@ def compute_norms_and_devpos_for_files(model, files, period=8, chunk_size=128):
 
         min_len = min(o.shape[0] for o in obs_list)
         obs_stack = np.stack([o[:min_len] for o in obs_list], axis=0)        # (N, T)
-        cue_stack = np.stack([c[:min_len, :] for c in cue_list], axis=0)     # (N, T, 2)
+        cue_stack = np.stack([c[:min_len, :] for c in cue_list], axis=0)     # (N, T, n_cue)
 
         y = torch.tensor(obs_stack, dtype=torch.float32).unsqueeze(-1)       # (N, T, 1)
-        q = torch.tensor(cue_stack, dtype=torch.float32)                     # (N, T, 2)
+        q = torch.tensor(cue_stack, dtype=torch.float32)                     # (N, T, n_cue)
 
         _, module_norms, _ = get_module_output_and_activity(model, y, q)
         for name, norms in module_norms.items():
@@ -74,7 +79,8 @@ if __name__ == '__main__':
     # Set to an int to randomly sample that many sequences, or None to use all.
     N_sequences = None
 
-    model_name = 'population_network_all_bn8_lr0'
+    # model_name = "population_network_all_bn8_lr0"
+    model_name = "population_network_all_bn8_lr0.001_dposweight"
     model_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/training_results/N_ctx_2/HierarchicalGM")
     model_path = model_dir / model_name
 
@@ -90,6 +96,10 @@ if __name__ == '__main__':
     model = eval.load_model(info)
     model.eval()
     print(f"Loaded model: {model_name}")
+
+    # If the model was trained with a larger cue vocabulary than the two cues present in
+    # the experimental sequences, re-encode the cues into the dimensionality it expects.
+    n_cue_classes = len(info.data_config_dict['cues_set'])
 
     # =============================================================================
     # Select trial files
@@ -110,7 +120,8 @@ if __name__ == '__main__':
     # =============================================================================
     # Run forward passes (chunked); collect per-module norms and deviant positions
     # =============================================================================
-    module_norms_dict, dev_pos = compute_norms_and_devpos_for_files(model, selected_files, period=PERIOD)
+    module_norms_dict, dev_pos = compute_norms_and_devpos_for_files(
+        model, selected_files, period=PERIOD, n_cue_classes=n_cue_classes, cue_seed=11)
 
     module_titles = {
         'obs':  'Observation module',

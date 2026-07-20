@@ -1504,6 +1504,8 @@ def plot_samples(sample_metrics, save_path, title=None, params=None, seq_start=N
     if isinstance(obs, torch.Tensor):
         obs = obs.detach().cpu().numpy()
     obs = obs.squeeze() # for safety
+    if obs.ndim == 1:  # a batch of 1 squeezes down to (T,); restore the (1, T) batch dim
+        obs = obs[None, :]
     
     # Get N_ctx from data_config
     n_ctx = data_config["N_ctx"]

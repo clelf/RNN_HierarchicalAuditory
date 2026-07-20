@@ -26,7 +26,8 @@ if __name__ == "__main__":
     # models_info = [eval.ModelInfo.from_path(models_dir / model_dir) for model_dir in os.listdir(models_dir)]
 
     # Or load a single specific model:
-    model_name = 'population_network_all_bn8_lr0'  # Change this to desired model name
+    # model_name = "population_network_all_bn8_lr0"
+    model_name = "population_network_all_bn8_lr0.001_dposweight"
     models_info = [eval.ModelInfo.from_path(models_dir / model_name)]
 
     # =============================================================================

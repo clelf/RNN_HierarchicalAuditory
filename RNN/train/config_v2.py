@@ -50,7 +50,8 @@ class TrainingConfig:
     # When False, dpos is supervised uniformly like the other modules.
     # Only affects PopulationNetwork + HierarchicalGM.
     constrained_dpos_response_window: bool = False
-    # Extra emphasis (added on top of the baseline weight of 1) on the deviant
+    
+    # Extra weight (added on top of the baseline weight of 1) on the deviant
     # timestep and the timestep just after it, respectively. Only used when
     # constrained_dpos_response_window is True. w_next >= w_dev prioritizes the
     # post-deviant step. Final weights: 1+w_dev at the deviant, 1+w_next just after,
@@ -551,6 +552,9 @@ class HyperparameterGrid:
     # Output settings
     base_output_dir: Path = field(default_factory=lambda: Path(os.path.dirname(__file__)) / '..' / 'training_results')
     run_id: Optional[str] = None
+    # Optional tag appended as a suffix to each model's folder name, so manual test
+    # runs don't overwrite each other. Set it in experiment.py.
+    folder_tag: Optional[str] = None
     
     def _get_objectives_and_kappas(self, model_type: ModelType) -> List[Tuple[str, Optional[float]]]:
         """
@@ -619,6 +623,9 @@ class HyperparameterGrid:
         if self.data.si_r_fixed is not None:
             folder_parts.append('fixedsir')
             name_parts.append('fixedsir')
+
+        if self.folder_tag:
+            folder_parts.append(self.folder_tag)
 
         folder_name = '_'.join(folder_parts)
         config_name = '_'.join(name_parts)
@@ -714,10 +721,11 @@ class HyperparameterGrid:
                     # and pinned-sigma_r runs from overwriting sampled-sigma_r runs.
                     h0_sfx = '_trainh0' if self.training.train_h0 else ''
                     sir_sfx = '_fixedsir' if self.data.si_r_fixed is not None else ''
+                    tag_sfx = f'_{self.folder_tag}' if self.folder_tag else ''
                     for h_dim in self.hidden_dims:
                         configs.append(RunConfig(
                             name=f"{model_type}_h{h_dim}_lr{lr}{h0_sfx}{sir_sfx}",
-                            save_dir=output_base / ctx_subpath / f"{model_type}_h{h_dim}{h0_sfx}{sir_sfx}",
+                            save_dir=output_base / ctx_subpath / f"{model_type}_h{h_dim}{h0_sfx}{sir_sfx}{tag_sfx}",
                             model_type=model_type,
                             hidden_dim=h_dim,
                             learning_rate=lr,

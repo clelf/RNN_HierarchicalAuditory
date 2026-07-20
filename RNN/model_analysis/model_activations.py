@@ -49,8 +49,8 @@ def dpos_conventions(info, experimental_dpos_min=EXPERIMENTAL_DPOS_MIN):
     return dpos_min, dpos_min - experimental_dpos_min
 
 
-def load_trial_sequence(filepath, return_hierarch=False):
-    """Load a trial CSV and return observation array and one-hot cue array (T, 2).
+def load_trial_sequence(filepath, return_hierarch=False, n_cue_classes=None, cue_seed=None):
+    """Load a trial CSV and return observation array and one-hot cue array (T, n).
 
     Parameters
     ----------
@@ -65,6 +65,18 @@ def load_trial_sequence(filepath, return_hierarch=False):
           shifted to 0-based class indices)
         - rule comes from the 'rule' column
         Each is an int64 array of shape (T,).
+    n_cue_classes : int, optional
+        Number of cue classes to encode. The experimental files only ever use the
+        two cues in ``CUE_LABELS``, but some models were trained with a larger cue
+        set (e.g. cues_set = 0,...,11). When ``n_cue_classes`` is larger than
+        ``len(CUE_LABELS)``, the two cues in the sequence are each assigned a
+        distinct, randomly chosen class out of ``range(n_cue_classes)`` (assignment
+        preserves ``CUE_LABELS`` order), and ``cue`` is returned as a
+        (T, n_cue_classes) one-hot the model can consume. Defaults to the native
+        two-class encoding.
+    cue_seed : int, optional
+        Seed for the random class assignment when ``n_cue_classes`` is set. ``None``
+        (default) draws a fresh assignment each call.
 
     Returns
     -------
@@ -76,7 +88,21 @@ def load_trial_sequence(filepath, return_hierarch=False):
     cue_raw = df['cue'].to_numpy()
     label_to_idx = {label: i for i, label in enumerate(CUE_LABELS)}
     cue_idx = np.vectorize(label_to_idx.get)(cue_raw)
-    cue = np.eye(len(CUE_LABELS), dtype=np.float32)[cue_idx]  # (T, 2)
+
+    n_native = len(CUE_LABELS)
+    if n_cue_classes is None or n_cue_classes == n_native:
+        cue = np.eye(n_native, dtype=np.float32)[cue_idx]  # (T, n_native)
+    else:
+        if n_cue_classes < n_native:
+            raise ValueError(
+                f"n_cue_classes ({n_cue_classes}) must be >= number of cue labels "
+                f"({n_native})")
+        # Map each native cue to a distinct random class; sort so the smaller class
+        # index goes to CUE_LABELS[0], keeping the column ordering recoverable.
+        rng = np.random.default_rng(cue_seed)
+        sel = np.sort(rng.choice(n_cue_classes, size=n_native, replace=False))
+        cue = np.zeros((len(cue_idx), n_cue_classes), dtype=np.float32)  # (T, n_cue_classes)
+        cue[np.arange(len(cue_idx)), sel[cue_idx]] = 1.0
     trial_n = df['trial_n']
     lim_std = df['lim_std'].iloc[0]
     d = df['d'].iloc[0]
