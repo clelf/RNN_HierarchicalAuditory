@@ -2067,6 +2067,13 @@ def train_model(
         lr=config.learning_rate,
         weight_decay=config.training.weight_decay
     )
+
+    # LR scheduler: cosine annealing from the initial LR down to ~0 over the run.
+    # Keeps the fast early descent of a higher LR while lowering it late in
+    # training, where a constant LR tends to spike and fail to recover.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.training.num_epochs
+    )
     
     # Loss function
     loss_fn_obs = torch.nn.GaussianNLLLoss(reduction='mean')
@@ -2191,7 +2198,10 @@ def train_model(
             epoch, valid_metrics, time.time() - t_start,
             (epoch + 1) * n_batches, benchmarks is not None
         )
-    
+
+        # Decay the learning rate for the next epoch
+        scheduler.step()
+
     # ========== SAVE RESULTS ==========
     print(f"Final - Train Loss: {np.mean(epoch_losses):.4f}, Valid Loss: {valid_metrics['loss']:.4f}")
     
