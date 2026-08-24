@@ -23,13 +23,14 @@ if __name__ == '__main__':
     # Number of trial sequences to use (only applies to Option B random sampling below)
     N_sequences = 2
 
-    model_name = 'population_network_all_bn8_lr0'
+    # model_name = "population_network_all_bn8_lr0"
+    model_name = "population_network_all_bn8_lr0.001_dposweight"
     model_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/training_results/N_ctx_2/HierarchicalGM")
     model_path = model_dir / model_name
 
-    trials_path = Path("/home/clevyfidel/Documents/Workspace/Jasmin/trialsequences2clem")
+    trials_path = Path("/home/clevyfidel/Documents/Workspace/Jasmin/trialsequences2clem")   
 
-    output_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output/viz_examples") / model_name
+    output_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output") / model_name / "viz_examples"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # =============================================================================
@@ -39,6 +40,10 @@ if __name__ == '__main__':
     model = eval.load_model(info)
     model.eval()
     print(f"Loaded model: {model_name}")
+
+    # If the model was trained with a larger cue vocabulary than the two cues present in
+    # the experimental sequences, re-encode the cues into the dimensionality it expects.
+    n_cue_classes = len(info.data_config_dict['cues_set'])
 
     # =============================================================================
     # Select trial files
@@ -66,7 +71,8 @@ if __name__ == '__main__':
     # =============================================================================
     obs_list, cue_list, params_list = [], [], []
     for f in selected_files:
-        obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(f)
+        obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(
+            f, n_cue_classes=n_cue_classes, cue_seed=11)
         obs_list.append(obs)
         cue_list.append(cue)
         params_list.append(load_trial_params(f))
@@ -84,10 +90,10 @@ if __name__ == '__main__':
         print(f"  Warning: sequences have unequal lengths — truncating all to {min_len} timesteps")
 
     obs_stack = np.stack([o[:min_len] for o in obs_list], axis=0)        # (N, T)
-    cue_stack = np.stack([c[:min_len, :] for c in cue_list], axis=0)     # (N, T, 2)
+    cue_stack = np.stack([c[:min_len, :] for c in cue_list], axis=0)     # (N, T, n_cue)
 
     y = torch.tensor(obs_stack, dtype=torch.float32).unsqueeze(-1)       # (N, T, 1)
-    q = torch.tensor(cue_stack, dtype=torch.float32)                     # (N, T, 2)
+    q = torch.tensor(cue_stack, dtype=torch.float32)                     # (N, T, n_cue)
 
     # =============================================================================
     # Run forward pass — returns norms (T-1, N) and derivatives (T-2, N)

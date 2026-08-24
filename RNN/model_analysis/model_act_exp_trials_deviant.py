@@ -28,7 +28,8 @@ if __name__ == '__main__':
     PERIOD = 8
 
     # Specify model path (one model only), load model
-    model_name = "population_network_all_bn8_lr0"
+    # model_name = "population_network_all_bn8_lr0"
+    model_name = "population_network_all_bn8_lr0.001_dposweight"
     model_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/training_results/N_ctx_2/HierarchicalGM")
     model_path = model_dir / model_name
 
@@ -44,6 +45,13 @@ if __name__ == '__main__':
     model = eval.load_model(info)
     model.eval()
     print(f"Loaded model: {model_path.name}")
+
+    # If the model was trained with a larger cue vocabulary than the two cues present in
+    # the experimental sequences, re-encode the cues into the dimensionality it expects.
+    # cue_seed must match model_prob_exp_trials.py so the deviant norms produced here and
+    # the deviant likelihoods produced there use the same cue encoding (they are merged
+    # per trial in exp_trial_join_act_proba.py).
+    n_cue_classes = len(info.data_config_dict['cues_set'])
 
     # dpos convention from the model's config. Two distinct uses of dpos are kept
     # separate below:
@@ -62,7 +70,8 @@ if __name__ == '__main__':
 
     for trial_file in trial_files:
         obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n = \
-            load_trial_sequence(trial_file, return_hierarch=True)
+            load_trial_sequence(trial_file, return_hierarch=True,
+                                n_cue_classes=n_cue_classes, cue_seed=11)
         y, q = to_model_tensors(obs, cue)
 
         # hidden_activity:    dict module → (T-1, 1)

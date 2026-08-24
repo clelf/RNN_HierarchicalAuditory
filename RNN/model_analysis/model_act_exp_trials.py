@@ -16,7 +16,8 @@ if __name__ == '__main__':
 
 
     # Specify model path (one model only), load model
-    model_name = "population_network_all_bn8_lr0"
+    # model_name = "population_network_all_bn8_lr0"
+    model_name = "population_network_all_bn8_lr0.001_dposweight"
     model_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/training_results/N_ctx_2/HierarchicalGM")
     model_path = model_dir / model_name
 
@@ -33,13 +34,19 @@ if __name__ == '__main__':
     model.eval()
     print(f"Loaded model: {model_path.name}")
 
+    # If using a model that was trained with a larger cue set than the two cues present in
+    # the experimental sequences. Read the trained cue count so the sequences can be
+    # re-encoded into the cue dimensionality the model expects.
+    n_cue_classes = len(info.data_config_dict['cues_set'])
+
     trial_files = sorted(trials_path.glob("*.csv"))
     if not trial_files:
         trial_files = sorted(trials_path.glob("*.txt"))
     print(f"Found {len(trial_files)} trial sequence files in {trials_path}")
 
     for trial_file in trial_files:
-        obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(trial_file)
+        obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(
+            trial_file, n_cue_classes=n_cue_classes, cue_seed=11)
         y, q = to_model_tensors(obs, cue)
 
         # hidden_activity:    dict module → (T-1, 1)
@@ -51,7 +58,11 @@ if __name__ == '__main__':
 
         # Align observation and cue to the first n_out timesteps
         obs_out = obs[:n_out]
-        cue_out = cue[:n_out, :]  # (n_out, 2)
+        # `cue` may be a (T, n_cue_classes) one-hot where only the two cues used in this
+        # sequence are ever active. Recover those two columns (ascending class order,
+        # matching CUE_LABELS order) so the CSV keeps its original two-cue encoding.
+        used_cols = np.flatnonzero(cue.any(axis=0))
+        cue_out = cue[:n_out][:, used_cols]  # (n_out, 2)
 
         # Squeeze batch dim (batch=1) from norms and derivatives
         norms = {name: arr[:, 0] for name, arr in hidden_activity.items()}      # each: (T-1,)

@@ -74,7 +74,8 @@ def plot_score_histograms(df, output_path, bins=30):
 if __name__ == '__main__':
 
     # Specify the path to the directory containing already computed model activations files for exp trials sequences
-    activations_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output/population_network_all_bn8_lr0")
+    # activations_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output/population_network_all_bn8_lr0/activations")
+    activations_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output/population_network_all_bn8_lr0.001_dposweight/activations")
 
     # Loop through the .CSV sequences. For each sequence, compute the Pearson correlation
     # between every pair of modules (excluding self-pairs) for both the activities and the

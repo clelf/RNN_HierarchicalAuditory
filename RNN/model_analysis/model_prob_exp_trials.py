@@ -28,7 +28,8 @@ if __name__ == '__main__':
     include_next_stimulus = True
 
     # Specify model path (one model only), load model
-    model_name = "population_network_all_bn8_lr0"
+    # model_name = "population_network_all_bn8_lr0"
+    model_name = "population_network_all_bn8_lr0.001_dposweight"
     model_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/training_results/N_ctx_2/HierarchicalGM")
     model_path = model_dir / model_name
 
@@ -65,11 +66,16 @@ if __name__ == '__main__':
     print(f"dpos class-index offset (model convention): {dpos_min}; "
           f"experimental dpos shift: +{EXPERIMENTAL_DPOS_SHIFT}")
 
+    # If using a model that was trained with a larger cue set than the two cues present in
+    # the experimental sequences. Read the trained cue count so the sequences can be
+    # re-encoded into the cue dimensionality the model expects.
+    n_cue_classes = len(info.data_config_dict['cues_set'])
+
     for trial_file in trial_files:
         # ctx/dpos/rule are the ground-truth labels from the original sequence.
         # dpos is the raw deviant position on disk (e.g. 2..6), not yet a 0-based class index.
         obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n = load_trial_sequence(
-            trial_file, return_hierarch=True
+            trial_file, return_hierarch=True, n_cue_classes=n_cue_classes, cue_seed=11
         )
 
         # Shift the experimental deviant-position labels into the model's training

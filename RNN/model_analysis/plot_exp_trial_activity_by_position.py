@@ -11,13 +11,19 @@ from model_activations import (
 import torch
 
 
-def compute_norms_for_files(model, files, period=8, chunk_size=128):
+def compute_norms_for_files(model, files, period=8, chunk_size=128,
+                            n_cue_classes=None, cue_seed=None):
     """Run the model over many sequence files and return per-module norms.
 
     Sequences are stacked into batches of at most ``chunk_size`` so the hidden
     states of one forward pass stay bounded in memory; the (small) norm arrays
     are concatenated along the batch axis afterwards. All sequences are assumed
     to share the same length (they are here: 8 * n_trials timesteps).
+
+    ``n_cue_classes`` / ``cue_seed`` are forwarded to ``load_trial_sequence`` so the
+    two experimental cues can be re-encoded into the model's cue vocabulary (see
+    that function). With a fixed ``cue_seed`` every sequence uses the same class pair,
+    keeping the batched cue width uniform.
 
     Returns
     -------
@@ -30,16 +36,17 @@ def compute_norms_for_files(model, files, period=8, chunk_size=128):
 
         obs_list, cue_list = [], []
         for f in chunk:
-            obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(f)
+            obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(
+                f, n_cue_classes=n_cue_classes, cue_seed=cue_seed)
             obs_list.append(obs)
             cue_list.append(cue)
 
         min_len = min(o.shape[0] for o in obs_list)
         obs_stack = np.stack([o[:min_len] for o in obs_list], axis=0)        # (N, T)
-        cue_stack = np.stack([c[:min_len, :] for c in cue_list], axis=0)     # (N, T, 2)
+        cue_stack = np.stack([c[:min_len, :] for c in cue_list], axis=0)     # (N, T, n_cue)
 
         y = torch.tensor(obs_stack, dtype=torch.float32).unsqueeze(-1)       # (N, T, 1)
-        q = torch.tensor(cue_stack, dtype=torch.float32)                     # (N, T, 2)
+        q = torch.tensor(cue_stack, dtype=torch.float32)                     # (N, T, n_cue)
 
         _, module_norms, _ = get_module_output_and_activity(model, y, q)
         for name, norms in module_norms.items():
@@ -63,7 +70,8 @@ if __name__ == '__main__':
     # Set to an int to randomly sample that many sequences, or None to use all.
     N_sequences = None
 
-    model_name = 'population_network_all_bn8_lr0'
+    # model_name = "population_network_all_bn8_lr0"
+    model_name = "population_network_all_bn8_lr0.001_dposweight"
     model_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/training_results/N_ctx_2/HierarchicalGM")
     model_path = model_dir / model_name
 
@@ -79,6 +87,10 @@ if __name__ == '__main__':
     model = eval.load_model(info)
     model.eval()
     print(f"Loaded model: {model_name}")
+
+    # If the model was trained with a larger cue vocabulary than the two cues present in
+    # the experimental sequences, re-encode the cues into the dimensionality it expects.
+    n_cue_classes = len(info.data_config_dict['cues_set'])
 
     # =============================================================================
     # Select trial files
@@ -99,7 +111,8 @@ if __name__ == '__main__':
     # =============================================================================
     # Run forward passes (chunked) and collect per-module norms (seq_len, n_select)
     # =============================================================================
-    module_norms_dict = compute_norms_for_files(model, selected_files, period=PERIOD)
+    module_norms_dict = compute_norms_for_files(
+        model, selected_files, period=PERIOD, n_cue_classes=n_cue_classes, cue_seed=11)
 
     module_titles = {
         'obs':  'Observation module',
