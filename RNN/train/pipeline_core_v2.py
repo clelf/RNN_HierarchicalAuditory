@@ -2073,6 +2073,7 @@ def train_model(
     # LR scheduler: cosine annealing from the initial LR down to ~0 over the run.
     # Keeps the fast early descent of a higher LR while lowering it late in
     # training, where a constant LR tends to spike and fail to recover.
+    # Recorded as training.lr_scheduler=True in the saved config.json.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.training.num_epochs
     )

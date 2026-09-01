@@ -65,6 +65,12 @@ class TrainingConfig:
     # (obs/ctx/dpos/rule) in SimpleRNN, ObsCtxModuleNetwork and PopulationNetwork.
     train_h0: bool = False
 
+    # Marker written to the saved config.json: True means the run used the LR scheduler
+    # (CosineAnnealingLR, from the initial LR down to ~0 over num_epochs). The training
+    # loop always uses it, so this stays True; it exists to tell these runs apart from
+    # older ones trained before the scheduler was implemented (which get False).
+    lr_scheduler: bool = True
+
     @classmethod
     def for_unit_test(cls, constrained_dpos_response_window: bool = False,
                       train_h0: bool = False) -> 'TrainingConfig':
@@ -125,7 +131,8 @@ class DataConfig:
     # sampling it from si_r_bounds. All other generative parameters keep being sampled
     # normally. Implemented by emitting degenerate si_r_bounds (low == high == si_r_fixed)
     # in to_gm_dict, so the GM sampling code is untouched. When set, runs get a
-    # '_fixedsir' folder/name suffix so they don't overwrite the sampled-sigma_r runs.
+    # '_fixedsir<value>' folder/name suffix (e.g. '_fixedsir0.02') so they don't overwrite
+    # the sampled-sigma_r runs nor runs pinned at a different sigma_r.
     si_r_fixed: Optional[float] = None
     
     # Multi-context parameters (only used when N_ctx > 1)
@@ -470,9 +477,14 @@ class RunConfig:
         # Filter DataConfig fields to only include valid constructor args
         import inspect
         data_config_fields = {f.name for f in DataConfig.__dataclass_fields__.values()}
-        data_dict = {k: v for k, v in d.get('data', {}).items() 
+        data_dict = {k: v for k, v in d.get('data', {}).items()
                      if k in data_config_fields}
-        
+
+        # Config files written before the LR scheduler was implemented have no
+        # 'lr_scheduler' key: those runs did not use one, so they load as False.
+        training_dict = dict(d.get('training', {}))
+        training_dict.setdefault('lr_scheduler', False)
+
         return cls(
             name=d['name'],
             save_dir=Path(d['save_dir']),
@@ -484,7 +496,7 @@ class RunConfig:
             kappa=d.get('kappa', 0.5),
             bottleneck_dim=d.get('bottleneck_dim'),
             module_hidden_dims=d.get('module_hidden_dims'),
-            training=TrainingConfig(**d.get('training', {})),
+            training=TrainingConfig(**training_dict),
             model_arch=ModelArchConfig(**d.get('model_arch', {})),
             data=DataConfig(**data_dict),
             seq_len_viz=d.get('seq_len_viz', 125),
@@ -619,13 +631,19 @@ class HyperparameterGrid:
             name_parts.append('trainh0')
 
         # Distinguish runs whose sigma_r was pinned (si_r_fixed) so they don't overwrite
-        # the sampled-sigma_r runs that are otherwise identically configured.
+        # the sampled-sigma_r runs, nor runs pinned at a different sigma_r. The pinned
+        # value is part of the suffix, e.g. 'fixedsir0.02'.
         if self.data.si_r_fixed is not None:
-            folder_parts.append('fixedsir')
-            name_parts.append('fixedsir')
+            folder_parts.append(f"fixedsir{self.data.si_r_fixed}")
+            name_parts.append(f"fixedsir{self.data.si_r_fixed}")
 
         if self.folder_tag:
             folder_parts.append(self.folder_tag)
+
+        # Always last: the training length, so runs of different durations live in
+        # separate folders instead of overwriting each other.
+        folder_parts.append(f"epochs{self.training.num_epochs}")
+        name_parts.append(f"epochs{self.training.num_epochs}")
 
         folder_name = '_'.join(folder_parts)
         config_name = '_'.join(name_parts)
@@ -720,12 +738,15 @@ class HyperparameterGrid:
                     # Suffix to keep trainable-h0 runs from overwriting zeros-init runs,
                     # and pinned-sigma_r runs from overwriting sampled-sigma_r runs.
                     h0_sfx = '_trainh0' if self.training.train_h0 else ''
-                    sir_sfx = '_fixedsir' if self.data.si_r_fixed is not None else ''
+                    sir_sfx = f'_fixedsir{self.data.si_r_fixed}' if self.data.si_r_fixed is not None else ''
                     tag_sfx = f'_{self.folder_tag}' if self.folder_tag else ''
+                    # Always last: the training length, so runs of different durations
+                    # live in separate folders instead of overwriting each other.
+                    ep_sfx = f'_epochs{self.training.num_epochs}'
                     for h_dim in self.hidden_dims:
                         configs.append(RunConfig(
-                            name=f"{model_type}_h{h_dim}_lr{lr}{h0_sfx}{sir_sfx}",
-                            save_dir=output_base / ctx_subpath / f"{model_type}_h{h_dim}{h0_sfx}{sir_sfx}{tag_sfx}",
+                            name=f"{model_type}_h{h_dim}_lr{lr}{h0_sfx}{sir_sfx}{ep_sfx}",
+                            save_dir=output_base / ctx_subpath / f"{model_type}_h{h_dim}{h0_sfx}{sir_sfx}{tag_sfx}{ep_sfx}",
                             model_type=model_type,
                             hidden_dim=h_dim,
                             learning_rate=lr,

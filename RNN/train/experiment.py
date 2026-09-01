@@ -31,7 +31,7 @@ if '--no-unit-test' in sys.argv:
 if UNIT_TEST:
     training = TrainingConfig.for_unit_test(constrained_dpos_response_window=True, train_h0=True)
 else:
-    training = TrainingConfig(num_epochs=200, constrained_dpos_response_window=True, train_h0=True)
+    training = TrainingConfig(num_epochs=300, constrained_dpos_response_window=True, train_h0=True)
 
 
 # Data config (single source of truth shared with benchmark_experiment.py).
@@ -39,7 +39,7 @@ else:
 data = DataConfig.for_hierarchical_experiment(
     N_ctx=2,
     max_cores=1 if UNIT_TEST else None,  # Disable parallel processing during tests
-    si_r_fixed=0.02,
+    si_r_fixed=0.01,
 )
 # --- To use NonHierarchicalGM instead, comment the block above and uncomment: ---
 # data = DataConfig.for_nonhierarchical_experiment(
