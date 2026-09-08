@@ -45,7 +45,8 @@ def plot_score_histograms(df, output_path, bins=30):
     Every column except 'sequence_name' is treated as a score column; each gets
     its own histogram over all sequences.
     """
-    score_cols = [c for c in df.columns if ('norm' in c or 'deriv' in c)]
+    score_cols = [c for c in df.columns
+                  if c.startswith('activity_') or c.startswith('derivative_')]
     n = len(score_cols)
     ncols = 3
     nrows = ceil(n / ncols)
@@ -75,7 +76,9 @@ if __name__ == '__main__':
 
     # Specify the path to the directory containing already computed model activations files for exp trials sequences
     # activations_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output/population_network_all_bn8_lr0/activations")
-    activations_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output/population_network_all_bn8_lr0.001_dposweight/activations")
+    # activations_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output/population_network_all_bn8_lr0.001_dposweight/activations")
+    activations_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output/population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched/activations")
+
 
     # Loop through the .CSV sequences. For each sequence, compute the Pearson correlation
     # between every pair of modules (excluding self-pairs) for both the activities and the

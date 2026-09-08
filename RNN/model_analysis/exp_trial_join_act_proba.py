@@ -37,7 +37,8 @@ from model_activations import (
 
 if __name__ == '__main__':
     # model_name = "population_network_all_bn8_lr0"
-    model_name = "population_network_all_bn8_lr0.001_dposweight"
+    # model_name = "population_network_all_bn8_lr0.001_dposweight" population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched
+    model_name = "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched"    
     base_output_path = Path(
         "/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output"
     ) / model_name

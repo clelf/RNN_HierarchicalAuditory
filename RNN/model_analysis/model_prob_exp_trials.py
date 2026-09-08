@@ -29,7 +29,9 @@ if __name__ == '__main__':
 
     # Specify model path (one model only), load model
     # model_name = "population_network_all_bn8_lr0"
-    model_name = "population_network_all_bn8_lr0.001_dposweight"
+    # model_name = "population_network_all_bn8_lr0.001_dposweight" population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched
+    # model_name = "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched"
+    model_name = "population_network_all_bn8_trainh0_fixedsir0.02_epochs300_lr0.002"
     model_dir = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/training_results/N_ctx_2/HierarchicalGM")
     model_path = model_dir / model_name
 

@@ -31,17 +31,15 @@ Configuration Loading:
     auto-detected during model loading.
 
 Usage:
-    # Evaluate all models in a directory
-    python evaluate_models.py --model_dirs training_results/N_ctx_1/rnn_h16 training_results/N_ctx_1/vrnn_h16
-    
-    # Specify number of test samples
-    python evaluate_models.py --model_dirs ... --n_samples 1000
-    
-    # Custom output path
-    python evaluate_models.py --model_dirs ... --output results/evaluation.csv
+    Edit the SETTINGS block at the bottom of this file (BASE_DIR / MODEL_DIRS,
+    N_SAMPLES, N_TONES, OUTPUT, VERBOSE), then run:
+
+        python evaluate_models.py
+
+    Or import and call evaluate_models(...) / assess_models_against_benchmarks(...)
+    directly from a notebook or another script.
 """
 
-import argparse
 import gc
 import json
 import os
@@ -56,6 +54,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from scipy import stats, special
+from scipy.stats import norm as sp_norm
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -2088,84 +2087,47 @@ def evaluate_models(
 
 
 # =============================================================================
-# CLI Entry Point
+# Script entry point — edit the settings below, then: python evaluate_models.py
 # =============================================================================
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Evaluate multiple trained models on shared test data',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Evaluate all models in a base directory (auto-discovers .pth files)
-    python evaluate_models.py --base_dir training_results_CORRECT/N_ctx_2/NonHierarchicalGM_selected
-    
-    # Evaluate specific model directories
-    python evaluate_models.py --model_dirs training_results/N_ctx_1/rnn_h16 training_results/N_ctx_1/vrnn_h16
-    
-    # Evaluate ModuleNetwork models with different objectives
-    python evaluate_models.py --model_dirs training_results/N_ctx_2/NonHierarchicalGM/module_network_obs_bn16 \\
-                                           training_results/N_ctx_2/NonHierarchicalGM/module_network_obs_ctx_kappa0.5_bn16
-    
-    # Custom test configuration
-    python evaluate_models.py --base_dir training_results/N_ctx_2 --n_samples 2000 --n_tones 500
-    
-    # Save results
-    python evaluate_models.py --base_dir training_results/N_ctx_2 --output results/evaluation.csv
-        """
-    )
-    
-    # Model selection
-    parser.add_argument('--base_dir', type=str, default='../training_results_CORRECT/N_ctx_2/NonHierarchicalGM_selected',
-                        help='Base directory to search for models (recursively finds all .pth files)')
-    parser.add_argument('--model_dirs', type=str, nargs='+', default=None,
-                        help='Paths to specific model directories to evaluate')
-    
-    # Test configuration
-    parser.add_argument('--n_samples', type=int, default=1000,
-                        help='Number of test samples (default: 1000)')
-    parser.add_argument('--n_tones', type=int, default=1000,
-                        help='Sequence length (default: 1000)')
-    
-    # Output
-    parser.add_argument('--output', type=str, default=None,
-                        help='Path to save results CSV')
-    parser.add_argument('--quiet', action='store_true',
-                        help='Suppress progress output')
-    
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    verbose = not args.quiet
-    
-    # Determine model selection method
-    if args.model_dirs is not None:
-        # Use explicit model directories
-        model_dirs = [Path(d) for d in args.model_dirs]
-    elif args.base_dir is not None:
-        # Discover models in base directory
-        model_dirs = discover_models(
-            Path(args.base_dir),
-            verbose=verbose
-        )
-        
-        if not model_dirs:
-            print(f"ERROR: No models found in {args.base_dir}")
-            sys.exit(1)
-    else:
-        print("ERROR: Must provide either --base_dir or --model_dirs")
-        sys.exit(1)
-    
-    evaluate_models(
-        model_dirs=model_dirs,
-        n_samples=args.n_samples,
-        n_tones=args.n_tones,
-        output_path=Path(args.output) if args.output else None,
-        verbose=verbose,
-    )
-
-
 if __name__ == '__main__':
-    main()
+
+    # ------------------------- SETTINGS (edit these) -------------------------
+    # Which models to evaluate. Either point BASE_DIR at a folder that is
+    # searched recursively for .pth files, or list explicit model directories in
+    # MODEL_DIRS. If MODEL_DIRS is not None it takes precedence over BASE_DIR.
+    RNN_DIR = Path(__file__).resolve().parent.parent   # .../RNN_paradigm/RNN
+    # BASE_DIR = RNN_DIR / 'training_results_CORRECT/N_ctx_2/NonHierarchicalGM_selected'
+    BASE_DIR = RNN_DIR / 'training_results/N_ctx_2/HierarchicalGM'
+    # MODEL_DIRS = None
+    MODEL_DIRS = [
+        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched",
+        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs300",
+        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir0.05_epochs300_lr0.002",
+        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir0.005_epochs300_lr0.002",
+        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir0.1_epochs300_lr0.002",
+    ]
+
+    # Test data.
+    N_SAMPLES = 1000   # number of test sequences
+    N_TONES = 1000     # sequence length (only used when no saved config is found)
+
+    # Output.
+    OUTPUT = None      # CSV path, e.g. 'results/evaluation.csv'; None = don't save
+    VERBOSE = True     # print progress and the results table
+    # -------------------------------------------------------------------------
+
+    if MODEL_DIRS is not None:
+        model_dirs = [Path(d) for d in MODEL_DIRS]
+    else:
+        model_dirs = discover_models(Path(BASE_DIR), verbose=VERBOSE)
+        if not model_dirs:
+            raise SystemExit(f"ERROR: No models found in {BASE_DIR}")
+
+    df = evaluate_models(
+        model_dirs=model_dirs,
+        n_samples=N_SAMPLES,
+        n_tones=N_TONES,
+        output_path=Path(OUTPUT) if OUTPUT else None,
+        verbose=VERBOSE,
+    )

@@ -466,13 +466,16 @@ class RunConfig:
     def from_dict(cls, d: dict) -> 'RunConfig':
         """
         Deserialize RunConfig from a dictionary (e.g., loaded from JSON).
+
+        Keys that a section does not declare are ignored, so a config saved by
+        another version of the pipeline (carrying a bookkeeping field such as
+        'lr_scheduler', which only records how the model was trained) still loads.
         """
-        # Filter DataConfig fields to only include valid constructor args
-        import inspect
-        data_config_fields = {f.name for f in DataConfig.__dataclass_fields__.values()}
-        data_dict = {k: v for k, v in d.get('data', {}).items() 
-                     if k in data_config_fields}
-        
+        def known_fields(config_cls, section):
+            """Keep only the keys `config_cls` accepts as constructor args."""
+            valid = {f.name for f in config_cls.__dataclass_fields__.values()}
+            return {k: v for k, v in section.items() if k in valid}
+
         return cls(
             name=d['name'],
             save_dir=Path(d['save_dir']),
@@ -484,9 +487,9 @@ class RunConfig:
             kappa=d.get('kappa', 0.5),
             bottleneck_dim=d.get('bottleneck_dim'),
             module_hidden_dims=d.get('module_hidden_dims'),
-            training=TrainingConfig(**d.get('training', {})),
-            model_arch=ModelArchConfig(**d.get('model_arch', {})),
-            data=DataConfig(**data_dict),
+            training=TrainingConfig(**known_fields(TrainingConfig, d.get('training', {}))),
+            model_arch=ModelArchConfig(**known_fields(ModelArchConfig, d.get('model_arch', {}))),
+            data=DataConfig(**known_fields(DataConfig, d.get('data', {}))),
             seq_len_viz=d.get('seq_len_viz', 125),
         )
     
