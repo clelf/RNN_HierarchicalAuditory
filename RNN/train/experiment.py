@@ -29,9 +29,9 @@ if '--no-unit-test' in sys.argv:
 # parameter, broadcast across the batch) instead of always starting from zeros. Off by
 # default to preserve existing behaviour; flip to True to enable.
 if UNIT_TEST:
-    training = TrainingConfig.for_unit_test(constrained_dpos_response_window=True, train_h0=False)
+    training = TrainingConfig.for_unit_test(constrained_dpos_response_window=True, train_h0=True)
 else:
-    training = TrainingConfig(num_epochs=200, constrained_dpos_response_window=True, train_h0=False)
+    training = TrainingConfig(num_epochs=300, constrained_dpos_response_window=True, train_h0=True)
 
 
 # Data config (single source of truth shared with benchmark_experiment.py).
@@ -39,7 +39,7 @@ else:
 data = DataConfig.for_hierarchical_experiment(
     N_ctx=2,
     max_cores=1 if UNIT_TEST else None,  # Disable parallel processing during tests
-    si_r_fixed=0.02,
+    si_r_fixed=0.01,
 )
 # --- To use NonHierarchicalGM instead, comment the block above and uncomment: ---
 # data = DataConfig.for_nonhierarchical_experiment(
@@ -55,7 +55,7 @@ FOLDER_TAG = None
 param_grid = HyperparameterGrid(
     folder_tag=FOLDER_TAG,
     model_types=['population_network'], # population_network , module_network
-    learning_rates=[0.001], #, 0.01, 0.001] if not UNIT_TEST else [0.01], # Removed 0.05 and 0.1 to prevent gradient explosion
+    learning_rates=[0.002], #, 0.01, 0.001] if not UNIT_TEST else [0.01], # Removed 0.05 and 0.1 to prevent gradient explosion
     # hidden_dims=[64],  # Fixed for ModuleNetwork anyway # TODO: look into this
     hidden_dims={'obs': [64], 'ctx': [64], 'dpos': [64], 'rule': [64]}, # TODO: look into this, possibly no need to decrease hidden dims...
     # learning_objectives=['all'], # 'obs', 'ctx', 'all'
