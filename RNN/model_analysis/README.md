@@ -16,6 +16,8 @@ Drivethrough of scripts in this folder:
 
 - exp_trials_selection.py: reads CSV files created by model_prob_exp_trials.py, and produces averages per sequence as well as visualizations
 
+- dpos_prob_at_deviant_distribution.py: plots distributions of modules likelihood across different dpos values, one figure per model specified
+
 - assess_dpos_and_ctx_detection(_summary).py: produces CSV storing detailing the performance at detecting the deviant and predicting the deviant position for specified models (to match with the .txt legend file)
 
 - plot_exp_trial_activity.py: plots activity per module across entire sequences
