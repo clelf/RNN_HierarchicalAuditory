@@ -641,11 +641,11 @@ if __name__ == '__main__':
 
     # One entry per model to analyse; a single model is just a one-element list.
     MODEL_NAMES = [
-        # "population_network_all_bn8_lr0",
-        # "population_network_all_bn8_lr0.001_dposweight",
-        "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched",
-        "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs300"
+        "population_network_all_bn8_trainh0_fixedsir0.02_epochs300_lr0.002",
+        "population_network_all_bn8_trainh0_fixedsir0.05_epochs300_lr0.002",
+        "population_network_all_bn8_trainh0_fixedsir0.1_epochs300_lr0.002",
     ]
+    
 
     # =============================================================================
     # Run both parts for every model
