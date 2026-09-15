@@ -1,29 +1,76 @@
-Drivethrough of scripts in this folder:
+# model_analysis
 
-- evaluate_models.py: stores functions computing likelihoods, plotting diverse figures.
+Analysis of trained RNN models, on generated test data and on the recorded
+experimental trial sequences.
 
-- model_analysis.py: Produces visualization evaluation on artificial test dataset (shared across models or one different per model, if different data configuration across models selected)
+## Layout
 
-- model_activations.py: stores tools to extract and analyze activations of hidden states
+Five library modules, one taxonomy module, and six entry points. Nothing in the
+library modules writes output on import; everything runnable is a `run_*.py`.
 
-- model_act_exp_trials.py: computes module activations on the experimental sequences
+### Library (import these, don't run them)
 
-- model_act_exp_trials_deviant.py: computes module activations on the experimental sequences
+| module | holds |
+| --- | --- |
+| `analysis_config.py` | the three filesystem roots, module/column naming conventions, the named model lists, figure defaults |
+| `analysis_core.py` | model loading (`ModelInfo`, `load_model`), synthetic test data, sequence I/O, the forward pass, likelihood helpers, module-activity statistics |
+| `metrics.py` | MSE / log-likelihood / calibration / ctx-dpos-rule scores, the Kalman-filter benchmark, and the evaluation drivers |
+| `plots.py` | every figure, plus `save_figure` — the one place that writes a PNG |
+| `exp_sequence_analysis.py` | running a model over the experimental sequences, and aggregating the CSVs that produces |
+| `alignment_cases.py` | the ctx/dpos detection case taxonomy and its per-trial / per-model tables |
 
-- model_prob_exp_trials.py: computes module probabilities on the experimental sequences, on deviant positions and immediate next positions.
+Dependencies run one way: `analysis_config` → `analysis_core` → {`metrics`,
+`exp_sequence_analysis`, `alignment_cases`} → `plots` → the `run_*` scripts.
 
-- run_exp_trials_pipeline.py: computes activations and probabilities as performed in the previously listed scripts, but all at once, for the models specified at the top of the script.
+### Entry points (run these)
 
-- exp_trials_selection.py: reads CSV files created by model_prob_exp_trials.py, and produces averages per sequence as well as visualizations
+| script | what it does |
+| --- | --- |
+| `run_exp_trials_pipeline.py` | model → experimental sequences: the activation / deviant-activation / probability CSVs and the three activity figure sets. **The only script with a command line** (`--help`); it is the heavy batch driver. |
+| `run_exp_trials_summaries.py` | reads those CSVs back: likelihood averages per sequence, the dpos probability at the true deviant, and the per-trial activity-vs-likelihood join |
+| `run_module_correlations.py` | module-pair correlation scores, then the distribution and association figures |
+| `run_alignment_assessment.py` | ctx/dpos detection cases per trial, collapsed into one row per model |
+| `run_model_evaluation.py` | compares models on generated test data; violin and calibration figures |
+| `run_sample_figures.py` | per-sample prediction figures (synthetic and experimental) and hidden-activity trajectories |
 
-- dpos_prob_at_deviant_distribution.py: plots distributions of modules likelihood across different dpos values, one figure per model specified
+Every entry point except the pipeline is configured by editing the
+`SETTINGS` block at the top of its `__main__`.
 
-- assess_dpos_and_ctx_detection(_summary).py: produces CSV storing detailing the performance at detecting the deviant and predicting the deviant position for specified models (to match with the .txt legend file)
+## Order of operations
 
-- plot_exp_trial_activity.py: plots activity per module across entire sequences
+`run_exp_trials_pipeline.py` produces the CSVs the other experimental-sequence
+scripts consume, so it runs first:
 
-- plot_exp_trial_deviant_activity.py: plots activity per module across entire sequences, at deviant positions only
+```
+run_exp_trials_pipeline.py          # writes activations/ and probabilities*/
+  ├── run_exp_trials_summaries.py   # needs probabilities_deviant/ (+ activations_deviant/)
+  └── run_module_correlations.py    # needs activations/
+run_alignment_assessment.py         # independent: runs the model itself
+run_model_evaluation.py             # independent: generated test data only
+run_sample_figures.py               # independent
+```
 
-- plot_exp_trial_activity_by_position.py: obsolete
+## Figure provenance
 
+Every figure written through `plots.save_figure` gets a line in a
+`figure_metadoc.txt` next to it, recording which script produced it. Entry points
+register themselves once:
 
+```python
+import plots
+plots.set_script_path(__file__)
+```
+
+Figures that `pipeline_core_v2.plot_samples` writes itself (the per-sample
+figures) are the exception — it names and saves its own files, so they carry no
+metadoc entry.
+
+## Paths
+
+`analysis_config.py` derives every root from its own location, so there are no
+absolute paths to edit:
+
+- `TRAINING_RESULTS_DIR` — `RNN/training_results/N_ctx_2/HierarchicalGM`
+- `TRIALS_PATH` — `Workspace/Jasmin/trialsequences2clem`
+- `EXP_SEQ_OUTPUT_ROOT` — `RNN/exp_seq_act_output`
+- `EVALUATION_RESULTS_DIR` — `RNN/evaluation_results`
