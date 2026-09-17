@@ -511,6 +511,39 @@ def compute_pairwise_module_correlations(module_norms_dict, use_derivatives=Fals
     return pair_correlations
 
 
+# Kept when model_activations.py was retired: this had no callers anywhere in
+# the workspace, but it is the natural summary over the pairwise scores above,
+# so it is preserved here rather than dropped.
+def compute_intermodule_correlations(module_norms_dict, use_derivatives=False, absolute=False):
+    """Average pairwise Pearson correlation between modules.
+
+    Parameters
+    ----------
+    module_norms_dict : dict
+        Keys are module names, values are norms arrays
+    use_derivatives : bool
+        If True, compute correlations on derivatives instead of raw activity
+    absolute : bool
+        If True, average the absolute value of each pairwise correlation (a
+        redundancy/coupling-strength metric, where +0.8 and -0.8 both count as
+        strong). If False (default), average the signed correlations, so
+        positive and negative pairs can cancel.
+
+    Returns
+    -------
+    float - average correlation between modules
+    """
+    pair_correlations = compute_pairwise_module_correlations(
+        module_norms_dict, use_derivatives=use_derivatives
+    )
+    values = list(pair_correlations.values())
+    if not values:
+        return 0.0
+    if absolute:
+        values = [abs(v) for v in values]
+    return float(np.mean(values))
+
+
 def load_module_dict(df, suffix):
     """Build {module_name: 1D array} from columns named '<module>_<suffix>'.
 

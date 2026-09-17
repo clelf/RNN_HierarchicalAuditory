@@ -8,7 +8,8 @@ Four groups, in order:
   3. Sequence I/O and  -- find_trial_files, select_files, load_trial_sequence,
      the forward pass     to_model_tensors, load_trial_params, dpos_conventions,
                           run_forward_pass, get_module_output_and_activity,
-                          get_module_probabilities.
+                          get_module_probabilities,
+                          module_probabilities_from_output.
   4. Numerics          -- gaussian_likelihood, class_likelihood,
                           compute_derivatives, gather_at.
 
