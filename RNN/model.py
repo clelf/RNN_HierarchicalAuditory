@@ -438,17 +438,28 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         )        
 
 
-    def forward(self, x, q, return_hidden=False):
+    def forward(self, x, q, return_hidden=False, return_prior=False):
         """
         Timestep-synchronous forward computation with bidirectional information flow.
         At each timestep t, the full forward+feedback cycle is executed before moving to t+1.
+
+        Every module is called exactly twice per timestep, which defines two readouts:
+        - prior     : output of the module's first call, before it has received the
+                      feedback carrying the rest of the network's estimate for this
+                      timestep. For rule/dpos/ctx this is the top-down sweep
+                      (cue -> rule -> dpos -> ctx); for obs it is the readout taken
+                      after the ctx priming but *before* x_t is fed in, i.e. the
+                      network's prediction of the current observation.
+        - posterior : output of the module's second call, once the bottom-up
+                      evidence (obs) has propagated back up. These are the readouts
+                      that are supervised during training.
 
         Module dimensions:
         - rule:  input_dim=cue_dim,   output_dim=N_rules
         - dpos:  input_dim=N_dpos,    output_dim=N_dpos
         - ctx:   input_dim=N_ctx,     output_dim=N_ctx
         - obs:   input_dim=obs_dim,   output_dim=2
-        
+
         Parameters
         ----------
         x : torch.Tensor
@@ -458,6 +469,24 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         return_hidden : bool, optional
             If True, also return hidden states for all modules at each timestep.
             Default is False for backward compatibility.
+        return_prior : bool, optional
+            If True, also return the prior (first-call) readouts of all modules --
+            and, when return_hidden is also True, the prior hidden states, i.e. the
+            hidden state of each module right after its first call. Default is False
+            for backward compatibility.
+
+        Returns
+        -------
+        tuple
+            Groups of four (one entry per module), appended in a fixed order so that
+            a caller which asks for less gets exactly the tuple it used to get:
+            (obs, ctx, dpos, rule)                                    posterior readouts
+            [+ (obs, ctx, dpos, rule) prior readouts                  if return_prior]
+            [+ (obs, ctx, dpos, rule) posterior hidden states         if return_hidden]
+            [+ (obs, ctx, dpos, rule) prior hidden states             if both]
+            The posterior hidden state of a module is the one it holds at the end of
+            the timestep (after its second call), which is what return_hidden has
+            always returned.
         """
         batch_size, seq_len, _ = x.size()
 
@@ -472,7 +501,16 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         ctx_outputs  = []
         dpos_outputs = []
         rule_outputs = []
-        
+
+        # Accumulators for the prior (first-call) readouts across time (if requested).
+        # These tensors are computed by the modules in any case (SimpleRNN always
+        # evaluates its extra readout), they are simply discarded when not requested.
+        if return_prior:
+            prior_obs_outputs  = []
+            prior_ctx_outputs  = []
+            prior_dpos_outputs = []
+            prior_rule_outputs = []
+
         # Accumulators for hidden states across time (if requested)
         if return_hidden:
             obs_hidden_states  = []
@@ -480,26 +518,40 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             dpos_hidden_states = []
             rule_hidden_states = []
 
+        # Hidden states as they stand after each module's first call, i.e. the state
+        # the prior readout was taken from. Only meaningful together with the prior
+        # readouts, so they follow return_prior rather than a flag of their own.
+        if return_prior and return_hidden:
+            prior_obs_hidden_states  = []
+            prior_ctx_hidden_states  = []
+            prior_dpos_hidden_states = []
+            prior_rule_hidden_states = []
+
         for t in range(seq_len):
             x_t = x[:, t:t+1, :]   # (batch, 1, obs_dim)   -- keeps 3-D shape for GRU
             q_t = q[:, t:t+1, :]   # (batch, 1, cue_dim)
 
-            # --- FORWARD PASS ---
+            # --- FORWARD PASS (prior sweep) ---
 
             # 1) Cues through rule module
-            rule_output, _, rule_hx = self.rule_module(q_t, hx=rule_hx, return_hidden=True)
+            prior_rule_output, prior_rule_output_ext, rule_hx = self.rule_module(q_t, hx=rule_hx, return_hidden=True)
+            prior_rule_hx = rule_hx
 
             # 2) Rule → dpos
-            enc_rule2dpos = self.readout_rule2dpos(rule_output)             # (batch, 1, N_dpos)
-            dpos_output, _, dpos_hx = self.dpos_module(enc_rule2dpos, hx=dpos_hx, return_hidden=True)
+            enc_rule2dpos = self.readout_rule2dpos(prior_rule_output)       # (batch, 1, N_dpos)
+            prior_dpos_output, prior_dpos_output_ext, dpos_hx = self.dpos_module(enc_rule2dpos, hx=dpos_hx, return_hidden=True)
+            prior_dpos_hx = dpos_hx
 
             # 3) Dpos → ctx
-            enc_dpos2ctx = self.readout_dpos2ctx(dpos_output)               # (batch, 1, N_ctx)
-            ctx_output, _, ctx_hx = self.context_module(enc_dpos2ctx, hx=ctx_hx, return_hidden=True)
+            enc_dpos2ctx = self.readout_dpos2ctx(prior_dpos_output)         # (batch, 1, N_ctx)
+            prior_ctx_output, prior_ctx_output_ext, ctx_hx = self.context_module(enc_dpos2ctx, hx=ctx_hx, return_hidden=True)
+            prior_ctx_hx = ctx_hx
 
-            # 4) Ctx primes obs (hidden state updated, output discarded)
-            enc_ctx2obs = self.readout_ctx2obs(ctx_output)                  # (batch, 1, obs_input_dim)
-            _, _, obs_hx = self.observation_module(enc_ctx2obs, hx=obs_hx, return_hidden=True)
+            # 4) Ctx primes obs (hidden state updated). The readout taken here is the
+            # obs module's prediction of the current observation, before x_t is seen.
+            enc_ctx2obs = self.readout_ctx2obs(prior_ctx_output)            # (batch, 1, obs_input_dim)
+            _, prior_obs_output_ext, obs_hx = self.observation_module(enc_ctx2obs, hx=obs_hx, return_hidden=True)
+            prior_obs_hx = obs_hx
 
             # 5) Actual observation processed with prior-informed hidden state
             posterior_obs_output, posterior_obs_output_ext, obs_hx = self.observation_module(x_t, hx=obs_hx, return_hidden=True)  # posterior-informed output and hidden state
@@ -523,6 +575,22 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             ctx_outputs.append(posterior_ctx_output_ext)
             dpos_outputs.append(posterior_dpos_output_ext)
             rule_outputs.append(posterior_rule_output_ext)
+
+            # Collect the prior readouts if requested
+            if return_prior:
+                prior_obs_outputs.append(prior_obs_output_ext)
+                prior_ctx_outputs.append(prior_ctx_output_ext)
+                prior_dpos_outputs.append(prior_dpos_output_ext)
+                prior_rule_outputs.append(prior_rule_output_ext)
+
+            # Collect the hidden states each prior readout was taken from. They are
+            # captured inside the cycle (steps 1-4 above), before the feedback sweep
+            # overwrites them.
+            if return_prior and return_hidden:
+                prior_obs_hidden_states.append(prior_obs_hx.detach())
+                prior_ctx_hidden_states.append(prior_ctx_hx.detach())
+                prior_dpos_hidden_states.append(prior_dpos_hx.detach())
+                prior_rule_hidden_states.append(prior_rule_hx.detach())
             
             # Collect hidden states if requested
             if return_hidden:
@@ -537,6 +605,19 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         dpos_outputs = torch.cat(dpos_outputs, dim=1)
         rule_outputs = torch.cat(rule_outputs, dim=1)
 
+        # Groups of four are appended in a fixed order, so that a caller that asks for
+        # neither (or only for the hidden states) gets exactly the tuple it used to get.
+        outputs = (obs_outputs, ctx_outputs, dpos_outputs, rule_outputs)
+
+        #### Return options
+        if return_prior:
+            prior_obs_outputs  = torch.cat(prior_obs_outputs,  dim=1)
+            prior_ctx_outputs  = torch.cat(prior_ctx_outputs,  dim=1)
+            prior_dpos_outputs = torch.cat(prior_dpos_outputs, dim=1)
+            prior_rule_outputs = torch.cat(prior_rule_outputs, dim=1)
+            outputs = outputs + (prior_obs_outputs, prior_ctx_outputs,
+                                 prior_dpos_outputs, prior_rule_outputs)
+
         if return_hidden:
             # Stack hidden states along time dimension
             # Hidden states have shape (n_layers, batch, hidden_dim), stack along time gives (seq_len, n_layers, batch, hidden_dim)
@@ -544,11 +625,18 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             ctx_hidden_states  = torch.stack(ctx_hidden_states,  dim=0)
             dpos_hidden_states = torch.stack(dpos_hidden_states, dim=0)
             rule_hidden_states = torch.stack(rule_hidden_states, dim=0)
-            
-            return (obs_outputs, ctx_outputs, dpos_outputs, rule_outputs,
-                    obs_hidden_states, ctx_hidden_states, dpos_hidden_states, rule_hidden_states)
-        
-        return obs_outputs, ctx_outputs, dpos_outputs, rule_outputs
+            outputs = outputs + (obs_hidden_states, ctx_hidden_states,
+                                 dpos_hidden_states, rule_hidden_states)
+
+            if return_prior:
+                prior_obs_hidden_states  = torch.stack(prior_obs_hidden_states,  dim=0)
+                prior_ctx_hidden_states  = torch.stack(prior_ctx_hidden_states,  dim=0)
+                prior_dpos_hidden_states = torch.stack(prior_dpos_hidden_states, dim=0)
+                prior_rule_hidden_states = torch.stack(prior_rule_hidden_states, dim=0)
+                outputs = outputs + (prior_obs_hidden_states, prior_ctx_hidden_states,
+                                     prior_dpos_hidden_states, prior_rule_hidden_states)
+
+        return outputs
 
 
 

@@ -79,7 +79,7 @@ DEFAULT_N_TRAJECTORIES = 2
 
 
 # =============================================================================
-# Stage group 1: per-file CSV extraction
+# Produce CSV of activations, probabilities
 # =============================================================================
 
 def run_csv_stages(model, info, trial_files, stages, output_root, cfg):
@@ -90,17 +90,17 @@ def run_csv_stages(model, info, trial_files, stages, output_root, cfg):
     the two activation stages) and one probability forward pass per file, only
     when the corresponding stage was requested.
     """
-    want_act = 'activations' in stages
-    want_act_dev = 'activations_deviant' in stages
-    want_prob = 'probabilities' in stages
-    need_activity = want_act or want_act_dev
+    include_act = 'activations' in stages
+    include_act_dev = 'activations_deviant' in stages
+    include_prob = 'probabilities' in stages
+    include_activity = include_act or include_act_dev
 
     dirs = {}
-    if want_act:
+    if include_act:
         dirs['activations'] = output_root / 'activations'
-    if want_act_dev:
+    if include_act_dev:
         dirs['activations_deviant'] = output_root / 'activations_deviant'
-    if want_prob:
+    if include_prob:
         dirs['probabilities'] = output_root / 'probabilities'
         # Deviant-only output: same information but restricted to rows where the
         # context label (trial_type) is 1.
@@ -130,7 +130,7 @@ def run_csv_stages(model, info, trial_files, stages, output_root, cfg):
             n_cue_classes=n_cue_classes, cue_seed=cfg.cue_seed)
         y, q = to_model_tensors(obs, cue)
 
-        if need_activity:
+        if include_activity:
             # hidden_activity:    dict module → (T-1, 1)
             # hidden_derivatives: dict module → (T-2, 1)
             _, hidden_activity, hidden_derivatives = get_module_output_and_activity(model, y, q)
@@ -138,14 +138,14 @@ def run_csv_stages(model, info, trial_files, stages, output_root, cfg):
             norms = {name: arr[:, 0] for name, arr in hidden_activity.items()}      # each: (T-1,)
             derivs = {name: arr[:, 0] for name, arr in hidden_derivatives.items()}  # each: (T-2,)
 
-        if want_act:
+        if include_act:
             out_df = exp.build_activations_frame(obs, cue, norms, derivs,
                                              lim_std, d, tau_std, trial_n)
             out_file = dirs['activations'] / (trial_file.stem + '_activations.csv')
             out_df.to_csv(out_file, index=False)
             print(f"  Saved: {out_file.name}")
 
-        if want_act_dev:
+        if include_act_dev:
             out_df = exp.build_deviant_activations_frame(
                 obs, dpos_raw, norms, derivs, lim_std, d, tau_std, trial_n,
                 period=cfg.period, dpos_shift=dpos_shift)
@@ -153,7 +153,7 @@ def run_csv_stages(model, info, trial_files, stages, output_root, cfg):
             out_df.to_csv(out_file, index=False)
             print(f"  Saved: {out_file.name}")
 
-        if want_prob:
+        if include_prob:
             # probs: dict module → (seq_len, batch, dim)
             #   'obs':  dim=2, columns are (mean, variance) of the predicted Gaussian
             #   others: dim=n_classes, softmax class probabilities
@@ -187,6 +187,10 @@ def run_csv_stages(model, info, trial_files, stages, output_root, cfg):
     for name, path in dirs.items():
         print(f"  {name}: {path}")
 
+
+# =============================================================================
+# Use produced CSV files for plotting
+# =============================================================================
 
 def run_plot_trajectories(model, n_cue_classes, all_files, output_dir, model_name, cfg):
     """Individual + averaged activity and derivatives.
@@ -311,20 +315,20 @@ def run_plot_stages(model, info, all_files, stages, output_root, model_name, cfg
     if 'plot_trajectories' in stages:
         run_plot_trajectories(model, n_cue_classes, all_files, output_dir, model_name, cfg)
 
-    want_by_pos = 'plot_by_position' in stages
-    want_dev = 'plot_deviant' in stages
-    if want_by_pos or want_dev:
+    include_by_pos = 'plot_by_position' in stages
+    include_dev = 'plot_deviant' in stages
+    if include_by_pos or include_dev:
         selected_files = select_files(all_files, cfg.n_sequences, seed=cfg.seed)
         n_select = len(selected_files)
         print(f"[plot_by_position/plot_deviant] using {n_select} trial sequence files")
 
         module_norms_dict, dev_pos = exp.compute_norms_for_files(
             model, selected_files, period=cfg.period, chunk_size=cfg.chunk_size,
-            n_cue_classes=n_cue_classes, cue_seed=cfg.cue_seed, return_devpos=want_dev)
+            n_cue_classes=n_cue_classes, cue_seed=cfg.cue_seed, return_devpos=include_dev)
 
-        if want_by_pos:
+        if include_by_pos:
             run_plot_by_position(module_norms_dict, n_select, output_dir, model_name, cfg)
-        if want_dev:
+        if include_dev:
             run_plot_deviant(module_norms_dict, dev_pos, n_select, output_dir, model_name, cfg)
 
     print(f"\nFigures saved to {output_dir}")

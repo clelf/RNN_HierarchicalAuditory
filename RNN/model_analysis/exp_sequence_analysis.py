@@ -46,11 +46,45 @@ from analysis_core import (
 # =============================================================================
 # Extraction: per-sequence tables
 # =============================================================================
-def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_n):
+def add_module_activity_columns(out_df, norms, derivs, n_out, prefix=''):
+    """Append one block of per-module activity norms and derivatives to `out_df`.
+
+    Called once per pass of a forward cycle: with prefix='' for the posterior
+    hidden states (the state each module ends the timestep with) and with
+    prefix='prior_' for the states their first call left them in.
+
+    Parameters
+    ----------
+    out_df : pandas.DataFrame
+        Frame to add the columns to, modified in place.
+    norms : dict
+        Module name → ndarray of shape (n_out,).
+    derivs : dict
+        Module name → ndarray of shape (n_out - 1,), padded with NaN on the right
+        so every column of the frame has the same length.
+    n_out : int
+        Number of rows of the frame, i.e. of model output timesteps.
+    prefix : str
+        Prepended to every column name written here.
+    """
+    n_deriv = next(iter(derivs.values())).shape[0]
+    pad = np.full(n_out - n_deriv, np.nan)
+    for name in MODULES:
+        out_df[f'{prefix}{name}_norm'] = norms[name]
+    for name in MODULES:
+        out_df[f'{prefix}{name}_deriv'] = np.concatenate([derivs[name], pad])
+
+
+def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_n,
+                            prior_norms=None, prior_derivs=None):
     """Per-timestep activity CSV: one row per model output timestep.
 
     Rows are the T-1 model output timesteps; the sequence columns are the raw
     (unshifted) observation and cue at those same timesteps.
+
+    `prior_norms` / `prior_derivs`, when given (get_module_output_and_activity(...,
+    return_prior=True)), add the same columns computed on the prior hidden states,
+    under a 'prior_' prefix. The unprefixed columns always hold the posterior pass.
     """
     n_out = next(iter(norms.values())).shape[0]
 
@@ -61,24 +95,19 @@ def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_
     used_cols = np.flatnonzero(cue.any(axis=0))
     cue_out = cue[:n_out][:, used_cols]  # (n_out, 2)
 
-    # Pad derivatives with NaN at the last position so all columns have length T-1
-    n_deriv = next(iter(derivs.values())).shape[0]
-    pad = np.full(n_out - n_deriv, np.nan)
-    derivs_padded = {name: np.concatenate([arr, pad]) for name, arr in derivs.items()}
-
     out_df = pd.DataFrame({
         'observation':  obs_out,
         'cue_1':        cue_out[:, 0].astype(int),
         'cue_2':        cue_out[:, 1].astype(int),
-        'obs_norm':     norms['obs'],
-        'ctx_norm':     norms['ctx'],
-        'dpos_norm':    norms['dpos'],
-        'rule_norm':    norms['rule'],
-        'obs_deriv':    derivs_padded['obs'],
-        'ctx_deriv':    derivs_padded['ctx'],
-        'dpos_deriv':   derivs_padded['dpos'],
-        'rule_deriv':   derivs_padded['rule'],
     })
+
+    # Derivatives are one step shorter than the norms and get NaN-padded inside.
+    add_module_activity_columns(out_df, norms, derivs, n_out)
+
+    if prior_norms is not None:
+        add_module_activity_columns(out_df, prior_norms, prior_derivs, n_out,
+                                    prefix='prior_')
+
     out_df['lim_std'] = lim_std
     out_df['d'] = d
     out_df['tau_std'] = tau_std
@@ -86,8 +115,22 @@ def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_
     return out_df
 
 
+def add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, n_deriv,
+                                        prefix=''):
+    """Append per-module activity sampled at the deviant timestep of each trial.
+
+    Same column block as add_module_activity_columns, but one row per trial: each
+    module's norm and derivative are gathered at that trial's deviant timestep.
+    """
+    for name in MODULES:
+        out_df[f'{prefix}{name}_norm'] = gather_at(norms[name], dev_idx, n_out)
+    for name in MODULES:
+        out_df[f'{prefix}{name}_deriv'] = gather_at(derivs[name], dev_idx, n_deriv)
+
+
 def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, tau_std,
-                                    trial_n, period, dpos_shift):
+                                    trial_n, period, dpos_shift,
+                                    prior_norms=None, prior_derivs=None):
     """One row per trial, sampled at the deviant timestep.
 
     Two distinct uses of dpos are kept separate:
@@ -95,6 +138,9 @@ def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, ta
         position (that is literally where the deviant tone sits in the sequence);
       * the stored deviant_pos LABEL is shifted into the model's convention so it
         matches the probabilities stage's dpos column and the model's class mapping.
+
+    `prior_norms` / `prior_derivs`, when given, add the same columns computed on the
+    prior hidden states, under a 'prior_' prefix.
     """
     n_out = next(iter(norms.values())).shape[0]     # T-1
     n_deriv = next(iter(derivs.values())).shape[0]  # T-2
@@ -112,15 +158,14 @@ def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, ta
     out_df = pd.DataFrame({
         'trial_n':      trial_ids,
         'deviant_pos':  deviant_pos,
-        'obs_norm':     gather_at(norms['obs'],  dev_idx, n_out),
-        'ctx_norm':     gather_at(norms['ctx'],  dev_idx, n_out),
-        'dpos_norm':    gather_at(norms['dpos'], dev_idx, n_out),
-        'rule_norm':    gather_at(norms['rule'], dev_idx, n_out),
-        'obs_deriv':    gather_at(derivs['obs'],  dev_idx, n_deriv),
-        'ctx_deriv':    gather_at(derivs['ctx'],  dev_idx, n_deriv),
-        'dpos_deriv':   gather_at(derivs['dpos'], dev_idx, n_deriv),
-        'rule_deriv':   gather_at(derivs['rule'], dev_idx, n_deriv),
     })
+
+    add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, n_deriv)
+
+    if prior_norms is not None:
+        add_module_deviant_activity_columns(out_df, prior_norms, prior_derivs, dev_idx,
+                                            n_out, n_deriv, prefix='prior_')
+
     out_df['lim_std'] = lim_std
     out_df['d'] = d
     out_df['tau_std'] = tau_std

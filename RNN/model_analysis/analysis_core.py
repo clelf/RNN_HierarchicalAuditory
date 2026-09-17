@@ -9,7 +9,7 @@ Four groups, in order:
      the forward pass     to_model_tensors, load_trial_params, dpos_conventions,
                           run_forward_pass, get_module_output_and_activity,
                           get_module_probabilities,
-                          module_probabilities_from_output.
+                          module_probabilities_from_output, group_by_module.
   4. Numerics          -- gaussian_likelihood, class_likelihood,
                           compute_derivatives, gather_at.
 
@@ -674,6 +674,12 @@ def dpos_conventions(info, experimental_dpos_min=EXPERIMENTAL_DPOS_MIN):
 # Forward pass
 # =============================================================================
 
+def group_by_module(group):
+    """Name the four entries of one forward-output group, in the model's order."""
+    obs, ctx, dpos, rule = group
+    return {'obs': obs, 'ctx': ctx, 'dpos': dpos, 'rule': rule}
+
+
 def run_forward_pass(model, y, q, return_prior=False):
     """Run a forward pass and return raw module outputs and hidden states per module.
 
@@ -686,52 +692,39 @@ def run_forward_pass(model, y, q, return_prior=False):
     q : torch.Tensor
         Query sequences, shape (batch, seq_len, q_dim).
     return_prior : bool
-        If True, also return the prior (first-call) module readouts, i.e. the
-        outputs produced before the feedback sweep has reached each module.
+        If True, also return the prior readouts and prior hidden states, i.e. the
+        output and the state each module holds after its first call, before the
+        feedback sweep of that timestep has reached it.
 
     Returns
     -------
     prob_output : dict
         Module name → posterior readout tensor, shape (batch, seq_len, out_dim).
     hidden_states : dict
-        Module name → tensor of shape (seq_len, n_layers, batch, hidden_dim).
+        Module name → tensor of shape (seq_len, n_layers, batch, hidden_dim), the
+        state each module ends the timestep with.
     prior_output : dict
-        Module name → prior readout tensor, same shape as prob_output. Returned
-        only when return_prior=True.
+        Module name → prior readout tensor. Returned only when return_prior=True.
+    prior_hidden_states : dict
+        Module name → prior hidden state tensor, same shape as hidden_states.
+        Returned only when return_prior=True.
     """
     with torch.no_grad():
         forward_output = model(y[:, :-1, :], q[:, :-1, :],
                                return_hidden=True, return_prior=return_prior)
 
     # The forward output is made of groups of four (one entry per module), in the
-    # order: posterior readouts, prior readouts (if asked for), hidden states.
-    obs_outputs, ctx_outputs, dpos_outputs, rule_outputs = forward_output[:4]
-    obs_hidden, ctx_hidden, dpos_hidden, rule_hidden = forward_output[-4:]
-
-    prob_output = {
-        'obs':  obs_outputs,
-        'ctx':  ctx_outputs,
-        'dpos': dpos_outputs,
-        'rule': rule_outputs,
-    }
-
-    hidden_states ={
-        'obs':  obs_hidden,
-        'ctx':  ctx_hidden,
-        'dpos': dpos_hidden,
-        'rule': rule_hidden,
-    }
+    # order: posterior readouts, prior readouts, posterior hidden states, prior
+    # hidden states -- the prior groups being present only when asked for.
+    prob_output = group_by_module(forward_output[:4])
 
     if return_prior:
-        prior_obs, prior_ctx, prior_dpos, prior_rule = forward_output[4:8]
-        prior_output = {
-            'obs':  prior_obs,
-            'ctx':  prior_ctx,
-            'dpos': prior_dpos,
-            'rule': prior_rule,
-        }
-        return prob_output, hidden_states, prior_output
+        prior_output = group_by_module(forward_output[4:8])
+        hidden_states = group_by_module(forward_output[8:12])
+        prior_hidden_states = group_by_module(forward_output[12:16])
+        return prob_output, hidden_states, prior_output, prior_hidden_states
 
+    hidden_states = group_by_module(forward_output[4:8])
     return prob_output, hidden_states
 
 
@@ -774,8 +767,8 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False
     layer_idx : int
         Which RNN layer to extract. Default: -1 (last layer).
     return_prior : bool
-        If True, also return the prior (first-call) module readouts as a fourth
-        element.
+        If True, also return the same three quantities computed on the prior
+        (first-call) readouts and hidden states, as three further elements.
 
     Returns
     -------
@@ -787,15 +780,28 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False
         Module name → ndarray of shape (seq_len-1, batch).
     prior_output : dict
         Module name → prior readout tensor. Returned only when return_prior=True.
+    prior_activity : dict
+        Module name → ndarray of shape (seq_len, batch), norms of the prior hidden
+        states. Returned only when return_prior=True.
+    prior_derivatives : dict
+        Module name → ndarray of shape (seq_len-1, batch). Returned only when
+        return_prior=True.
     """
     if return_prior:
-        prob_output, hidden_states, prior_output = run_forward_pass(model, y, q, return_prior=True)
+        prob_output, hidden_states, prior_output, prior_hidden_states = run_forward_pass(
+            model, y, q, return_prior=True)
     else:
         prob_output, hidden_states = run_forward_pass(model, y, q)
+
     hidden_activity = compute_hidden_norms(hidden_states, layer_idx=layer_idx)
     hidden_derivatives = {name: compute_derivatives(norms) for name, norms in hidden_activity.items()}
+
     if return_prior:
-        return prob_output, hidden_activity, hidden_derivatives, prior_output
+        prior_activity = compute_hidden_norms(prior_hidden_states, layer_idx=layer_idx)
+        prior_derivatives = {name: compute_derivatives(norms) for name, norms in prior_activity.items()}
+        return (prob_output, hidden_activity, hidden_derivatives,
+                prior_output, prior_activity, prior_derivatives)
+
     return prob_output, hidden_activity, hidden_derivatives
 
 
