@@ -151,8 +151,8 @@ def load_trial_params(filepath):
     }
 
 
-def run_forward_pass(model, y, q):
-    """Run a forward pass and return raw hidden states per module.
+def run_forward_pass(model, y, q, return_prior=False):
+    """Run a forward pass and return raw module outputs and hidden states per module.
 
     Parameters
     ----------
@@ -162,17 +162,29 @@ def run_forward_pass(model, y, q):
         Observation sequences, shape (batch, seq_len, obs_dim).
     q : torch.Tensor
         Query sequences, shape (batch, seq_len, q_dim).
+    return_prior : bool
+        If True, also return the prior (first-call) module readouts, i.e. the
+        outputs produced before the feedback sweep has reached each module.
 
     Returns
     -------
-    dict
+    prob_output : dict
+        Module name → posterior readout tensor, shape (batch, seq_len, out_dim).
+    hidden_states : dict
         Module name → tensor of shape (seq_len, n_layers, batch, hidden_dim).
+    prior_output : dict
+        Module name → prior readout tensor, same shape as prob_output. Returned
+        only when return_prior=True.
     """
     with torch.no_grad():
-        obs_outputs, ctx_outputs, dpos_outputs, rule_outputs, \
-            obs_hidden, ctx_hidden, dpos_hidden, rule_hidden = \
-            model(y[:, :-1, :], q[:, :-1, :], return_hidden=True)
-    
+        forward_output = model(y[:, :-1, :], q[:, :-1, :],
+                               return_hidden=True, return_prior=return_prior)
+
+    # The forward output is made of groups of four (one entry per module), in the
+    # order: posterior readouts, prior readouts (if asked for), hidden states.
+    obs_outputs, ctx_outputs, dpos_outputs, rule_outputs = forward_output[:4]
+    obs_hidden, ctx_hidden, dpos_hidden, rule_hidden = forward_output[-4:]
+
     prob_output = {
         'obs':  obs_outputs,
         'ctx':  ctx_outputs,
@@ -186,6 +198,16 @@ def run_forward_pass(model, y, q):
         'dpos': dpos_hidden,
         'rule': rule_hidden,
     }
+
+    if return_prior:
+        prior_obs, prior_ctx, prior_dpos, prior_rule = forward_output[4:8]
+        prior_output = {
+            'obs':  prior_obs,
+            'ctx':  prior_ctx,
+            'dpos': prior_dpos,
+            'rule': prior_rule,
+        }
+        return prob_output, hidden_states, prior_output
 
     return prob_output, hidden_states
 
@@ -212,7 +234,7 @@ def compute_hidden_norms(hidden_states, layer_idx=-1):
     return norms
 
 
-def get_module_output_and_activity(model, y, q, layer_idx=-1):
+def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False):
     """Return per-module hidden activity norms and their temporal derivatives.
 
     Runs a single forward pass with return_hidden=True, selects the requested
@@ -228,21 +250,72 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1):
         Query sequences, shape (batch, seq_len, q_dim).
     layer_idx : int
         Which RNN layer to extract. Default: -1 (last layer).
+    return_prior : bool
+        If True, also return the prior (first-call) module readouts as a fourth
+        element.
 
     Returns
     -------
+    prob_output : dict
+        Module name → posterior readout tensor.
     hidden_activity : dict
         Module name → ndarray of shape (seq_len, batch).
     hidden_derivatives : dict
         Module name → ndarray of shape (seq_len-1, batch).
+    prior_output : dict
+        Module name → prior readout tensor. Returned only when return_prior=True.
     """
-    prob_output, hidden_states = run_forward_pass(model, y, q)
+    if return_prior:
+        prob_output, hidden_states, prior_output = run_forward_pass(model, y, q, return_prior=True)
+    else:
+        prob_output, hidden_states = run_forward_pass(model, y, q)
     hidden_activity = compute_hidden_norms(hidden_states, layer_idx=layer_idx)
     hidden_derivatives = {name: compute_derivatives(norms) for name, norms in hidden_activity.items()}
+    if return_prior:
+        return prob_output, hidden_activity, hidden_derivatives, prior_output
     return prob_output, hidden_activity, hidden_derivatives
 
 
-def get_module_probabilities(model, y, q):
+def module_probabilities_from_output(model, model_output, prior=False):
+    """Post-process one forward output into per-module probabilities.
+
+    Shared by get_module_probabilities for the posterior and the prior readouts;
+    the post-processing itself is delegated to pipeline_core_v2.get_model_predictions
+    so both passes are read exactly as in training and evaluation.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Trained model.
+    model_output : tuple
+        Output of the model's forward pass.
+    prior : bool
+        If True, read the prior (first-call) readouts, which requires model_output
+        to come from forward(..., return_prior=True).
+
+    Returns
+    -------
+    dict
+        Module name → ndarray of shape (seq_len, batch, dim).
+    """
+    pred = get_model_predictions(model, model_output, prior=prior)
+
+    # get_model_predictions returns batch-major arrays:
+    #   mu_estim / var_estim : (batch, seq_len)
+    #   *_prob               : (batch, seq_len, n_classes)
+    # Stack obs into (batch, seq_len, 2) then move to the (seq_len, batch, dim)
+    # convention used elsewhere (time-major, batch second).
+    obs = np.stack([pred['mu_estim'], pred['var_estim']], axis=-1)  # (batch, seq_len, 2)
+
+    return {
+        'obs':  np.transpose(obs, (1, 0, 2)),
+        'ctx':  np.transpose(pred['ctx_prob'], (1, 0, 2)),
+        'dpos': np.transpose(pred['dpos_prob'], (1, 0, 2)),
+        'rule': np.transpose(pred['rule_prob'], (1, 0, 2)),
+    }
+
+
+def get_module_probabilities(model, y, q, return_prior=False):
     """Return per-module output probabilities/distribution parameters.
 
     Runs a standard forward pass and delegates the output post-processing to
@@ -264,31 +337,26 @@ def get_module_probabilities(model, y, q):
         Observation sequences, shape (batch, seq_len, obs_dim).
     q : torch.Tensor
         Query sequences, shape (batch, seq_len, q_dim).
+    return_prior : bool
+        If True, also return the same quantities computed on the prior
+        (first-call) readouts, as a second dict.
 
     Returns
     -------
-    dict
-        Module name → ndarray of shape (seq_len, batch, dim):
+    probabilities : dict
+        Module name → ndarray of shape (seq_len, batch, dim), from the posterior
+        readouts:
         - 'obs':  dim = 2, columns are (mean, variance)
         - others: dim = n_classes, softmax class probabilities
+    prior_probabilities : dict
+        Same, from the prior readouts. Returned only when return_prior=True.
     """
     with torch.no_grad():
-        model_output = model(y[:, :-1, :], q[:, :-1, :])
-    pred = get_model_predictions(model, model_output)
+        model_output = model(y[:, :-1, :], q[:, :-1, :], return_prior=return_prior)
 
-    # get_model_predictions returns batch-major arrays:
-    #   mu_estim / var_estim : (batch, seq_len)
-    #   *_prob               : (batch, seq_len, n_classes)
-    # Stack obs into (batch, seq_len, 2) then move to the (seq_len, batch, dim)
-    # convention used elsewhere (time-major, batch second).
-    obs = np.stack([pred['mu_estim'], pred['var_estim']], axis=-1)  # (batch, seq_len, 2)
-
-    probabilities = {
-        'obs':  np.transpose(obs, (1, 0, 2)),
-        'ctx':  np.transpose(pred['ctx_prob'], (1, 0, 2)),
-        'dpos': np.transpose(pred['dpos_prob'], (1, 0, 2)),
-        'rule': np.transpose(pred['rule_prob'], (1, 0, 2)),
-    }
+    probabilities = module_probabilities_from_output(model, model_output, prior=False)
+    if return_prior:
+        return probabilities, module_probabilities_from_output(model, model_output, prior=True)
     return probabilities
 
 
