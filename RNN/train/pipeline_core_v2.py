@@ -298,7 +298,7 @@ def compute_model_loss(model, objective, y_tensor, model_output, data_mode,
         # Standard RNN/VRNN loss
         return objective.loss(model, y_tensor[:, 1:, :], model_output)
 
-def get_model_predictions(model, model_output, dpos_min=0):
+def get_model_predictions(model, model_output, dpos_min=0, prior=False):
     """
     Extract and process all model predictions from output based on model type.
     
@@ -312,6 +312,13 @@ def get_model_predictions(model, model_output, dpos_min=0):
         The model (SimpleRNN, VRNN, ModuleNetwork, or PopulationNetwork)
     model_output : tuple or torch.Tensor
         Output from model forward pass
+    dpos_min : int
+        Class-index offset of the dpos module (class c <-> position c + dpos_min)
+    prior : bool
+        PopulationNetwork only. If False (default), read the posterior readouts,
+        i.e. the four first elements of the forward output. If True, read the prior
+        (first-call) readouts instead, which requires model_output to come from
+        forward(..., return_prior=True): they are the next four elements.
     
     Returns
     -------
@@ -333,7 +340,10 @@ def get_model_predictions(model, model_output, dpos_min=0):
         obs_output, context_output = model_output
         output = {'obs_dist': obs_output, 'ctx': context_output}
     elif model.name == 'population_network':
-        obs_output, context_output, dpos_output, rule_output = model_output
+        # forward() returns the four posterior readouts, then the four prior ones
+        # (return_prior=True), then the four hidden-state stacks (return_hidden=True).
+        offset = 4 if prior else 0
+        obs_output, context_output, dpos_output, rule_output = model_output[offset:offset + 4]
         output = {'obs_dist': obs_output, 'ctx': context_output, 'dpos': dpos_output, 'rule': rule_output}
     elif model.name == 'vrnn':
         output = {'obs_dist': model_output[0]}

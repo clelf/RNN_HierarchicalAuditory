@@ -1,95 +1,48 @@
-"""
-Tools for model evaluation.
+"""Scoring a trained model, and comparing it against the Kalman-filter benchmark.
 
-This script loads multiple trained models and evaluates them on the same
-generated test dataset, computing:
-- MSE (Mean Squared Error)
-- Log-likelihood (Gaussian log-probability)
-- Calibration (Kolmogorov-Smirnov test for predicted variance)
-- Context inference accuracy (for ModuleNetwork with N_ctx > 1)
-- Context log-probability (for ModuleNetwork with N_ctx > 1)
+Three groups:
 
-Benchmark Comparison:
-    The assess_model_against_benchmarks() function allows comparing model 
-    performance against Kalman Filter (KF) benchmarks. Given pre-computed KF
-    results, it computes:
-    - Model vs KF MSE ratio (< 1 means model is better)
-    - Model vs KF log-likelihood difference (> 0 means model is better)
-    - Model vs KF calibration ratio (< 1 means model is better calibrated)
-    
-    This helps assess how difficult the problem was for the model relative
-    to the optimal Bayesian estimator (KF).
+  1. Metrics      -- one function per quantity (MSE, Gaussian log-likelihood,
+                     calibration KS, and the accuracy / log-probability of the
+                     ctx, dpos and rule modules).
+  2. KF benchmark -- the hierarchical Kalman filter's marginal predictive
+                     likelihood, used as the reference an RNN is scored against.
+  3. Drivers      -- evaluate_model (one model) and evaluate_models (a list of
+                     them, returning a tidy DataFrame), plus the benchmark
+                     comparison that turns those into model/KF ratios.
 
-Configuration Loading:
-    Models trained with the updated pipeline automatically save a config JSON file
-    (config.json) alongside the weights. This script will:
-    1. Load the saved config if available (recommended for reproducibility)
-    2. Use the exact training data parameters for test data generation
-    3. Fall back to inferring config from directory structure if needed
-    
-    Each model folder should contain a single .pth weights file, which is
-    auto-detected during model loading.
-
-Usage:
-    Edit the SETTINGS block at the bottom of this file (BASE_DIR / MODEL_DIRS,
-    N_SAMPLES, N_TONES, OUTPUT, VERBOSE), then run:
-
-        python evaluate_models.py
-
-    Or import and call evaluate_models(...) / assess_models_against_benchmarks(...)
-    directly from a notebook or another script.
+Split out of evaluate_models.py; the bodies are unchanged. Model loading and
+test-data generation live in analysis_core.py, plotting in plots.py.
 """
 
 import gc
-import json
 import os
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 from scipy import stats, special
-from scipy.stats import norm as sp_norm
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
-
-# Set up sys.path before all local imports:
-#   model_analysis/ — this file's own directory (for sibling modules)
-#   RNN/            — parent, contains model.py
-#   RNN/train/      — contains pipeline_core_v2.py and config_v2.py
-#   Workspace/      — root for PreProParadigm and Kalman packages
-_here = os.path.abspath(os.path.dirname(__file__))
-_rnn_dir = os.path.abspath(os.path.join(_here, '..'))
-_train_dir = os.path.abspath(os.path.join(_here, '..', 'train'))
-_workspace = os.path.abspath(os.path.join(_here, '..', '..', '..'))
-for _p in [_workspace, _train_dir, _rnn_dir, _here]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from model import SimpleRNN, VRNN, ObsCtxModuleNetwork, PopulationNetwork
-from pipeline_core_v2 import get_model_predictions, prepare_batch_data, _create_module_network_config, _create_population_network_config
-
-# Local config (for loading saved configs)
-from config_v2 import RunConfig, TrainingConfig, ModelArchConfig, DataConfig as TrainDataConfig
-
-# Generative models
-from PreProParadigm.audit_gm import NonHierarchicalAuditGM, HierarchicalAuditGM
+from analysis_core import (
+    ModelInfo,
+    load_model,
+    generate_test_data,
+    get_model_predictions,
+)
 
 # Kalman-filter benchmark machinery (config-agnostic numerics).
 from Kalman.kalman import (
-    MIN_OBS_FOR_EM,
     kalman_online_fit_predict_multicontext,
     likelihood_observation,
     contexts_to_probabilities,
 )
 # The deviant-position conditional and its marginalization over rules are REUSED
-# from PreProParadigm/model_RTs.py (single source of truth). They now accept a
+# from PreProParadigm/model_RTs.py (single source of truth). They accept a
 # `valid_positions` arg so the same math applies to the RNN HierarchicalGM's
 # rules_dpos_set instead of the old hard-coded positions.
 from PreProParadigm.model_RTs import (
@@ -99,721 +52,8 @@ from PreProParadigm.model_RTs import (
 
 
 # =============================================================================
-# Plotting helpers
+# Metrics
 # =============================================================================
-
-def plot_calibration_curve(
-    y_true: np.ndarray,
-    mu_pred: np.ndarray,
-    var_pred: np.ndarray,
-    save_path: Path = None,
-    title: str = "KS Calibration Plot",
-    ax: plt.Axes = None,
-    color: str = "#1f77b4",
-    label: str = None,
-    alpha_band: float = 0.05,
-):
-    """
-    Plot the empirical CDF of the Probability Integral Transform (PIT) values
-    against the ideal uniform diagonal.
-
-    For a perfectly calibrated model the PIT values are Uniform(0,1), so the
-    empirical CDF should lie on the diagonal.  The maximum vertical distance
-    from the diagonal is the Kolmogorov–Smirnov D-statistic.
-
-    Parameters
-    ----------
-    y_true : np.ndarray, shape (n_samples, seq_len)
-        True observations.
-    mu_pred : np.ndarray, shape (n_samples, seq_len)
-        Predicted means.
-    var_pred : np.ndarray, shape (n_samples, seq_len)
-        Predicted variances.
-    save_path : Path, optional
-        If given, save the figure to this path.
-    title : str
-        Plot title.
-    ax : matplotlib Axes, optional
-        If provided, draw on this axes (useful for multi-panel figures).
-    color : str
-        Line colour for the empirical CDF.
-    label : str, optional
-        Legend label for the empirical CDF curve.
-    alpha_band : float
-        Significance level for the KS confidence band (default 0.05 → 95 %).
-
-    Returns
-    -------
-    fig : matplotlib Figure or None
-        The figure object (None when an external *ax* was supplied).
-    ks_stat : float
-        The pooled KS D-statistic.
-    """
-
-    # --- Compute PIT values (pooled across samples & time) ---
-    sigma_pred = np.sqrt(var_pred)
-    pit = sp_norm.cdf((y_true - mu_pred) / sigma_pred)
-    pit_flat = pit.ravel()
-    pit_flat = pit_flat[~np.isnan(pit_flat)]
-    pit_flat.sort()
-
-    n = len(pit_flat)
-    ecdf = np.arange(1, n + 1) / n          # empirical CDF values
-    F    = pit_flat                           # theoretical quantiles (sorted PITs)
-
-    # KS statistic = max |ECDF(f) - f|
-    ks_stat = np.max(np.abs(ecdf - F))
-
-    # --- KS confidence band width ---
-    # c(alpha) for two-sided KS test: 1.36 (alpha=0.05), 1.22 (0.10), 1.63 (0.01)
-    c_alpha = {0.01: 1.63, 0.05: 1.36, 0.10: 1.22}.get(alpha_band, 1.36)
-    band_half = c_alpha / np.sqrt(n)
-
-    # --- Plot ---
-    own_fig = ax is None
-    if own_fig:
-        fig, ax = plt.subplots(figsize=(6, 6))
-    else:
-        fig = None
-
-    # Confidence band around the diagonal
-    F_grid = np.linspace(0, 1, 500)
-    ax.fill_between(
-        F_grid,
-        np.clip(F_grid - band_half, 0, 1),
-        np.clip(F_grid + band_half, 0, 1),
-        color="grey", alpha=0.75,
-        label=f"{int((1-alpha_band)*100)}% KS band",
-    )
-
-    # Ideal diagonal
-    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Ideal (Uniform)")
-
-    # Empirical CDF of PITs
-    ax.plot(F, ecdf, color=color, linewidth=1.5,
-            label=label or f"Empirical CDF (D={ks_stat:.4f})")
-
-    # Mark the point of maximum deviation
-    idx_max = np.argmax(np.abs(ecdf - F))
-    ax.plot([F[idx_max], F[idx_max]], [F[idx_max], ecdf[idx_max]],
-            color="red", linewidth=1.5, linestyle="-",
-            label=f"Max deviation = {ks_stat:.4f}")
-    ax.plot(F[idx_max], ecdf[idx_max], "o", color="red", markersize=5)
-
-    ax.set_xlabel("PIT value (theoretical quantile)")
-    ax.set_ylabel("Empirical CDF")
-    ax.set_title(title)
-    ax.legend(loc="lower right", fontsize=9)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_aspect("equal")
-
-    if own_fig and save_path is not None:
-        fig.savefig(save_path, bbox_inches="tight")
-        print(f"Saved calibration plot to: {save_path}")
-        plt.close(fig)
-
-    return fig, ks_stat
-
-
-def get_desired_order(results):
-    # Categorize models
-    obs = [mod for mod in results if results[mod]['learning_objective'] == 'obs']
-    obs_ctx = [mod for mod in results if results[mod]['learning_objective'] == 'obs_ctx']
-    ctx = [mod for mod in results if results[mod]['learning_objective'] == 'ctx']
-    # Handle any other objectives (e.g., 'all')
-    other = [mod for mod in results if results[mod]['learning_objective'] not in ['obs', 'obs_ctx', 'ctx']]
-
-    # Sort obs by bottleneck_dim
-    obs_sorted = sorted(obs, key=lambda mod: results[mod]['bottleneck_dim'])
-    # Sort obs_ctx by bottleneck_dim, then kappa (inverted order)
-    obs_ctx_sorted = sorted(obs_ctx, key=lambda mod: (results[mod]['bottleneck_dim'], results[mod]['kappa']))
-    # Sort ctx by bottleneck_dim
-    ctx_sorted = sorted(ctx, key=lambda mod: results[mod]['bottleneck_dim'])
-    # Sort other by bottleneck_dim
-    other_sorted = sorted(other, key=lambda mod: results[mod]['bottleneck_dim'])
-
-    # Concatenate in desired order
-    return obs_sorted + obs_ctx_sorted + ctx_sorted + other_sorted
-
-
-
-# =============================================================================
-# Learning Rate Detection
-# =============================================================================
-
-def find_lr_id_for_learning_rate(model_dir: Path, target_lr: float = 0.01, tolerance: float = 1e-6) -> Optional[int]:
-    """
-    Find the lr_id that corresponds to a specific learning rate.
-    
-    Parses training log files (training_log_lr{id}.txt) to find the lr_id
-    that was trained with the target learning rate.
-    
-    Args:
-        model_dir: Path to the model directory
-        target_lr: Target learning rate to find (default: 0.01)
-        tolerance: Tolerance for float comparison
-    
-    Returns:
-        The lr_id that matches, or None if not found
-    """
-    model_dir = Path(model_dir)
-    
-    # Find all training log files
-    log_files = list(model_dir.glob("training_log_lr*.txt"))
-    
-    for log_file in log_files:
-        # Extract lr_id from filename
-        filename = log_file.name  # e.g., "training_log_lr0.txt"
-        lr_id = int(filename.split("_lr")[1].split(".txt")[0])
-        
-        # Read first line to get the learning rate
-        with open(log_file, 'r') as f:
-            first_line = f.readline().strip()
-        
-        # Parse "LR:  1e-02; epoch: ..." format
-        if "LR:" in first_line:
-            lr_str = first_line.split("LR:")[1].split(";")[0].strip()
-            actual_lr = float(lr_str)
-            
-            if abs(actual_lr - target_lr) < tolerance:
-                return lr_id
-    
-    return None
-
-
-def discover_models_with_lr(
-    base_dir: Path, 
-    target_lr: float = 0.01,
-    verbose: bool = True
-) -> List[Tuple[Path, int]]:
-    """
-    Discover all model directories and find the lr_id for a specific learning rate.
-    
-    DEPRECATED: Use discover_models() for folders with single weights files.
-    
-    Args:
-        base_dir: Base directory containing model subdirectories
-        target_lr: Target learning rate to find
-        verbose: Print discovery information
-    
-    Returns:
-        List of (model_dir, lr_id) tuples for models trained with target_lr
-    """
-    base_dir = Path(base_dir)
-    results = []
-    
-    if verbose:
-        print(f"\nDiscovering models trained with lr={target_lr}...")
-    
-    # Find all model directories (those containing weights files)
-    for weights_file in base_dir.rglob("*_weights.pth"):
-        model_dir = weights_file.parent
-        
-        # Skip if we've already processed this directory
-        if any(d == model_dir for d, _ in results):
-            continue
-        
-        lr_id = find_lr_id_for_learning_rate(model_dir, target_lr)
-        
-        if lr_id is not None:
-            weights_path = model_dir / f"lr{lr_id}_weights.pth"
-            if weights_path.exists():
-                results.append((model_dir, lr_id))
-                if verbose:
-                    print(f"  ✓ {model_dir.name}: lr_id={lr_id}")
-            else:
-                if verbose:
-                    print(f"  ✗ {model_dir.name}: Found lr_id={lr_id} but weights file missing")
-        else:
-            if verbose:
-                print(f"  ✗ {model_dir.name}: No training with lr={target_lr} found")
-    
-    if verbose:
-        print(f"  Found {len(results)} models trained with lr={target_lr}")
-    
-    return results
-
-
-def discover_models(
-    base_dir: Path,
-    verbose: bool = True
-) -> List[Path]:
-    """
-    Discover all model directories (those containing a .pth weights file).
-    
-    Each model directory is expected to contain a single weights file (.pth)
-    and optionally a config.json file.
-    
-    Args:
-        base_dir: Base directory to search for models
-        verbose: Print discovery information
-    
-    Returns:
-        List of model directory paths
-    """
-    base_dir = Path(base_dir)
-    results = []
-    
-    if verbose:
-        print(f"\nDiscovering models in {base_dir}...")
-    
-    # Find all directories containing weights files
-    for weights_file in base_dir.rglob("*.pth"):
-        model_dir = weights_file.parent
-        
-        # Skip if we've already processed this directory
-        if model_dir in results:
-            continue
-        
-        results.append(model_dir)
-        if verbose:
-            print(f"  ✓ {model_dir.name}")
-    
-    if verbose:
-        print(f"  Found {len(results)} models")
-    
-    return results
-
-
-# =============================================================================
-# Model Configuration Inference
-# =============================================================================
-
-@dataclass
-class ModelInfo:
-    """Information about a trained model extracted from its directory or config file."""
-    model_dir: Path
-    model_type: str  # 'rnn', 'vrnn', 'module_network'
-    hidden_dim: int
-    n_ctx: int
-    gm_name: str
-    weights_path: Path
-    
-    # ModuleNetwork specific
-    learning_objective: str
-    kappa: float
-    bottleneck_dim: int
-    
-    # Full config if loaded from file
-    run_config: Optional[RunConfig] = None
-    
-    # Data config for test data generation (parsed from run_config or defaults)
-    data_config_dict: Optional[dict] = None
-    
-    @classmethod
-    def from_path(cls, model_dir: Path) -> 'ModelInfo':
-        """
-        Load model configuration, preferring saved config file if available.
-        
-        Automatically finds the weights file in the directory (expects single .pth file).
-        
-        Priority:
-        1. Load from config.json if it exists
-        2. Load from legacy lr*_config.json as fallback
-        3. Fall back to inferring from directory structure
-        """
-        model_dir = Path(model_dir)
-        config_path = model_dir / 'config.json'
-        
-        # Find the weights file (expect single .pth file)
-        weights_files = list(model_dir.glob('*.pth'))
-        if not weights_files:
-            raise FileNotFoundError(f"No weights file found in: {model_dir}")
-        if len(weights_files) > 1:
-            # If multiple, prefer the one without 'lr' prefix or just take first
-            weights_path = weights_files[0]
-        else:
-            weights_path = weights_files[0]
-        
-        # Try to load from config.json first
-        if config_path.exists():
-            return cls._from_config_file(config_path, model_dir, weights_path)
-        
-        # Try to find legacy lr*_config.json files
-        config_files = list(model_dir.glob('*config*.json'))
-        if config_files:
-            # Use the first available config file
-            fallback_config = config_files[0]
-            return cls._from_config_file(fallback_config, model_dir, weights_path)
-        
-        # Fall back to inferring from directory structure
-        return cls._from_directory_structure(model_dir, weights_path)
-    
-    @classmethod
-    def _from_config_file(cls, config_path: Path, model_dir: Path, 
-                          weights_path: Path) -> 'ModelInfo':
-        """Load ModelInfo from a saved config JSON file."""
-        run_config = RunConfig.load(config_path)
-        
-        return cls(
-            model_dir=model_dir,
-            model_type=run_config.model_type,
-            hidden_dim=run_config.hidden_dim,
-            n_ctx=run_config.data.N_ctx,
-            gm_name=run_config.data.gm_name,
-            weights_path=weights_path,
-            learning_objective=run_config.learning_objective,
-            kappa=run_config.kappa,
-            bottleneck_dim=run_config.bottleneck_dim or 16,
-            run_config=run_config,
-            data_config_dict=run_config.data.to_gm_dict(run_config.training.batch_size_test),
-        )
-    
-    @classmethod
-    def _from_directory_structure(cls, model_dir: Path, weights_path: Path) -> 'ModelInfo':
-        """
-        Infer model configuration from directory structure (legacy support).
-        
-        Expected structures:
-        - N_ctx_1/rnn_h16/
-        - N_ctx_1/vrnn_h32/
-        - N_ctx_2/NonHierarchicalGM/module_network_obs_ctx_kappa0.5_bn16/
-        """
-        # Parse directory structure
-        parts = model_dir.parts
-        dir_name = model_dir.name
-        
-        # Find N_ctx from path
-        n_ctx = 1
-        gm_name = 'NonHierarchicalGM'
-        for part in parts:
-            if part.startswith('N_ctx_'):
-                n_ctx = int(part.split('_')[-1])
-            if part in ['NonHierarchicalGM', 'HierarchicalGM']:
-                gm_name = part
-        
-        # Parse model type and hyperparameters from directory name
-        if dir_name.startswith('rnn_h'):
-            model_type = 'rnn'
-            hidden_dim = int(dir_name.split('_h')[1])
-            return cls(
-                model_dir=model_dir,
-                model_type=model_type,
-                hidden_dim=hidden_dim,
-                n_ctx=n_ctx,
-                gm_name=gm_name,
-                weights_path=weights_path,
-            )
-        
-        elif dir_name.startswith('vrnn_h'):
-            model_type = 'vrnn'
-            hidden_dim = int(dir_name.split('_h')[1])
-            return cls(
-                model_dir=model_dir,
-                model_type=model_type,
-                hidden_dim=hidden_dim,
-                n_ctx=n_ctx,
-                gm_name=gm_name,
-                weights_path=weights_path,
-            )
-        
-        elif dir_name.startswith('module_network'):
-            model_type = 'module_network'
-            hidden_dim = 64  # Fixed for ModuleNetwork
-            
-            # Parse learning objective
-            if 'obs_ctx' in dir_name:
-                learning_objective = 'obs_ctx'
-            elif 'ctx' in dir_name and 'obs' not in dir_name:
-                learning_objective = 'ctx'
-            else:
-                learning_objective = 'obs'
-            
-            # Parse kappa
-            kappa = 0.5
-            if 'kappa' in dir_name:
-                kappa_str = dir_name.split('kappa')[1].split('_')[0]
-                kappa = float(kappa_str)
-            
-            # Parse bottleneck dimension
-            # Default is 24 to match get_module_network_config() in config.py
-            bottleneck_dim = 24
-            if '_bn' in dir_name:
-                bn_str = dir_name.split('_bn')[1]
-                bottleneck_dim = int(bn_str)
-            
-            return cls(
-                model_dir=model_dir,
-                model_type=model_type,
-                hidden_dim=hidden_dim,
-                n_ctx=n_ctx,
-                gm_name=gm_name,
-                weights_path=weights_path,
-                learning_objective=learning_objective,
-                kappa=kappa,
-                bottleneck_dim=bottleneck_dim,
-            )
-        
-        else:
-            raise ValueError(f"Cannot parse model type from directory: {dir_name}")
-
-
-# =============================================================================
-# Model Loading
-# =============================================================================
-
-def infer_bottleneck_dim_from_weights(weights_path: Path) -> int:
-    """
-    Infer the bottleneck dimension from saved ModuleNetwork weights.
-    
-    The bottleneck dimension can be determined from the readout layer shapes.
-    For ModuleNetwork, readout_obs2ctx is:
-        nn.Linear(in_dim=2, bottleneck_dim)  -> weight shape (bottleneck_dim, 2)
-        nn.ReLU()
-        nn.Linear(bottleneck_dim, out_dim)   -> weight shape (out_dim, bottleneck_dim)
-    
-    So readout_obs2ctx.0.weight has shape (bottleneck_dim, 2).
-    """
-    state_dict = torch.load(weights_path, map_location='cpu')
-    
-    # readout_obs2ctx.0.weight shape is (bottleneck_dim, in_dim)
-    if 'readout_obs2ctx.0.weight' in state_dict:
-        bottleneck_dim = state_dict['readout_obs2ctx.0.weight'].shape[0]
-        return bottleneck_dim
-    
-    # Default fallback
-    return 16
-
-
-def load_model(info: ModelInfo, device: str = 'cpu') -> nn.Module:
-    """Load a trained model from its weights file."""
-    if info.model_type == 'rnn':
-        config = {
-            'input_dim': 1,
-            'output_dim': 2,
-            'hidden_dim': info.hidden_dim,
-            'n_layers': 1,
-            'device': device,
-        }
-        model = SimpleRNN(config)
-    
-    elif info.model_type == 'vrnn':
-        config = {
-            'input_dim': 1,
-            'output_dim': 2,
-            'latent_dim': info.hidden_dim,
-            'phi_x_dim': info.hidden_dim,
-            'phi_z_dim': info.hidden_dim,
-            'phi_prior_dim': info.hidden_dim,
-            'rnn_hidden_states_dim': info.hidden_dim,
-            'rnn_n_layers': 1,
-            'device': device,
-        }
-        model = VRNN(config)
-    
-    elif info.model_type == 'module_network':
-        # Use config from file if available, otherwise fall back to inference
-        if info.run_config is not None:
-            # Build config using the standard function from pipeline_core_v2
-            config = _create_module_network_config(info.run_config)
-            config['device'] = device
-        else:
-            # Fall back to inferring from directory structure
-            # This path is for legacy models without config files
-            bottleneck_dim = info.bottleneck_dim
-            
-            # Safety: infer from weights if there's a mismatch
-            inferred_dim = infer_bottleneck_dim_from_weights(info.weights_path)
-            if inferred_dim != bottleneck_dim:
-                print(f"  Warning: bottleneck_dim mismatch for {info.model_dir.name}: "
-                        f"expected {bottleneck_dim}, weights have {inferred_dim}. Using inferred value.")
-                bottleneck_dim = inferred_dim
-            
-            config = {
-                'kappa': info.kappa,
-                'observation_module': {
-                    'input_dim': 1,
-                    'output_dim': 2,
-                    'rnn_hidden_dim': 64,
-                    'rnn_n_layers': 1,
-                    'bottleneck_dim': bottleneck_dim,
-                },
-                'context_module': {
-                    'input_dim': 2,
-                    'output_dim': info.n_ctx,
-                    'rnn_hidden_dim': 32,
-                    'rnn_n_layers': 1,
-                    'bottleneck_dim': bottleneck_dim,
-                },
-                'device': device,
-            }
-        model = ObsCtxModuleNetwork(config)
-    
-    
-    elif info.model_type == 'population_network':
-        # Build config 
-        config = _create_population_network_config(info.run_config)
-        config['device'] = device
-        # Create model
-        model = PopulationNetwork(config)
-
-
-    else:
-        raise ValueError(f"Unknown model type: {info.model_type}")
-    
-    # Load weights
-    model.load_state_dict(torch.load(info.weights_path, map_location=device))
-    model.to(device)
-    model.eval()
-    
-    return model
-
-
-# =============================================================================
-# Test Data Generation
-# =============================================================================
-
-def generate_test_data(data_config: Union[TrainDataConfig, dict], n_samples: int, 
-                       device: str = 'cpu') -> Dict[str, Any]:
-    """
-    Generate a shared test dataset using training data config.
-    
-    Harmonized with training data generation (prepare_batch_data) to ensure consistent
-    tensor types, shapes, and field naming for both forward passes and evaluation.
-    
-    Parameters
-    ----------
-    data_config : TrainDataConfig or dict
-        Either a DataConfig object from config_v2, or a dict (from to_gm_dict()).
-        Using TrainDataConfig is recommended as it handles all GM types (including HierarchicalGM).
-    n_samples : int
-        Number of samples to generate for the test set.
-    device : str
-        Device to place tensors on ('cpu' or 'cuda').
-    
-    Returns
-    -------
-    dict
-        Dictionary containing (aligned with prepare_batch_data):
-        
-        Core fields (always present):
-        - 'y': Observations tensor (n_samples, seq_len, 1) [float32]
-        - 'y_np': Observations as numpy array (n_samples, seq_len)
-        - 'pars': Generation parameters dict
-        
-        Context fields (n_ctx > 1):
-        - 'contexts': Context labels tensor (n_samples, seq_len) [long]
-        - 'contexts_np': Context labels as numpy array
-        
-        HierarchicalGM-specific fields (HierarchicalGM only):
-        - 'rules': Active rules unsqueezed (n_samples, seq_len, 1) [long] ← used in forward pass
-        - 'rules_np': Same as numpy array
-        - 'dpos': Deviant positions unsqueezed (n_samples, seq_len, 1) [long] ← used in loss computation  
-        - 'dpos_np': Same as numpy array
-        - 'q': Cues converted to one-hot encoding (n_samples, seq_len, n_cues) [float32] ← used in forward pass
-        - 'q_np': Original cue indices as numpy array
-        - 'timbres': Object identities (n_samples, seq_len)
-        - 'timbres_np': Same as numpy array
-        - 'pi_rules': Rule transition probabilities
-        - (and other hierarchical fields as generated by HierarchicalAuditGM)
-    
-    Notes
-    -----
-    CRITICAL ALIGNMENT WITH TRAINING:
-    This function ensures test data matches training data structure exactly:
-    1. Fields used in forward pass (y, q) are float32 to work with GRU layers
-    2. Integer fields (rules, dpos) are unsqueezed to (batch, seq_len, 1) shape
-    3. Cues are one-hot encoded into 'q' field (not raw integers)
-    4. Both tensor and numpy versions provided for all fields
-    
-    For HierarchicalGM, all required parameters (rules_dpos_set, mu_rho_rules, 
-    si_rho_rules, p_cues, cues_set) must be present in the data config.
-    """
-    # Convert DataConfig to gm_dict, overriding sample count
-    if isinstance(data_config, TrainDataConfig):
-        gm_dict = data_config.to_gm_dict(n_samples)
-    elif isinstance(data_config, dict):
-        # Assume it's already a gm_dict; update sample count
-        gm_dict = data_config.copy()
-        gm_dict['N_samples'] = n_samples
-    else:
-        raise TypeError(f"data_config must be TrainDataConfig or dict, got {type(data_config)}")
-    
-    gm_name = gm_dict['gm_name']
-    
-    # Instantiate the appropriate generative model
-    if gm_name == 'NonHierarchicalGM':
-        gm = NonHierarchicalAuditGM(gm_dict)
-    elif gm_name == 'HierarchicalGM':
-        gm = HierarchicalAuditGM(gm_dict)
-    else:
-        raise ValueError(f"Unknown GM: {gm_name}")
-    
-    # Generate batch
-    batch = gm.generate_batch(return_pars=True)
-    
-    # Extract observations and convert to tensor
-    y = batch['obs']
-    y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(-1).to(device)
-    
-    # Initialize result with observations and parameters
-    result = {
-        'y': y_tensor,
-        'y_np': y,
-        'pars': batch['pars'],
-    }
-    
-    # Handle contexts (present in both NonHierarchicalGM and HierarchicalGM)
-    contexts = batch['contexts'] if 'contexts' in batch.keys() else None
-    n_ctx = gm_dict['N_ctx']
-    if n_ctx > 1 and contexts is not None:
-        contexts_tensor = torch.tensor(contexts, dtype=torch.long).to(device)
-        result['contexts'] = contexts_tensor
-        result['contexts_np'] = contexts
-    else:
-        result['contexts'] = None
-        result['contexts_np'] = None
-    
-    # ========== HierarchicalGM-specific field processing ==========
-    # Align with prepare_batch_data() to ensure consistent tensor types and shapes
-    # for both training and testing
-    if gm_name == 'HierarchicalGM':
-        # 1) Process rules_long: convert to long, unsqueeze, and store as 'rules'
-        #    (matches training where only rules_long is used and unsqueezed)
-        if 'rules_long' in batch:
-            rules_data = batch['rules_long']
-            result['rules'] = torch.tensor(rules_data, dtype=torch.long, requires_grad=False).unsqueeze(2).to(device)
-            result['rules_np'] = rules_data
-        
-        # 2) Process dpos_long: convert to long, unsqueeze, and store as 'dpos'
-        #    (matches training where only dpos_long is used and unsqueezed)
-        if 'dpos_long' in batch:
-            dpos_data = batch['dpos_long']
-            result['dpos'] = torch.tensor(dpos_data, dtype=torch.long, requires_grad=False).unsqueeze(2).to(device)
-            result['dpos_np'] = dpos_data
-        
-        # 3) Process cues_long: convert to one-hot encoding (float32) and store as 'q'
-        #    (matches training where cues_long is converted to one-hot and stored as 'q')
-        if 'cues_long' in batch:
-            cues_data = batch['cues_long']
-            q_onehot = torch.nn.functional.one_hot(
-                torch.tensor(cues_data, dtype=torch.long, requires_grad=False),
-                num_classes=gm.N_cues
-            ).float().to(device)
-            result['q'] = q_onehot  # Shape: (n_samples, seq_len, n_cues)
-            result['q_np'] = cues_data
-        
-        # 4) Store other hierarchical fields for analysis (numpy + tensor versions)
-        #    These are not used in forward pass but may be needed for evaluation
-        other_fields = ['timbres', 'timbres_long', 'pi_rules']
-        for field in other_fields:
-            if field in batch:
-                field_data = batch[field]
-                # Keep as appropriate dtype
-                if field_data.dtype in [np.int32, np.int64]:
-                    result[field] = torch.tensor(field_data, dtype=torch.long).to(device)
-                else:
-                    result[field] = torch.tensor(field_data, dtype=torch.float32).to(device)
-                result[f'{field}_np'] = field_data
-    
-    return result
-
-
-# =============================================================================
-# Metrics Computation
-# =============================================================================
-
 def compute_mse(y_true: np.ndarray, y_pred: np.ndarray, reduce: bool = True) -> Union[np.ndarray, float]:
     """
     Compute Mean Squared Error.
@@ -929,7 +169,6 @@ def measure_KS_stat(x, u, s):
 	KS   = abs(np.array([(cump <= f).sum(1) / N for f in F]) - F[:, None, None]).max((0, 2))
 	
 	return KS
-
 
 
 def compute_context_accuracy(contexts_true: np.ndarray, contexts_pred: np.ndarray,
@@ -1110,34 +349,6 @@ def compute_rule_log_prob(rules_true: np.ndarray, rule_probs: np.ndarray,
         return np.mean(log_probs, axis=1)
 
 
-# =============================================================================
-# Hierarchical Kalman-filter benchmark: the marginal predictive likelihood
-# p(y_t | H) over all four levels, at every timestep (not only deviant positions).
-#
-# Kalman-filter analogue of the RNN's marginal predictive distribution. It
-# combines two ingredients:
-#   * the conditional per-context predictive distributions from the multi-context
-#       KF,  N(y_t; mu_std_t, var_std_t)  and  N(y_t; mu_dev_t, var_dev_t),
-#     estimated under the assumption that the context labels are known (the KF is
-#     fit on the known standard/deviant labels, as the existing pipeline already
-#     does). The deviant-context prediction is defined at every timestep (held
-#     constant between deviants), non-NaN once >= MIN_OBS_FOR_EM deviants have been
-#     observed; with
-#   * the marginal context probabilities P(std|H), P(dev|H), obtained by
-#     marginalizing the deviant-position and rule levels. This REUSES the
-#     deviant-position conditional (prior_dpos_given_prev_rule) and its
-#     marginalization over rules (pior_dpos_given_prev_rule_and_stds) from
-#     PreProParadigm.model_RTs (generalized with `valid_positions`).
-#
-#   p(y_t | H) = P(std|H) N(y_t; mu_std, var_std) + P(dev|H) N(y_t; mu_dev, var_dev)
-#
-# Evaluating this marginal predictive density at the realized observation y_t
-# yields the marginal likelihood of that observation.
-#
-# Variance vs std: likelihood_observation(y, mu, sigma) and the multi-context KF
-# both use VARIANCES, so the per-context variances are passed straight through.
-# =============================================================================
-
 def compute_dev_probabilities(dpos_long, rules_long, n_tones, rules_dpos_set,
                               pi_rules=None, mu_rho_rules=None,
                               post_dev_standards=True):
@@ -1211,6 +422,10 @@ def compute_dev_probabilities(dpos_long, rules_long, n_tones, rules_dpos_set,
                     j, pi_rules, prev_rule, valid_positions)
     return p_dev[0] if single else p_dev
 
+
+# =============================================================================
+# Hierarchical Kalman-filter benchmark: the marginal predictive likelihood
+# =============================================================================
 
 def marginal_obs_likelihood(y, p_dev, mu_std, var_std, mu_dev, var_dev):
     """Marginal likelihood of each observation under the two-context predictive
@@ -1357,7 +572,7 @@ def reduce_benchmark_loglik(lik_obs, start=1, min_obs_for_em=None, reduce=True):
 
 
 # =============================================================================
-# Model Evaluation
+# Evaluation drivers
 # =============================================================================
 
 def evaluate_model(
@@ -1520,8 +735,186 @@ def evaluate_model(
     return results
 
 
+def evaluate_models(
+    model_dirs: List[Path] = None,
+    n_samples: int = 1000,
+    n_tones: int = 1000,
+    output_path: Optional[Path] = None,
+    verbose: bool = True,
+    reduce: bool = True,
+) -> Union[pd.DataFrame, Dict[str, Dict[str, Any]]]:
+    """
+    Evaluate multiple models on a shared test dataset.
+    
+    Args:
+        model_dirs: List of paths to model directories
+        n_samples: Number of test samples to generate
+        n_tones: Sequence length
+        output_path: Optional path to save results CSV (only used if reduce=True)
+        verbose: Print progress information
+        reduce: If True, return DataFrame with scalar metrics (default behavior).
+                If False, return dict of model_name -> dict of metric distributions.
+    
+    Returns:
+        If reduce=True: DataFrame with evaluation results for all models (scalars)
+        If reduce=False: Dict mapping model names to dicts of metric arrays (n_samples,)
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Validate input
+    if model_dirs is None or len(model_dirs) == 0:
+        raise ValueError("Must provide model_dirs")
+    
+    if verbose:
+        print("\n" + "=" * 70)
+        print("MODEL EVALUATION")
+        print("=" * 70)
+        print(f"Device: {device}")
+        print(f"Number of models: {len(model_dirs)}")
+        print(f"Test samples: {n_samples}")
+        print(f"Sequence length: {n_tones}")
+        print("=" * 70)
+    
+    # Parse model information
+    model_infos = []
+    for model_dir in model_dirs:
+        info = ModelInfo.from_path(Path(model_dir))
+        model_infos.append(info)
+        if verbose:
+            print(f"  Found: {info.model_type} (h={info.hidden_dim}, n_ctx={info.n_ctx})")
+    
+    if not model_infos:
+        raise ValueError("No valid models found!")
+    
+    # Check all models have same N_ctx and GM (for shared test data)
+    n_ctx_values = set(info.n_ctx for info in model_infos)
+    gm_values = set(info.gm_name for info in model_infos)
+    
+    if len(n_ctx_values) > 1:
+        raise ValueError(f"Models have different N_ctx values: {n_ctx_values}. "
+                         "Cannot generate shared test data.")
+    if len(gm_values) > 1:
+        raise ValueError(f"Models have different GM types: {gm_values}. "
+                         "Cannot generate shared test data.")
+    
+    n_ctx = model_infos[0].n_ctx
+    gm_name = model_infos[0].gm_name
+    
+    # Generate shared test data
+    # Try to use saved config from first model with a config file for accurate params
+    if verbose:
+        print(f"\nGenerating test data (n_ctx={n_ctx}, gm={gm_name})...")
+    
+    # Check if any model has a saved data config
+    saved_data_config = None
+    for info in model_infos:
+        if info.data_config_dict is not None:
+            saved_data_config = info.data_config_dict
+            if verbose:
+                print(f"  Using saved data config from: {info.model_dir}")
+                print(f"    - N_tones: {saved_data_config.get('N_tones', 'N/A')}")
+                print(f"    - mu_tau_bounds: {saved_data_config.get('mu_tau_bounds', 'N/A')}")
+                print(f"    - si_stat_bounds: {saved_data_config.get('si_stat_bounds', 'N/A')}")
+                print(f"    - params_testing: {saved_data_config.get('params_testing', 'N/A')}")
+            break
+    
+    if saved_data_config is not None:
+        # Use saved config (ensures same params_testing bounds, etc.)
+        test_data = generate_test_data(saved_data_config, n_samples=n_samples, device=device)
+    else:
+        # Fall back to defaults: create a minimal gm_dict
+        if verbose:
+            print(f"  No saved config found, using defaults")
+        # Build a minimal config dict for fallback
+        fallback_config = {
+            'gm_name': gm_name,
+            'N_ctx': n_ctx,
+            'N_samples': n_samples,
+            'N_blocks': 1,
+            'N_tones': n_tones,
+            'mu_rho_ctx': 0.9,
+            'si_rho_ctx': 0.05,
+            'si_lim': 5.0,
+            'si_tau': 0.5,
+            'params_testing': True,
+            'mu_tau_bounds': {'low': 1, 'high': 250},
+            'si_stat_bounds': {'low': 0.1, 'high': 2},
+            'si_r_bounds': {'low': 0.1, 'high': 2},
+        }
+        if n_ctx > 1:
+            fallback_config.update({
+                'si_d_coef': 0.05,
+                'd_bounds': {'high': 4, 'low': 0.1},
+                'mu_d': 2.0,
+            })
+        test_data = generate_test_data(fallback_config, n_samples=n_samples, device=device)
+    
+    if verbose:
+        print(f"  Generated {n_samples} sequences of length {n_tones}")
+    
+    # Evaluate each model
+    results = []
+    results_unreduced = {}  # For reduce=False mode
+    
+    for info in tqdm(model_infos, desc="Evaluating models", disable=not verbose):
+        model = load_model(info, device=device)
+        metrics = evaluate_model(model, info, test_data, device=device, reduce=reduce)
+        
+        if reduce:
+            results.append(metrics)
+        else:
+            # Use model directory name as key
+            model_name = info.model_dir.name
+            results_unreduced[model_name] = metrics
+        
+        # Cleanup
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    # Return based on reduce mode
+    if not reduce:
+        if verbose:
+            print("\n" + "=" * 70)
+            print("EVALUATION COMPLETE (unreduced mode)")
+            print("=" * 70)
+            print(f"Returned dict with {len(results_unreduced)} models")
+            print(f"Each model has metric arrays of shape ({n_samples},)")
+            print("=" * 70)
+        return results_unreduced
+    
+    # Create results DataFrame (reduce=True mode)
+    df = pd.DataFrame(results)
+    
+    # Print summary
+    if verbose:
+        print("\n" + "=" * 70)
+        print("EVALUATION RESULTS")
+        print("=" * 70)
+        
+        # Display key metrics
+        display_cols = ['model_type', 'hidden_dim', 'mse', 'obs_loglik', 'ks_statistic']
+        if 'context_accuracy' in df.columns:
+            display_cols.extend(['context_accuracy', 'context_loglik'])
+        
+        available_cols = [c for c in display_cols if c in df.columns]
+        print(df[available_cols].to_string(index=False))
+        print("=" * 70)
+    
+    # Save results
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_path, index=False)
+        if verbose:
+            print(f"\nResults saved to: {output_path}")
+    
+    return df
+
+
 # =============================================================================
-# Benchmark Comparison
+# Benchmark comparison
 # =============================================================================
 
 @dataclass
@@ -1905,229 +1298,226 @@ def assess_models_against_benchmarks(
 
 
 # =============================================================================
-# Main Evaluation Pipeline
+# Evaluation orchestration over a list of models
 # =============================================================================
+#
+# Resolving model folders, building one test set per model (or one shared set),
+# and collecting the per-model metric dictionaries the figures are drawn from.
+# Previously the top half of model_analysis.py.
 
-def evaluate_models(
-    model_dirs: List[Path] = None,
-    n_samples: int = 1000,
-    n_tones: int = 1000,
-    output_path: Optional[Path] = None,
-    verbose: bool = True,
-    reduce: bool = True,
-) -> Union[pd.DataFrame, Dict[str, Dict[str, Any]]]:
+def resolve_model_dir(model_dir, models_dir=None):
+    """Resolve one entry of a model selection.
+
+    Accepts an absolute path, a path relative to the working directory, or the
+    bare name of a folder inside `models_dir`.
     """
-    Evaluate multiple models on a shared test dataset.
-    
-    Args:
-        model_dirs: List of paths to model directories
-        n_samples: Number of test samples to generate
-        n_tones: Sequence length
-        output_path: Optional path to save results CSV (only used if reduce=True)
-        verbose: Print progress information
-        reduce: If True, return DataFrame with scalar metrics (default behavior).
-                If False, return dict of model_name -> dict of metric distributions.
-    
-    Returns:
-        If reduce=True: DataFrame with evaluation results for all models (scalars)
-        If reduce=False: Dict mapping model names to dicts of metric arrays (n_samples,)
+    model_dir = Path(model_dir)
+    if model_dir.is_absolute() or model_dir.exists() or models_dir is None:
+        return model_dir
+    return Path(models_dir) / model_dir
+
+
+def load_models_info(models_dir=None, model_dirs=None, verbose=True, strict=False):
+    """Load a ModelInfo for each model to compare.
+
+    Pass `models_dir` to take every model sub-folder it contains, and/or
+    `model_dirs` to select specific models — either full paths or bare folder
+    names looked up inside `models_dir`. A model folder is any directory holding
+    a .pth weights file; anything else in `models_dir` is skipped silently (an
+    explicitly selected folder is reported instead).
+
+    Folders whose config cannot be read (no config.json and an unrecognised
+    directory name, or a config.json written by another version of config_v2)
+    are reported and skipped — pass strict=True to get the traceback instead.
     """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Validate input
-    if model_dirs is None or len(model_dirs) == 0:
-        raise ValueError("Must provide model_dirs")
-    
-    if verbose:
-        print("\n" + "=" * 70)
-        print("MODEL EVALUATION")
-        print("=" * 70)
-        print(f"Device: {device}")
-        print(f"Number of models: {len(model_dirs)}")
-        print(f"Test samples: {n_samples}")
-        print(f"Sequence length: {n_tones}")
-        print("=" * 70)
-    
-    # Parse model information
-    model_infos = []
-    for model_dir in model_dirs:
-        info = ModelInfo.from_path(Path(model_dir))
-        model_infos.append(info)
-        if verbose:
-            print(f"  Found: {info.model_type} (h={info.hidden_dim}, n_ctx={info.n_ctx})")
-    
-    if not model_infos:
-        raise ValueError("No valid models found!")
-    
-    # Check all models have same N_ctx and GM (for shared test data)
-    n_ctx_values = set(info.n_ctx for info in model_infos)
-    gm_values = set(info.gm_name for info in model_infos)
-    
-    if len(n_ctx_values) > 1:
-        raise ValueError(f"Models have different N_ctx values: {n_ctx_values}. "
-                         "Cannot generate shared test data.")
-    if len(gm_values) > 1:
-        raise ValueError(f"Models have different GM types: {gm_values}. "
-                         "Cannot generate shared test data.")
-    
-    n_ctx = model_infos[0].n_ctx
-    gm_name = model_infos[0].gm_name
-    
-    # Generate shared test data
-    # Try to use saved config from first model with a config file for accurate params
-    if verbose:
-        print(f"\nGenerating test data (n_ctx={n_ctx}, gm={gm_name})...")
-    
-    # Check if any model has a saved data config
-    saved_data_config = None
-    for info in model_infos:
-        if info.data_config_dict is not None:
-            saved_data_config = info.data_config_dict
-            if verbose:
-                print(f"  Using saved data config from: {info.model_dir}")
-                print(f"    - N_tones: {saved_data_config.get('N_tones', 'N/A')}")
-                print(f"    - mu_tau_bounds: {saved_data_config.get('mu_tau_bounds', 'N/A')}")
-                print(f"    - si_stat_bounds: {saved_data_config.get('si_stat_bounds', 'N/A')}")
-                print(f"    - params_testing: {saved_data_config.get('params_testing', 'N/A')}")
-            break
-    
-    if saved_data_config is not None:
-        # Use saved config (ensures same params_testing bounds, etc.)
-        test_data = generate_test_data(saved_data_config, n_samples=n_samples, device=device)
+    if model_dirs is not None:
+        candidates = [resolve_model_dir(d, models_dir) for d in model_dirs]
+    elif models_dir is not None:
+        candidates = [Path(models_dir) / name for name in sorted(os.listdir(models_dir))]
     else:
-        # Fall back to defaults: create a minimal gm_dict
+        raise ValueError("Pass either models_dir (take every model in it) or model_dirs.")
+
+    models_info = []
+    for model_dir in candidates:
+        if not model_dir.is_dir() or not list(model_dir.glob('*.pth')):
+            if model_dirs is not None:  # explicitly asked for: say why it is dropped
+                print(f"  ✗ {model_dir}: skipped (not a model folder with a .pth file)")
+            continue
+        try:
+            models_info.append(ModelInfo.from_path(model_dir))
+        except Exception as err:
+            if strict:
+                raise
+            print(f"  ✗ {model_dir.name}: skipped ({err})")
+            continue
         if verbose:
-            print(f"  No saved config found, using defaults")
-        # Build a minimal config dict for fallback
-        fallback_config = {
-            'gm_name': gm_name,
-            'N_ctx': n_ctx,
-            'N_samples': n_samples,
-            'N_blocks': 1,
-            'N_tones': n_tones,
-            'mu_rho_ctx': 0.9,
-            'si_rho_ctx': 0.05,
-            'si_lim': 5.0,
-            'si_tau': 0.5,
-            'params_testing': True,
-            'mu_tau_bounds': {'low': 1, 'high': 250},
-            'si_stat_bounds': {'low': 0.1, 'high': 2},
-            'si_r_bounds': {'low': 0.1, 'high': 2},
+            print(f"  ✓ {model_dir.name}")
+
+    if not models_info:
+        raise FileNotFoundError(
+            f"No readable model folder in {model_dirs if model_dirs is not None else models_dir}")
+    return models_info
+
+
+def pinned_si_r(data_config_dict):
+    """The observation noise a config pins, or None when sigma_r is sampled.
+
+    DataConfig.to_gm_dict() encodes si_r_fixed as degenerate si_r_bounds
+    (low == high), which is what the GM then draws sigma_r from, so a pinned
+    sigma_r shows up here and under no other key.
+    """
+    bounds = (data_config_dict or {}).get('si_r_bounds') or {}
+    low, high = bounds.get('low'), bounds.get('high')
+    return low if low is not None and low == high else None
+
+
+def check_shared_data_config(models_info, shared=False):
+    """Report the models that were not all trained on the same data config.
+
+    With `shared`, one test set (the first model's) is used for every model, so
+    a mismatch matters twice over: a structural difference (a different number
+    of cues, say) makes the other models fail in their forward pass with an
+    opaque shape error, and a difference in the generative parameters — a fixed
+    sigma_r above all, see pinned_si_r — silently scores them off their training
+    regime. Without it every model gets its own test set, and the differences
+    are only listed for the record.
+    """
+    reference = models_info[0].data_config_dict or {}
+    ref_si_r = pinned_si_r(reference)
+    for info in models_info[1:]:
+        other = info.data_config_dict or {}
+        differing = [k for k in set(reference) | set(other)
+                     if k != 'N_samples' and repr(reference.get(k)) != repr(other.get(k))]
+        if not differing:
+            continue
+
+        mark = '!' if shared else '-'
+        print(f"  {mark} {info.model_dir.name}: data config differs from "
+              f"{models_info[0].model_dir.name} on {sorted(differing)}")
+
+        si_r = pinned_si_r(other)
+        if 'si_r_bounds' in differing and si_r is not None and ref_si_r is not None:
+            if shared:
+                print(f"      trained with sigma_r fixed at {si_r:g}, evaluated at "
+                      f"{ref_si_r:g} (test set follows the first model)")
+            else:
+                print(f"      sigma_r fixed at {si_r:g} (vs {ref_si_r:g}); "
+                      f"evaluated on its own test set")
+
+
+def generate_test_set(data_config_dict, n_samples, device='cpu', seed=None):
+    """One freshly generated test set.
+
+    With `seed` the generation becomes reproducible: the RNG is reset and the GM
+    is forced to run sequentially, because the worker pool it uses otherwise
+    (max_cores > 1) forks streams of its own. Two configs that then differ only
+    in sigma_r give the same latents — rules, contexts, cues, tau — and differ
+    only in the observation noise, which is what makes per-model test sets
+    comparable to each other.
+    """
+    if seed is not None:
+        data_config_dict = {**data_config_dict, 'max_cores': 1}
+        np.random.seed(seed)
+    return generate_test_data(data_config_dict, n_samples=n_samples, device=device)
+
+
+def build_test_sets(models_info, n_samples, shared=False, benchmark_data=None,
+                    device='cpu', seed=None):
+    """Test set of every model, as {model folder name: test_data}.
+
+    By default each model gets a set generated from its own training data
+    config, so a model trained at a fixed sigma_r is scored at that sigma_r;
+    models whose config is identical share one generated set, which makes this
+    mode collapse to the shared one when the configs agree.
+
+    `shared` instead generates a single set from the first model's config and
+    hands it to all of them — worth it only when the models really were trained
+    on the same data and the point is to compare them on the very sequences.
+
+    `benchmark_data` overrides both: the sequences the KF was run on are reused
+    for every model, so model and KF metrics are computed on the same data.
+    """
+    names = [info.model_dir.name for info in models_info]
+
+    if benchmark_data is not None:
+        test_data = {
+            'y': torch.tensor(benchmark_data.y, dtype=torch.float32).unsqueeze(-1).to(device),
+            'y_np': benchmark_data.y,
+            'contexts_np': benchmark_data.contexts,
+            'pars': benchmark_data.pars,
         }
-        if n_ctx > 1:
-            fallback_config.update({
-                'si_d_coef': 0.05,
-                'd_bounds': {'high': 4, 'low': 0.1},
-                'mu_d': 2.0,
-            })
-        test_data = generate_test_data(fallback_config, n_samples=n_samples, device=device)
-    
-    if verbose:
-        print(f"  Generated {n_samples} sequences of length {n_tones}")
-    
-    # Evaluate each model
-    results = []
-    results_unreduced = {}  # For reduce=False mode
-    
-    for info in tqdm(model_infos, desc="Evaluating models", disable=not verbose):
+        return {name: test_data for name in names}
+
+    if shared:
+        test_data = generate_test_set(models_info[0].data_config_dict, n_samples,
+                                      device=device, seed=seed)
+        return {name: test_data for name in names}
+
+    test_sets, by_config = {}, {}
+    for info in tqdm(models_info, desc="Generating test data"):
+        key = repr(info.data_config_dict)
+        if key not in by_config:
+            by_config[key] = generate_test_set(info.data_config_dict, n_samples,
+                                               device=device, seed=seed)
+        test_sets[info.model_dir.name] = by_config[key]
+    return test_sets
+
+
+def evaluate_all_models(models_info, test_sets, min_obs_for_em=None, device='cpu'):
+    """Evaluate every model, keeping metrics as per-sample distributions.
+
+    `test_sets` maps a model folder name to the test data that model is
+    evaluated on (see build_test_sets); a shared test set is simply the same
+    object under every key.
+
+    Returns {model folder name: metrics dict}. `min_obs_for_em` restricts the
+    evaluation to the KF window (y[min_obs_for_em:]) so per-sample model metrics
+    stay comparable with the KF ones.
+    """
+    results = {}
+    for info in tqdm(models_info, desc="Evaluating models"):
         model = load_model(info, device=device)
-        metrics = evaluate_model(model, info, test_data, device=device, reduce=reduce)
-        
-        if reduce:
-            results.append(metrics)
-        else:
-            # Use model directory name as key
-            model_name = info.model_dir.name
-            results_unreduced[model_name] = metrics
-        
-        # Cleanup
+        results[info.model_dir.name] = evaluate_model(
+            model, info, test_sets[info.model_dir.name], device=device, reduce=False,
+            min_obs_for_em=min_obs_for_em,
+        )
         del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    
-    # Return based on reduce mode
-    if not reduce:
-        if verbose:
-            print("\n" + "=" * 70)
-            print("EVALUATION COMPLETE (unreduced mode)")
-            print("=" * 70)
-            print(f"Returned dict with {len(results_unreduced)} models")
-            print(f"Each model has metric arrays of shape ({n_samples},)")
-            print("=" * 70)
-        return results_unreduced
-    
-    # Create results DataFrame (reduce=True mode)
-    df = pd.DataFrame(results)
-    
-    # Print summary
-    if verbose:
-        print("\n" + "=" * 70)
-        print("EVALUATION RESULTS")
-        print("=" * 70)
-        
-        # Display key metrics
-        display_cols = ['model_type', 'hidden_dim', 'mse', 'obs_loglik', 'ks_statistic']
-        if 'context_accuracy' in df.columns:
-            display_cols.extend(['context_accuracy', 'context_loglik'])
-        
-        available_cols = [c for c in display_cols if c in df.columns]
-        print(df[available_cols].to_string(index=False))
-        print("=" * 70)
-    
-    # Save results
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(output_path, index=False)
-        if verbose:
-            print(f"\nResults saved to: {output_path}")
-    
-    return df
+    return results
 
 
-# =============================================================================
-# Script entry point — edit the settings below, then: python evaluate_models.py
-# =============================================================================
+def compute_kf_metrics(benchmark_data):
+    """Per-sample KF metrics, keyed like the model metrics (see KF_METRICS)."""
+    var_kf = benchmark_data.std_kf ** 2
+    y_target = benchmark_data.y[:, benchmark_data.min_obs_for_em:]
+    return {
+        'mse': compute_mse(y_target, benchmark_data.mu_kf, reduce=False),
+        'obs_loglik': compute_log_likelihood(
+            y_target, benchmark_data.mu_kf, var_kf, reduce=False),
+        'ks_statistic': compute_calibration_ks(
+            y_target, benchmark_data.mu_kf, var_kf, reduce=False),
+    }
+
+
+def model_predictions(info, test_data, device='cpu'):
+    """Forward pass of one model on the test set.
+
+    Returns (y_target, mu_pred, var_pred), all aligned on y[1:] (the model
+    predicts the next observation).
+    """
+    model = load_model(info, device=device)
+    y = test_data['y']
+    with torch.no_grad():
+        if info.model_type == 'population_network':
+            q = test_data.get('q')
+            if q is None:
+                raise ValueError("PopulationNetwork requires the one-hot cues 'q' in test_data "
+                                 "(not available when using benchmark data).")
+            model_output = model(y[:, :-1, :], q[:, :-1, :])
+        else:
+            model_output = model(y[:, :-1, :])
+        preds = get_model_predictions(model, model_output)
+    del model
+    return test_data['y_np'][:, 1:], preds['mu_estim'], preds['var_estim']
 
 if __name__ == '__main__':
-
-    # ------------------------- SETTINGS (edit these) -------------------------
-    # Which models to evaluate. Either point BASE_DIR at a folder that is
-    # searched recursively for .pth files, or list explicit model directories in
-    # MODEL_DIRS. If MODEL_DIRS is not None it takes precedence over BASE_DIR.
-    RNN_DIR = Path(__file__).resolve().parent.parent   # .../RNN_paradigm/RNN
-    # BASE_DIR = RNN_DIR / 'training_results_CORRECT/N_ctx_2/NonHierarchicalGM_selected'
-    BASE_DIR = RNN_DIR / 'training_results/N_ctx_2/HierarchicalGM'
-    # MODEL_DIRS = None
-    MODEL_DIRS = [
-        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched",
-        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs300",
-        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir0.05_epochs300_lr0.002",
-        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir0.005_epochs300_lr0.002",
-        BASE_DIR / "population_network_all_bn8_trainh0_fixedsir0.1_epochs300_lr0.002",
-    ]
-
-    # Test data.
-    N_SAMPLES = 1000   # number of test sequences
-    N_TONES = 1000     # sequence length (only used when no saved config is found)
-
-    # Output.
-    OUTPUT = None      # CSV path, e.g. 'results/evaluation.csv'; None = don't save
-    VERBOSE = True     # print progress and the results table
-    # -------------------------------------------------------------------------
-
-    if MODEL_DIRS is not None:
-        model_dirs = [Path(d) for d in MODEL_DIRS]
-    else:
-        model_dirs = discover_models(Path(BASE_DIR), verbose=VERBOSE)
-        if not model_dirs:
-            raise SystemExit(f"ERROR: No models found in {BASE_DIR}")
-
-    df = evaluate_models(
-        model_dirs=model_dirs,
-        n_samples=N_SAMPLES,
-        n_tones=N_TONES,
-        output_path=Path(OUTPUT) if OUTPUT else None,
-        verbose=VERBOSE,
-    )
+    pass

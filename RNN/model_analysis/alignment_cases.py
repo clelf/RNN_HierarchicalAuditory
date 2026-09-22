@@ -1,11 +1,11 @@
 """Per-trial alignment between the ctx (context) and dpos (deviant-position) modules.
 
-For each trained model and each trial of each experimental sequence, this script
-asks two questions:
+For each trained model and each trial of each experimental sequence, two
+questions are asked:
 
-  1. *dpos module* — when, within the 8-tone trial, does the module commit to the
+  1. *dpos module* -- when, within the 8-tone trial, does the module commit to the
      trial's true deviant position, and does it hold that commitment?
-  2. *ctx module* — the position at which the ctx module first calls a deviant:
+  2. *ctx module* -- the position at which the ctx module first calls a deviant:
      is it endorsed by the dpos module, and when?
 
 Alignment convention
@@ -15,127 +15,63 @@ The model is run on ``y[:, :-1]``, so output row ``k`` is the module's report
 ``(k + 1) // period``. This is the same alignment the dpos response window uses at
 training time (``within_trial_pos = arange(1, T) % N_tones`` in
 ``pipeline_core_v2.compute_loss``), where ``rel == 0`` (the deviant timestep) and
-``rel == 1`` (the step after) are the two up-weighted commitment steps — exactly the
-positions cases 2/3 and 4/5 below are about. Timestep 0 of a sequence therefore has
-no report, so the first trial is dropped by default (``--skip-trials``).
+``rel == 1`` (the step after) are the two up-weighted commitment steps. Timestep 0
+of a sequence therefore has no report, so the first trial is dropped by default.
 
 A dpos output *class* ``c`` encodes deviant position ``c + dpos_min`` in the model's
 convention; ``dpos_conventions()`` converts that back to the raw within-trial
 position used by the sequence files (2..6), so predictions, ctx report positions and
 ground truth are all compared on one 0-indexed within-trial scale.
 
-dpos assessment (one case per trial)
-------------------------------------
-Let ``correct[p]`` be "the dpos argmax at position p equals the trial's true deviant
-position", and ``first`` the earliest such p.
+The two case families are exhaustive and mutually exclusive: every trial has
+exactly one dpos case and exactly one ctx case, so ``case_0``..``case_7`` sum to 1
+across a model's row of the summary table and ``case_A``..``case_N`` do too.
 
-  0  correct from position 0 and never changes (correct at every position)
-  1  correct at position 0 but changes later
-  2  first correct AT the deviant, and maintained to the end of the trial
-  3  first correct AT the deviant, not maintained
-  4  first correct the step AFTER the deviant, and maintained to the end
-  5  first correct the step AFTER the deviant, not maintained
-  6  never correct within the trial                    [not in the original list]
-  7  first correct at some other position              [not in the original list]
+dpos cases 6 and 7 are additions to the six originally requested categories,
+which are not exhaustive (a trial can be wrong throughout, or first become
+correct at, say, position 1 with a deviant at position 4); silently dropping
+those trials would bias every proportion computed from the table. "Maintained"
+is read literally throughout -- correct at *every* position from the first
+correct one to the end of the trial.
 
-Cases 6 and 7 are additions: the six requested categories are not exhaustive (a
-trial can be wrong throughout, or first become correct at, say, position 1 with a
-deviant at position 4), and silently dropping those trials would bias every
-proportion computed from this table. "Maintained" is read literally throughout —
-correct at *every* position from the first correct one to the end — so cases 2/3 and
-4/5 partition their branch the same way C/D and E/F do below.
-
-ctx assessment (one case per trial)
------------------------------------
-Let ``p_ctx`` be the first within-trial position at which the ctx module reports a
-deviant (see ``--ctx-rule``), ``match[p]`` be "the dpos argmax at position p points
-at ``p_ctx``", and ``first`` the earliest such p.
-
-  A  no position in the trial matches p_ctx
-  B  first matched by a prediction realised BEFORE p_ctx
-  C  first matched AT p_ctx, and maintained afterwards
-  D  first matched AT p_ctx, not maintained
-  E  first matched at the IMMEDIATE NEXT position, and maintained afterwards
-  F  first matched at the immediate next position, not maintained
-  G  first matched later than the immediate next position   [not in the list]
-  N  the ctx module never reports a deviant in this trial   [not in the list]
-
-Case N is not a corner case: with the plain argmax rule the ctx module leaves most
-trials without any label-1 timestep (P(deviant) rarely clears 0.5, since deviants are
-1 tone in 8). ``--ctx-rule max-prob`` or ``--ctx-rule threshold`` give a report on
-every trial if that is the question of interest. Ordering is by *first* match, so a
-prediction realised before p_ctx yields B even if p_ctx is also matched and held.
-Note a dpos prediction can only ever match p_ctx in 2..6, so a ctx report at
-position 0, 1 or 7 is case A by construction.
-
-Output
-------
-``<output-root>/<model name>/alignment/<model name>_trial_alignment.csv``
-    one row per trial, with the two case labels, one 0/1 indicator column per case
-    (case_0..case_7, case_A..case_G, case_N), the quantities the cases are derived
-    from, and one string per module giving its per-position call across the trial
-    (``dpos_pred_seq`` e.g. '44222222', ``ctx_report_seq`` e.g. '....D...').
-``<output-root>/<model name>/alignment/<model name>_alignment_summary.csv``
-    counts and proportions per case (suppress with --no-summary).
-
-Both carry the model's observation-noise setting: ``si_r_fixed`` when the run pinned
-sigma_r, otherwise ``si_r_bounds_low``/``si_r_bounds_high`` for the range it was
-sampled from. Exactly one of the two is filled; the other is NaN.
-
-Examples
---------
-    # every model in DEFAULT_MODEL_NAMES, every sequence file
-    python assess_module_alignment.py
-
-    # two models, 200 sequences, ctx report = peak P(deviant) rather than argmax
-    python assess_module_alignment.py --n-sequences 200 --ctx-rule max-prob \
-        --model-names population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs300 \
-                      population_network_all_bn8_trainh0_fixedsir0.05_epochs300_lr0.002
+Split out of assess_dpos_and_ctx_detection.py and its _summary companion, which
+between them held this taxonomy, the per-trial table, and the per-model
+proportions table. The summary half previously failed to import at all: it
+imported a module name that no longer existed after the script was renamed.
 """
 
-import argparse
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 
-import evaluate_models as eval
-from model_activations import (
-    load_trial_sequence,
-    get_module_probabilities,
+from analysis_core import (
+    ModelInfo,
     dpos_conventions,
+    get_module_probabilities,
+    load_model,
+    load_trial_sequence,
 )
 
 
 # =============================================================================
-# Defaults (override on the command line; see --help)
+# The two case taxonomies
 # =============================================================================
-
-DEFAULT_MODEL_DIR = Path(
-    "/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/training_results/N_ctx_2/HierarchicalGM")
-
-# Same list as run_exp_trials_pipeline.DEFAULT_MODEL_NAMES.
-DEFAULT_MODEL_NAMES = [
-    "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched",
-    "population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs300",
-    "population_network_all_bn8_trainh0_fixedsir0.05_epochs300_lr0.002",
-    "population_network_all_bn8_trainh0_fixedsir0.005_epochs300_lr0.002",
-    "population_network_all_bn8_trainh0_fixedsir0.1_epochs300_lr0.002",
-]
-
-DEFAULT_TRIALS_PATH = Path("/home/clevyfidel/Documents/Workspace/Jasmin/trialsequences2clem")
-DEFAULT_OUTPUT_ROOT = Path("/home/clevyfidel/Documents/Workspace/RNN_paradigm/RNN/exp_seq_act_output")
-
-DEFAULT_PERIOD = 8          # timesteps per trial
-DEFAULT_CUE_SEED = 11       # cue re-encoding seed; same value as the other stages
-DEFAULT_CHUNK_SIZE = 128    # sequences per batched forward pass
-DEFAULT_SKIP_TRIALS = 1     # leading trials to drop (trial 0 has no report at position 0)
-DEFAULT_CTX_THRESHOLD = 0.5
 
 # Sentinel written into the position-0 slot that has no model report. Chosen far
 # outside the dpos range so it can never be mistaken for a prediction or a match.
 NO_REPORT = -99
+
+# Leading trials to drop: trial 0 has no report at position 0.
+DEFAULT_SKIP_TRIALS = 1
+
+# Probability above which the ctx module is taken to be calling a deviant, under
+# the 'threshold' rule.
+DEFAULT_CTX_THRESHOLD = 0.5
+
+CTX_RULES = ('argmax', 'max-prob', 'threshold')
 
 DPOS_CASES = {
     0: 'correct from position 0, never changes',
@@ -159,16 +95,43 @@ CTX_CASES = {
     'N': 'ctx module never reports a deviant in the trial',
 }
 
-CTX_RULES = ('argmax', 'max-prob', 'threshold')
-
 # Observation-noise provenance carried into both output CSVs; see si_r_columns().
 SI_R_COLUMNS = ('si_r_fixed', 'si_r_bounds_low', 'si_r_bounds_high')
 
+# Column order: dpos cases first (numeric), then ctx cases (letters), matching the
+# order the per-trial CSV lays them out in.
+DPOS_COLUMNS = [f'case_{code}' for code in DPOS_CASES]
+CTX_COLUMNS = [f'case_{code}' for code in CTX_CASES]
+
+DEFAULT_OUTPUT_NAME = 'alignment_case_proportions.csv'
+
 
 # =============================================================================
-# Sequence loading
+# Run settings
 # =============================================================================
 
+@dataclass
+class AlignmentConfig:
+    """Everything one assessment run needs beyond the model list and the files.
+
+    No defaults: the entry point sets every field explicitly, so a run's settings
+    are readable in one place rather than spread between a parser and a call.
+    `analysis_config` holds the values the project normally uses.
+    """
+    model_dir: Path          # directory holding the trained model folders
+    output_root: Path        # <output_root>/<model>/alignment/ per model
+    period: int              # timesteps per trial
+    cue_seed: int            # cue re-encoding seed; fixed across stages
+    chunk_size: int          # sequences per batched forward pass
+    skip_trials: int         # leading trials dropped per sequence
+    ctx_rule: str            # one of CTX_RULES
+    ctx_threshold: float     # used only by the 'threshold' rule
+    no_summary: bool         # skip the per-case proportions CSV
+
+
+# =============================================================================
+# Sequence loading and the forward pass
+# =============================================================================
 def si_r_columns(info):
     """The model's observation-noise setting, as columns for the output tables.
 
@@ -200,22 +163,6 @@ def si_r_columns(info):
     return {'si_r_fixed': nan,
             'si_r_bounds_low': float(bounds['low']) if bounds.get('low') is not None else nan,
             'si_r_bounds_high': float(bounds['high']) if bounds.get('high') is not None else nan}
-
-
-def find_trial_files(trials_path):
-    """Sequence files in `trials_path`, preferring .csv and falling back to .txt."""
-    files = sorted(trials_path.glob("*.csv"))
-    if not files:
-        files = sorted(trials_path.glob("*.txt"))
-    return files
-
-
-def select_files(all_files, n_sequences, seed=0):
-    """All files, or `n_sequences` of them sampled without replacement."""
-    if n_sequences is None or n_sequences >= len(all_files):
-        return list(all_files)
-    rng = np.random.default_rng(seed=seed)
-    return sorted(rng.choice(all_files, size=n_sequences, replace=False).tolist())
 
 
 def load_sequences(files, n_cue_classes, cue_seed, period):
@@ -256,10 +203,6 @@ def check_ground_truth(seqs):
     if bad_pos:
         print(f"  Warning: {bad_pos} trial(s) where trial_type==1 is not at the dpos position")
 
-
-# =============================================================================
-# Forward pass -> per-trial position grids
-# =============================================================================
 
 def to_trial_grid(arr, period, fill):
     """(N, T-1) model outputs -> (N, n_trials, period), indexed by within-trial position.
@@ -331,7 +274,7 @@ def run_model_on_sequences(model, seqs, period, chunk_size, dpos_min, dpos_shift
 
 
 # =============================================================================
-# Case assignment
+# Classifying one trial
 # =============================================================================
 
 def _suffix_all(mask):
@@ -441,7 +384,7 @@ def classify_ctx(dpos_pred, report):
 
 
 # =============================================================================
-# Assembly and output
+# Per-trial and per-model tables
 # =============================================================================
 
 def _dpos_strings(grid, no_report_char='.'):
@@ -535,8 +478,8 @@ def build_summary_frame(df, model_name):
 def run_one_model(model_name, files, seq_cache, cfg):
     """Assess one model over every sequence file; returns (trial frame, summary frame)."""
     model_path = cfg.model_dir / model_name
-    info = eval.ModelInfo.from_path(model_path)
-    model = eval.load_model(info)
+    info = ModelInfo.from_path(model_path)
+    model = load_model(info)
     model.eval()
 
     n_cue_classes = len(info.data_config_dict['cues_set'])
@@ -585,89 +528,86 @@ def run_one_model(model_name, files, seq_cache, cfg):
 
 
 # =============================================================================
-# Entry point
+# Collapsing per-trial tables into per-model case proportions
 # =============================================================================
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--model-names', nargs='+', default=list(DEFAULT_MODEL_NAMES),
-                   metavar='NAME',
-                   help='trained model directory names, run in order (default: the '
-                        f'{len(DEFAULT_MODEL_NAMES)} models listed in DEFAULT_MODEL_NAMES)')
-    p.add_argument('--model-dir', type=Path, default=DEFAULT_MODEL_DIR,
-                   help='directory containing the trained models (default: %(default)s)')
-    p.add_argument('--trials-path', type=Path, default=DEFAULT_TRIALS_PATH,
-                   help='directory of experimental sequence files (default: %(default)s)')
-    p.add_argument('--output-root', type=Path, default=DEFAULT_OUTPUT_ROOT,
-                   help='base output directory; each model writes to '
-                        '<output-root>/<model-name>/alignment/ (default: %(default)s)')
-    p.add_argument('--combined-csv', type=Path, default=None,
-                   help='also write every model\'s trials to this single CSV')
-    p.add_argument('--n-sequences', type=int, default=None,
-                   help='sequence files to use (default: all of them)')
-    p.add_argument('--seed', type=int, default=0,
-                   help='seed for random file sampling (default: %(default)s)')
-    p.add_argument('--period', type=int, default=DEFAULT_PERIOD,
-                   help='timesteps per trial (default: %(default)s)')
-    p.add_argument('--cue-seed', type=int, default=DEFAULT_CUE_SEED,
-                   help='seed for cue re-encoding; keep it fixed across stages '
-                        '(default: %(default)s)')
-    p.add_argument('--chunk-size', type=int, default=DEFAULT_CHUNK_SIZE,
-                   help='sequences per batched forward pass (default: %(default)s)')
-    p.add_argument('--skip-trials', type=int, default=DEFAULT_SKIP_TRIALS,
-                   help='leading trials to drop per sequence; the default of 1 drops the '
-                        'trial whose position 0 the model never reports on '
-                        '(default: %(default)s)')
-    p.add_argument('--ctx-rule', choices=CTX_RULES, default='argmax',
-                   help="how the ctx module 'reports a deviant': argmax = its output "
-                        'label is 1; threshold = P(deviant) >= --ctx-threshold; '
-                        'max-prob = the trial\'s peak P(deviant) (default: %(default)s)')
-    p.add_argument('--ctx-threshold', type=float, default=DEFAULT_CTX_THRESHOLD,
-                   help='probability threshold for --ctx-rule threshold (default: %(default)s)')
-    p.add_argument('--no-summary', action='store_true',
-                   help='skip the per-case counts/proportions CSV')
-    return p.parse_args(argv)
+def find_trial_tables(output_root, model_names=None):
+    """Per-trial alignment CSVs under `output_root`, optionally restricted and ordered."""
+    if model_names:
+        paths = [output_root / name / 'alignment' / f'{name}_trial_alignment.csv'
+                 for name in model_names]
+        missing = [p for p in paths if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "no per-trial alignment table for: "
+                + ', '.join(p.parent.parent.name for p in missing)
+                + " — run the per-trial stage for those models first")
+        return paths
+    return sorted(output_root.glob('*/alignment/*_trial_alignment.csv'))
 
 
-def main(argv=None):
-    cfg = parse_args(argv)
+def load_cases(paths):
+    """Read the model, the two case columns, and any si_r provenance columns present.
 
-    all_files = find_trial_files(cfg.trials_path)
-    if not all_files:
-        raise FileNotFoundError(f"No .csv or .txt sequence files in {cfg.trials_path}")
-    files = select_files(all_files, cfg.n_sequences, seed=cfg.seed)
-    print(f"Found {len(all_files)} trial sequence files in {cfg.trials_path}; using {len(files)}")
-    print(f"Models ({len(cfg.model_names)}): {', '.join(cfg.model_names)}")
-    print(f"ctx report rule: {cfg.ctx_rule}"
-          + (f" (threshold {cfg.ctx_threshold})" if cfg.ctx_rule == 'threshold' else ''))
+    The si_r columns are optional: tables written before they existed are read
+    unchanged, and the resulting per-model rows simply carry no si_r values.
+    """
+    frames = []
+    for path in paths:
+        # Only a handful of columns are needed, so the 90k-row tables load in a
+        # fraction of the time (and memory) a full read would take.
+        available = pd.read_csv(path, nrows=0).columns
+        columns = (['model', 'dpos_case', 'ctx_case']
+                   + [name for name in SI_R_COLUMNS if name in available])
+        frames.append(pd.read_csv(path, usecols=columns))
+        print(f"  read {path.name}: {len(frames[-1])} trials")
+    return pd.concat(frames, ignore_index=True)
 
-    # A failure on one model (a missing checkpoint, say) should not throw away the
-    # models already done or block the ones still queued; report at the end instead.
-    seq_cache = {}
-    frames, summaries, failures = [], [], []
-    for i, model_name in enumerate(cfg.model_names, start=1):
-        print(f"\n{'=' * 79}\n[{i}/{len(cfg.model_names)}] {model_name}\n{'=' * 79}")
-        try:
-            df, summary = run_one_model(model_name, files, seq_cache, cfg)
-            frames.append(df)
-            summaries.append(summary)
-        except Exception as exc:
-            print(f"  FAILED: {type(exc).__name__}: {exc}")
-            failures.append((model_name, exc))
 
-    if cfg.combined_csv and frames:
-        cfg.combined_csv.parent.mkdir(parents=True, exist_ok=True)
-        pd.concat(frames, ignore_index=True).to_csv(cfg.combined_csv, index=False)
-        print(f"\nSaved combined table: {cfg.combined_csv}")
+def build_case_table(df, model_names=None):
+    """One row per model, one column per case, cells = proportion of that model's trials."""
+    # si_r is a property of the checkpoint, so it is constant within a model group and
+    # one value per group carries it into the wide table. Absent from older inputs.
+    si_r_present = [name for name in SI_R_COLUMNS if name in df.columns]
 
-    n_ok = len(cfg.model_names) - len(failures)
-    print(f"\nDone: {n_ok}/{len(cfg.model_names)} model(s) completed.")
-    for model_name, exc in failures:
-        print(f"  FAILED {model_name}: {type(exc).__name__}: {exc}")
-    if failures:
-        raise SystemExit(1)
+    rows = []
+    for model, group in df.groupby('model', sort=False):
+        n_trials = len(group)
+        row = {'model': model}
+        row.update({name: group[name].iloc[0] for name in si_r_present})
+        row['n_trials'] = n_trials
+        for cases, column in ((DPOS_CASES, 'dpos_case'), (CTX_CASES, 'ctx_case')):
+            counts = group[column].value_counts()
+            for code in cases:
+                row[f'case_{code}'] = counts.get(code, 0) / n_trials
+        rows.append(row)
+
+    table = pd.DataFrame(
+        rows,
+        columns=['model'] + si_r_present + ['n_trials'] + DPOS_COLUMNS + CTX_COLUMNS)
+    if model_names:
+        # Preserve the order the models were asked for, not the order they were read in.
+        order = {name: i for i, name in enumerate(model_names)}
+        table = (table.sort_values('model', key=lambda s: s.map(order))
+                      .reset_index(drop=True))
+    return table
+
+
+def check_family_sums(table, tol=1e-9):
+    """Warn if either family's proportions fail to sum to 1 for some model."""
+    for family, columns in (('dpos', DPOS_COLUMNS), ('ctx', CTX_COLUMNS)):
+        sums = table[columns].sum(axis=1)
+        bad = table.loc[(sums - 1).abs() > tol, 'model']
+        for model in bad:
+            print(f"  Warning: {family} proportions do not sum to 1 for {model}")
+
+
+def print_legend():
+    print("\nCase legend")
+    for cases, family in ((DPOS_CASES, 'dpos'), (CTX_CASES, 'ctx')):
+        for code, description in cases.items():
+            print(f"  case_{code}  [{family}]  {description}")
 
 
 if __name__ == '__main__':
-    main()
+    pass
