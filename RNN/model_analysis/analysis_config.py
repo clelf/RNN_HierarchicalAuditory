@@ -78,6 +78,15 @@ CHUNK_SIZE = 128
 # CSV column groups
 # =============================================================================
 
+# Per-sequence CSVs written by run_exp_trials_pipeline.py, one per experimental
+# sequence and kind, at <EXP_SEQ_OUTPUT_ROOT>/<model>/<kind>/<sequence><suffix>.
+SEQUENCE_CSV_SUFFIXES = {
+    'activations':           '_activations.csv',
+    'activations_deviant':   '_deviant_trial.csv',
+    'probabilities':         '_probabilities.csv',
+    'probabilities_deviant': '_probabilities_deviant.csv',
+}
+
 # Likelihood columns summarised from the *_probabilities_deviant.csv files.
 # cdf_lik_obs and log_lik_obs are derived on read, not stored by the extraction.
 LIKELIHOOD_COLS = ['lik_obs', 'cdf_lik_obs', 'log_lik_obs', 'lik_ctx', 'lik_dpos', 'lik_rule']
@@ -111,44 +120,20 @@ SEQUENCE_PARAM_COLS = [
 # Model lists
 # =============================================================================
 
-MODEL_LIST_NOTES = """\
-Two lists existed across the old scripts and had drifted apart despite a comment
-claiming they matched:
-
-  * the three aggregation scripts (likelihood summaries, dpos-probability
-    distributions, module correlations) all used the sigma_r sweep 0.02/0.05/0.1;
-  * evaluate_models.py and the alignment assessment used a wider five-model list.
-
-Both are kept below under explicit names. Two discrepancies are left as they are
-rather than silently fixed, because resolving them is a research decision:
-
-  * 'population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs300' appears in the
-    wider list but has no folder under TRAINING_RESULTS_DIR;
-  * 'population_network_all_bn8_trainh0_fixedsir0.01_epochs300_lr0.002' exists on
-    disk but appears in no list.
-"""
-
-# The sigma_r sweep: the models the experimental-sequence analyses compare.
-SIGMA_R_SWEEP_MODELS = [
+# Fixed sigma_r: the models the experimental-sequence analyses compare.
+FIXED_SIGMA_R_MODELS = [
     'population_network_all_bn8_trainh0_fixedsir0.02_epochs300_lr0.002',
     'population_network_all_bn8_trainh0_fixedsir0.05_epochs300_lr0.002',
     'population_network_all_bn8_trainh0_fixedsir0.1_epochs300_lr0.002',
 ]
 
-# The wider list used by the synthetic-test-set evaluation and the alignment
-# assessment. See MODEL_LIST_NOTES about the missing epochs300 checkpoint.
 EVALUATION_MODELS = [
-    'population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs200_lrsched',
-    'population_network_all_bn8_trainh0_fixedsir_lr0.002_epochs300',
+    'population_network_all_bn8_trainh0_fixedsir0.02_epochs300_lr0.002',
     'population_network_all_bn8_trainh0_fixedsir0.05_epochs300_lr0.002',
-    'population_network_all_bn8_trainh0_fixedsir0.005_epochs300_lr0.002',
     'population_network_all_bn8_trainh0_fixedsir0.1_epochs300_lr0.002',
+    'population_network_all_bn8_trainh0_epochs300_lr0.002'
 ]
 
-# What run_exp_trials_pipeline.py processes by default.
-DEFAULT_MODEL_NAMES = [
-    'population_network_all_bn8_trainh0_fixedsir0.02_epochs300_lr0.002',
-]
 
 
 # =============================================================================

@@ -31,7 +31,8 @@ if __name__ == '__main__':
     # Restrict the comparison to specific models. None evaluates every sub-folder
     # of BASE_DIR holding a .pth file; entries are full paths or bare folder names
     # looked up inside BASE_DIR.
-    MODEL_DIRS = cfg.SIGMA_R_SWEEP_MODELS
+    # MODEL_DIRS = cfg.FIXED_SIGMA_R_MODELS
+    MODEL_DIRS = cfg.EVALUATION_MODELS
 
     OUTPUT_DIR = cfg.EVALUATION_RESULTS_DIR / 'model_comparison' / 'HierarchicalGM'
 
@@ -65,7 +66,7 @@ if __name__ == '__main__':
     PLOT_METRIC_VIOLINS = True
     PLOT_KF_RATIOS = True           # only drawn when USE_BENCHMARK_DATA is True
     PLOT_CALIBRATION = False
-    SAVE_INDIVIDUAL_PANELS = True   # one extra file per metric of figure 1
+    SAVE_INDIVIDUAL_PANELS = False   # one extra file per metric of figure 1
     ROW_LABELS = None               # e.g. ['tone process estimation', 'context estimation']
     # -------------------------------------------------------------------------
 

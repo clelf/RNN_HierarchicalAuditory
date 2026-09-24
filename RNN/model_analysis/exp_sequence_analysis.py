@@ -2,14 +2,16 @@
 
 Two halves:
 
-  1. Extraction -- run a trained model on the recorded trial sequences and build
-     the per-sequence tables (activity norms per timestep, one row per trial at
-     the deviant, per-module predicted distributions and ground-truth
-     likelihoods). These are what run_exp_trials_pipeline.py writes to CSV.
+  1. Extraction -- build the per-sequence tables from a model's forward pass over
+     the recorded trial sequences (activity norms per timestep, one row per trial
+     at the deviant, per-module predicted distributions and ground-truth
+     likelihoods). These are what run_exp_trials_pipeline.py writes to CSV, and
+     the only place a model is run on the experimental sequences.
 
-  2. Aggregation -- read those CSVs back and summarise them: mean likelihoods per
+  2. Aggregation -- read the generated CSVs and summarise them: mean likelihoods per
      sequence (optionally split by deviant position), module-pair correlation
-     scores, and the per-trial join of activity against likelihood.
+     scores, the per-trial join of activity against likelihood, and the arrays
+     the activity figures and per-sample figures are drawn from.
 
 The ctx/dpos detection case taxonomy is large and self-contained, so it lives in
 alignment_cases.py rather than here.
@@ -22,7 +24,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import scipy
-import torch
 from scipy.stats import pearsonr, spearmanr
 
 from analysis_config import (
@@ -35,11 +36,10 @@ from analysis_config import (
 )
 from analysis_core import (
     class_likelihood,
+    class_probability_columns,
     compute_derivatives,
     gather_at,
     gaussian_likelihood,
-    get_module_output_and_activity,
-    load_trial_sequence,
 )
 
 
@@ -225,7 +225,7 @@ def build_probabilities_frame(obs, cue, ctx, dpos_model, rule, probs,
     `dpos_model` must already be in the model's convention (raw + shift), so that
     dpos_model - dpos_min is a valid 0-based class index.
 
-    `prior_probs`, when given (get_module_probabilities(..., return_prior=True)),
+    `prior_probs`, when given (get_module_output_and_activity(..., return_prior=True)),
     adds the same columns computed on the prior readouts, under a 'prior_' prefix.
     The unprefixed columns always hold the posterior readouts, so files written
     without priors stay readable by the downstream summaries unchanged.
@@ -278,77 +278,6 @@ def subset_deviant_rows(out_df, include_next_stimulus):
         # Deviants + the immediate next stimulus.
         deviant_mask = deviant_mask | deviant_mask.shift(1, fill_value=False)
     return out_df[deviant_mask]
-
-
-# =============================================================================
-# Extraction: batched forward passes over many sequences
-# =============================================================================
-
-def compute_norms_for_files(model, files, period=8, chunk_size=128,
-                            n_cue_classes=None, cue_seed=None, return_devpos=False):
-    """Run the model over many sequence files and return per-module norms.
-
-    Sequences are stacked into batches of at most ``chunk_size`` so the hidden
-    states of one forward pass stay bounded in memory; the (small) norm arrays
-    are concatenated along the batch axis afterwards. All sequences are assumed
-    to share the same length (they are here: period * n_trials timesteps).
-
-    ``n_cue_classes`` / ``cue_seed`` are forwarded to ``load_trial_sequence`` so the
-    two experimental cues can be re-encoded into the model's cue vocabulary. With a
-    fixed ``cue_seed`` every sequence uses the same class pair, keeping the batched
-    cue width uniform.
-
-    With ``return_devpos`` the 0-based within-trial deviant position of every trial
-    is collected too, so plot_by_position and plot_deviant can share one pass.
-
-    Returns
-    -------
-    module_norms_dict : dict
-        Module name → ndarray of shape (seq_len, n_files).
-    dev_pos : np.ndarray or None
-        Shape (n_files, n_trials) — 0-based within-trial deviant position per trial.
-        None unless ``return_devpos``.
-    """
-    norm_chunks = {}
-    devpos_list = []
-    for start in range(0, len(files), chunk_size):
-        chunk = files[start:start + chunk_size]
-
-        obs_list, cue_list = [], []
-        for f in chunk:
-            if return_devpos:
-                obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n = \
-                    load_trial_sequence(f, return_hierarch=True,
-                                        n_cue_classes=n_cue_classes, cue_seed=cue_seed)
-                # RAW physical within-trial position {2..6}: kept raw because it indexes
-                # the deviant's actual timestep (t*period + pos) in extract_deviant_activity.
-                # This is about where the deviant physically sits, independent of any model,
-                # so it must NOT be shifted to a model's dpos convention (that would point
-                # one tone past the real deviant). The legend renders pos+1 (1-indexed).
-                devpos_list.append(dpos[::period])   # one deviant position per trial
-            else:
-                obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(
-                    f, n_cue_classes=n_cue_classes, cue_seed=cue_seed)
-            obs_list.append(obs)
-            cue_list.append(cue)
-
-        min_len = min(o.shape[0] for o in obs_list)
-        obs_stack = np.stack([o[:min_len] for o in obs_list], axis=0)        # (N, T)
-        cue_stack = np.stack([c[:min_len, :] for c in cue_list], axis=0)     # (N, T, n_cue)
-
-        y = torch.tensor(obs_stack, dtype=torch.float32).unsqueeze(-1)       # (N, T, 1)
-        q = torch.tensor(cue_stack, dtype=torch.float32)                     # (N, T, n_cue)
-
-        _, module_norms, _ = get_module_output_and_activity(model, y, q)
-        for name, norms in module_norms.items():
-            norm_chunks.setdefault(name, []).append(norms)                   # (seq_len, N_chunk)
-
-        print(f"  processed {min(start + chunk_size, len(files))}/{len(files)} sequences")
-
-    module_norms_dict = {name: np.concatenate(chunks, axis=1)
-                         for name, chunks in norm_chunks.items()}
-    dev_pos = np.stack(devpos_list, axis=0) if return_devpos else None       # (n_files, n_trials)
-    return module_norms_dict, dev_pos
 
 
 # =============================================================================
@@ -812,6 +741,52 @@ def load_timestep_means(seq_files, with_position=False):
     # categorical -> discrete colours; column name -> legend title "position"
     ts_means['position'] = ts_means['position'].astype(str)
     return ts_means, pos_order
+
+
+def load_activity_norms(act_files):
+    """{module: (T-1, n_files) activity norms}, stacked from per-sequence activations CSVs.
+
+    The layout get_module_output_and_activity returns for a batch, so the activity
+    figures draw the same arrays whether they come from a forward pass or from
+    disk. Sequences of unequal length are truncated to the shortest one.
+    """
+    norm_cols = [f'{m}_norm' for m in MODULES]
+    frames = [pd.read_csv(f, usecols=norm_cols) for f in act_files]
+    min_len = min(len(df) for df in frames)
+    if any(len(df) != min_len for df in frames):
+        print(f"  Warning: sequences have unequal lengths — truncating all to {min_len} timesteps")
+    return {m: np.stack([df[f'{m}_norm'].to_numpy()[:min_len] for df in frames], axis=1)
+            for m in MODULES}
+
+
+def load_deviant_activity_frame(dev_files, dpos_shift):
+    """Every per-trial deviant-activity CSV of `dev_files`, concatenated.
+
+    Adds 'dev_pos', the 0-based within-trial position the deviant physically sits
+    at: the stored deviant_pos label is in the model's convention (raw + shift),
+    whereas grouping trials by where the deviant is must not depend on the model.
+    """
+    dev_df = pd.concat([pd.read_csv(f) for f in dev_files], ignore_index=True)
+    dev_df['dev_pos'] = dev_df['deviant_pos'] - dpos_shift
+    return dev_df
+
+
+def predictions_from_probabilities(prob_df, dpos_min):
+    """One sequence's model predictions, rebuilt from its probabilities CSV.
+
+    Same keys and layout as pipeline_core_v2.get_model_predictions returns for a
+    batch of one sequence: (1, T-1) for estimates and predicted labels, and
+    (1, T-1, n_classes) for class probabilities. Predicted dpos labels are in the
+    model's convention (class index + dpos_min), like the dpos column of the CSV.
+    """
+    pred = {'mu_estim': prob_df['obs_mean'].to_numpy()[None],
+            'sigma_estim': np.sqrt(prob_df['obs_var'].to_numpy())[None]}
+    for module in ('ctx', 'dpos', 'rule'):
+        probs = prob_df[class_probability_columns(prob_df.columns, module)].to_numpy()[None]
+        pred[f'{module}_prob'] = probs
+        pred[f'{module}_pred'] = probs.argmax(axis=-1)
+    pred['dpos_pred'] = pred['dpos_pred'] + dpos_min
+    return pred
 
 
 if __name__ == '__main__':

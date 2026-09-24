@@ -1,10 +1,12 @@
 """Unified driver for the experimental-sequence model analyses.
 
 Runs, for each of a list of trained models and one directory of experimental
-trial-sequence files, any subset of six analyses. Paths below are relative to
-``<output-root>/<model name>/``, one tree per model.
+trial-sequence files, any subset of six stages (toggled in the SETTINGS block by
+listing them in STAGES). Paths below are relative to ``<output-root>/<model name>/``,
+one tree per model.
 
-  CSV extraction (one row-set per sequence file)
+  CSV extraction (one CSV per sequence file and kind) -- the only stages that run
+  a model; every other experimental-sequence analysis reads these CSVs back
     activations         per-timestep module activity norms + derivatives
                         -> activations/*_activations.csv
     activations_deviant one row per trial, sampled at the deviant timestep
@@ -14,46 +16,29 @@ trial-sequence files, any subset of six analyses. Paths below are relative to
                         -> probabilities/*_probabilities.csv
                         -> probabilities_deviant/*_probabilities_deviant.csv
 
-  Figures (-> viz_examples/)
+  Figures (-> viz_examples/), drawn from those CSVs
     plot_trajectories   individual + averaged activity and derivatives for a
-                        small random sample of sequences
+                        small random sample of sequences      <- activations
     plot_by_position    activity / derivatives averaged over sequences, split by
-                        within-trial position
+                        within-trial position                 <- activations
     plot_deviant        activity / derivatives at the deviant timestep, grouped
-                        by deviant position
+                        by deviant position                   <- activations_deviant
 
-Each model is loaded once for all of its stages, each sequence file is read once
-per group of stages, and the batched forward passes needed by plot_by_position
-and plot_deviant are shared instead of being recomputed twice. Models are
-independent, so a model that fails (a missing checkpoint, say) is reported at the
-end without stopping the rest.
+Existing outputs are reused: a sequence is only run through the model when one of
+the CSVs its requested stages write is missing, and a model is only loaded when
+at least one sequence needs it. The sequences that do need it go through one
+batched forward pass per chunk, which serves all three extraction stages at once.
+A figure stage is redrawn when one of its figures is missing or older than one of
+the CSVs it is drawn from. Requesting a figure stage also makes sure
+the CSVs it reads exist, extracting the missing ones.
 
-This is the one script here that keeps a command line, because it is the heavy
-batch driver; every flag defaults to the corresponding value in analysis_config.
 The stage implementations live in exp_sequence_analysis.py and plots.py.
-
-Examples
---------
-    # every stage, for every model in analysis_config.DEFAULT_MODEL_NAMES
-    python run_exp_trials_pipeline.py
-
-    # just the CSV extraction, for one model
-    python run_exp_trials_pipeline.py \
-        --stages activations activations_deviant probabilities \
-        --model-names population_network_all_bn8_trainh0_fixedsir0.02_epochs300_lr0.002
-
-    # just the figures, on 200 randomly sampled sequences
-    python run_exp_trials_pipeline.py \
-        --stages plot_trajectories plot_by_position plot_deviant --n-sequences 200
 """
-
-import argparse
-from pathlib import Path
 
 import numpy as np
 import torch
 
-import analysis_config as cfg_mod
+import analysis_config as cfg
 import exp_sequence_analysis as exp
 import plots
 from analysis_config import MODULE_TITLES
@@ -62,51 +47,73 @@ from analysis_core import (
     dpos_conventions,
     find_trial_files,
     get_module_output_and_activity,
-    get_module_probabilities,
     load_model,
     load_trial_params,
     load_trial_sequence,
+    outputs_up_to_date,
     select_files,
-    to_model_tensors,
+    sequence_csv_path,
 )
 
-CSV_STAGES = ('activations', 'activations_deviant', 'probabilities')
+EXTRACTION_STAGES = ('activations', 'activations_deviant', 'probabilities')
 PLOT_STAGES = ('plot_trajectories', 'plot_by_position', 'plot_deviant')
-ALL_STAGES = CSV_STAGES + PLOT_STAGES
+ALL_STAGES = EXTRACTION_STAGES + PLOT_STAGES
 
-# plot_trajectories draws one panel row per sequence, so it uses a small sample.
-DEFAULT_N_TRAJECTORIES = 2
+# CSV kinds (keys of analysis_config.SEQUENCE_CSV_SUFFIXES) each extraction stage
+# writes per sequence.
+STAGE_CSVS = {
+    'activations':         ('activations',),
+    'activations_deviant': ('activations_deviant',),
+    'probabilities':       ('probabilities', 'probabilities_deviant'),
+}
+
+# The extraction stage whose CSVs each figure stage is drawn from.
+FIGURE_SOURCES = {
+    'plot_trajectories': 'activations',
+    'plot_by_position':  'activations',
+    'plot_deviant':      'activations_deviant',
+}
+
+# Figure names (after '<model>_') each figure stage writes, each in two versions.
+FIGURE_STEMS = {
+    'plot_trajectories': ('exp_activity_trajectories', 'exp_activity_averaged'),
+    'plot_by_position':  ('exp_activity_averaged_by_position',),
+    'plot_deviant':      ('exp_deviant_activity_by_position',),
+}
+
+# Every activity figure comes in two versions: the norms and their derivatives.
+DERIVATIVE_SUFFIXES = ((False, ''), (True, '_derivatives'))
 
 
 # =============================================================================
 # Produce CSV of activations, probabilities
 # =============================================================================
 
-def run_csv_stages(model, info, trial_files, stages, output_root, cfg):
-    """Run the per-file CSV stages, reading each sequence file once.
+def pending_extraction(trial_files, stages, output_root, model_name, overwrite):
+    """{trial file: extraction stages to (re)write}, for the files with any left to do."""
+    pending = {}
+    for trial_file in trial_files:
+        todo = [s for s in stages
+                if overwrite or not all(
+                    sequence_csv_path(output_root, model_name, kind, trial_file.stem).exists()
+                    for kind in STAGE_CSVS[s])]
+        if todo:
+            pending[trial_file] = todo
+    return pending
 
-    Any of 'activations', 'activations_deviant' and 'probabilities' present in
-    `stages` are produced in the same loop: one activity forward pass (shared by
-    the two activation stages) and one probability forward pass per file, only
-    when the corresponding stage was requested.
+
+def write_sequence_csvs(model, info, pending, output_root, model_name, period, cue_seed,
+                        chunk_size, include_prior, include_next_stimulus):
+    """Write the pending CSVs, running one batched forward pass per chunk of sequences.
+
+    - activations: per-timestep module activity norms + derivatives
+    - activations_deviant: one row per trial, sampled at the deviant timestep
+    - probabilities: per-module predicted distributions + ground-truth likelihoods
+    - probabilities_deviant: same as probabilities, but restricted to the deviant rows + optionally the immediate next stimulus row
     """
-    include_act = 'activations' in stages
-    include_act_dev = 'activations_deviant' in stages
-    include_prob = 'probabilities' in stages
-    include_activity = include_act or include_act_dev
-
-    dirs = {}
-    if include_act:
-        dirs['activations'] = output_root / 'activations'
-    if include_act_dev:
-        dirs['activations_deviant'] = output_root / 'activations_deviant'
-    if include_prob:
-        dirs['probabilities'] = output_root / 'probabilities'
-        # Deviant-only output: same information but restricted to rows where the
-        # context label (trial_type) is 1.
-        dirs['probabilities_deviant'] = output_root / 'probabilities_deviant'
-    for path in dirs.values():
-        path.mkdir(parents=True, exist_ok=True)
+    kinds = {kind for todo in pending.values() for s in todo for kind in STAGE_CSVS[s]}
+    for kind in kinds:
+        (output_root / model_name / kind).mkdir(parents=True, exist_ok=True)
 
     # If the model was trained with a larger cue vocabulary than the two cues present
     # in the experimental sequences, re-encode the cues into the dimensionality it
@@ -122,315 +129,252 @@ def run_csv_stages(model, info, trial_files, stages, output_root, cfg):
     print(f"dpos class-index offset (model convention): {dpos_min}; "
           f"experimental dpos shift: +{dpos_shift}")
 
-    for trial_file in trial_files:
-        # ctx/dpos/rule are the ground-truth labels from the original sequence.
-        # dpos_raw is the raw deviant position on disk (e.g. 2..6), not yet a class index.
-        obs, cue, ctx, dpos_raw, rule, lim_std, d, tau_std, trial_n = load_trial_sequence(
-            trial_file, return_hierarch=True,
-            n_cue_classes=n_cue_classes, cue_seed=cfg.cue_seed)
-        y, q = to_model_tensors(obs, cue)
+    files = list(pending)
+    for start in range(0, len(files), chunk_size):
+        chunk = files[start:start + chunk_size]
+        # Each entry: obs, cue, ctx, dpos_raw, rule, lim_std, d, tau_std, trial_n.
+        # ctx/dpos/rule are the ground-truth labels from the original sequence;
+        # dpos_raw is the raw deviant position on disk (e.g. 2..6), not a class index.
+        seqs = [load_trial_sequence(f, return_hierarch=True,
+                                    n_cue_classes=n_cue_classes, cue_seed=cue_seed)
+                for f in chunk]
 
-        if include_activity:
-            # hidden_activity:    dict module → (T-1, 1)
-            # hidden_derivatives: dict module → (T-2, 1)
-            _, hidden_activity, hidden_derivatives = get_module_output_and_activity(model, y, q)
-            # Squeeze batch dim (batch=1) from norms and derivatives
-            norms = {name: arr[:, 0] for name, arr in hidden_activity.items()}      # each: (T-1,)
-            derivs = {name: arr[:, 0] for name, arr in hidden_derivatives.items()}  # each: (T-2,)
+        # Stacking requires every sequence of a chunk to have the same length.
+        y = torch.tensor(np.stack([seq[0] for seq in seqs]),
+                         dtype=torch.float32).unsqueeze(-1)             # (N, T, 1)
+        q = torch.tensor(np.stack([seq[1] for seq in seqs]),
+                         dtype=torch.float32)                           # (N, T, n_cue)
 
-        if include_act:
-            out_df = exp.build_activations_frame(obs, cue, norms, derivs,
-                                             lim_std, d, tau_std, trial_n)
-            out_file = dirs['activations'] / (trial_file.stem + '_activations.csv')
-            out_df.to_csv(out_file, index=False)
-            print(f"  Saved: {out_file.name}")
+        # One forward pass serves every stage:
+        #   probs:  dict module → (T-1, N, dim)
+        #     'obs':  dim=2, columns are (mean, variance) of the predicted Gaussian
+        #     others: dim=n_classes, softmax class probabilities
+        #   norms:  dict module → (T-1, N);  derivs: dict module → (T-2, N)
+        # With include_prior, the probabilities are also read from the prior
+        # (first-call) readout of each module, i.e. before the feedback sweep.
+        forward = get_module_output_and_activity(model, y, q, return_prior=include_prior)
+        probs, norms, derivs = forward[:3]
+        prior_probs = forward[3] if include_prior else None
 
-        if include_act_dev:
-            out_df = exp.build_deviant_activations_frame(
-                obs, dpos_raw, norms, derivs, lim_std, d, tau_std, trial_n,
-                period=cfg.period, dpos_shift=dpos_shift)
-            out_file = dirs['activations_deviant'] / (trial_file.stem + '_deviant_trial.csv')
-            out_df.to_csv(out_file, index=False)
-            print(f"  Saved: {out_file.name}")
+        for j, (trial_file, seq) in enumerate(zip(chunk, seqs)):
+            obs, cue, ctx, dpos_raw, rule, lim_std, d, tau_std, trial_n = seq
+            todo = pending[trial_file]
+            seq_norms = {name: arr[:, j] for name, arr in norms.items()}      # each: (T-1,)
+            seq_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T-2,)
+            csv_path = {kind: sequence_csv_path(output_root, model_name, kind, trial_file.stem)
+                        for kind in kinds}
 
-        if include_prob:
-            # probs: dict module → (seq_len, batch, dim)
-            #   'obs':  dim=2, columns are (mean, variance) of the predicted Gaussian
-            #   others: dim=n_classes, softmax class probabilities
-            # With --include-prior, the same quantities are also read from the prior
-            # (first-call) readout of each module, i.e. before the feedback sweep.
-            if cfg.include_prior:
-                probs, prior_probs = get_module_probabilities(model, y, q, return_prior=True)
-            else:
-                probs = get_module_probabilities(model, y, q)
-                prior_probs = None
+            if 'activations' in todo:
+                out_df = exp.build_activations_frame(obs, cue, seq_norms, seq_derivs,
+                                                     lim_std, d, tau_std, trial_n)
+                out_df.to_csv(csv_path['activations'], index=False)
 
-            # Shift the experimental deviant-position labels into the model's training
-            # convention ({2..6} -> {3..7}); the on-disk files are left untouched.
-            dpos_model = dpos_raw + dpos_shift
+            if 'activations_deviant' in todo:
+                out_df = exp.build_deviant_activations_frame(
+                    obs, dpos_raw, seq_norms, seq_derivs, lim_std, d, tau_std, trial_n,
+                    period=period, dpos_shift=dpos_shift)
+                out_df.to_csv(csv_path['activations_deviant'], index=False)
 
-            out_df = exp.build_probabilities_frame(obs, cue, ctx, dpos_model, rule, probs,
-                                               lim_std, d, tau_std, trial_n, dpos_min,
-                                               prior_probs=prior_probs)
-            out_file = dirs['probabilities'] / (trial_file.stem + '_probabilities.csv')
-            out_df.to_csv(out_file, index=False)
-            print(f"  Saved: {out_file.name}")
+            if 'probabilities' in todo:
+                # Shift the experimental deviant-position labels into the model's
+                # training convention ({2..6} -> {3..7}); the on-disk files are left
+                # untouched. Probabilities keep a batch dimension of one.
+                out_df = exp.build_probabilities_frame(
+                    obs, cue, ctx, dpos_raw + dpos_shift, rule,
+                    {name: arr[:, j:j + 1] for name, arr in probs.items()},
+                    lim_std, d, tau_std, trial_n, dpos_min,
+                    prior_probs=(None if prior_probs is None else
+                                 {name: arr[:, j:j + 1] for name, arr in prior_probs.items()}))
+                out_df.to_csv(csv_path['probabilities'], index=False)
 
-            deviant_df = exp.subset_deviant_rows(out_df, cfg.include_next_stimulus)
-            deviant_file = (dirs['probabilities_deviant']
-                            / (trial_file.stem + '_probabilities_deviant.csv'))
-            deviant_df.to_csv(deviant_file, index=False)
-            print(f"  Saved: {deviant_file.name}")
+                deviant_df = exp.subset_deviant_rows(out_df, include_next_stimulus)
+                deviant_df.to_csv(csv_path['probabilities_deviant'], index=False)
 
-    print(f"\n{len(trial_files)} file(s) processed for stages: "
-          f"{', '.join(s for s in CSV_STAGES if s in stages)}")
-    for name, path in dirs.items():
-        print(f"  {name}: {path}")
+        print(f"  processed {min(start + chunk_size, len(files))}/{len(files)} sequences")
+
+    for kind in sorted(kinds):
+        print(f"  {kind}: {output_root / model_name / kind}")
 
 
 # =============================================================================
-# Use produced CSV files for plotting
+# Figures, drawn from the CSVs
 # =============================================================================
 
-def run_plot_trajectories(model, n_cue_classes, all_files, output_dir, model_name, cfg):
+def figure_files(stage, model_name):
+    """Every figure file name a figure stage writes."""
+    return [f"{model_name}_{stem}{suffix}.png"
+            for stem in FIGURE_STEMS[stage] for _, suffix in DERIVATIVE_SUFFIXES]
+
+
+def run_plot_trajectories(trial_files, output_root, output_dir, model_name,
+                          n_trajectories, seed):
     """Individual + averaged activity and derivatives.
 
     Draws one panel row per sequence, so it runs on a small random sample
-    (``--n-trajectories``) rather than the full set.
+    (`n_trajectories`) rather than the full set.
     """
-    selected_files = select_files(all_files, cfg.n_trajectories, seed=cfg.seed)
+    selected_files = select_files(trial_files, n_trajectories, seed=seed)
     n_select = len(selected_files)
     print(f"[plot_trajectories] using {n_select} trial sequence files")
 
-    # Sequences may differ in length; we truncate all to the shortest one.
-    obs_list, cue_list, params_list = [], [], []
-    for f in selected_files:
-        obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(
-            f, n_cue_classes=n_cue_classes, cue_seed=cfg.cue_seed)
-        obs_list.append(obs)
-        cue_list.append(cue)
-        params_list.append(load_trial_params(f))
+    # Norms (T-1, N); sequences of unequal length are truncated to the shortest one.
+    module_norms_dict = exp.load_activity_norms(
+        [sequence_csv_path(output_root, model_name, 'activations', f.stem)
+         for f in selected_files])
 
     # Build pars dict in the format expected by extract_sample_parameters
-    pars = {
-        'tau':     [p['tau']     for p in params_list],
-        'lim':     [p['lim']     for p in params_list],
-        'si_stat': [p['si_stat'] for p in params_list],
-        'si_r':    [p['si_r']    for p in params_list],
-    }
-
-    min_len = min(o.shape[0] for o in obs_list)
-    if any(o.shape[0] != min_len for o in obs_list):
-        print(f"  Warning: sequences have unequal lengths — truncating all to {min_len} timesteps")
-
-    obs_stack = np.stack([o[:min_len] for o in obs_list], axis=0)        # (N, T)
-    cue_stack = np.stack([c[:min_len, :] for c in cue_list], axis=0)     # (N, T, n_cue)
-
-    y = torch.tensor(obs_stack, dtype=torch.float32).unsqueeze(-1)       # (N, T, 1)
-    q = torch.tensor(cue_stack, dtype=torch.float32)                     # (N, T, n_cue)
-
-    # Forward pass — returns norms (T-1, N) and derivatives (T-2, N)
-    _, module_norms_dict, _ = get_module_output_and_activity(model, y, q)
+    params_list = [load_trial_params(f) for f in selected_files]
+    pars = {key: [p[key] for p in params_list] for key in ('tau', 'lim', 'si_stat', 'si_r')}
 
     seq_len = next(iter(module_norms_dict.values())).shape[0]
     timesteps = np.arange(seq_len)
 
-    # Figure 1: Individual trajectories (activity)
-    fig = plots.plot_individual_trajectories(
-        module_norms_dict, MODULE_TITLES, timesteps,
-        output_dir, model_name, include_derivatives=False, pars=pars,
-    )
-    plots.save_figure(fig, output_dir, f"{model_name}_exp_activity_trajectories.png")
+    for include_derivatives, suffix in DERIVATIVE_SUFFIXES:
+        fig = plots.plot_individual_trajectories(
+            module_norms_dict, MODULE_TITLES, timesteps,
+            output_dir, model_name, include_derivatives=include_derivatives, pars=pars,
+        )
+        plots.save_figure(fig, output_dir, f"{model_name}_exp_activity_trajectories{suffix}.png")
 
-    # Figure 2: Averaged activity
-    fig = plots.plot_averaged_activity(
-        module_norms_dict, MODULE_TITLES, timesteps,
-        output_dir, model_name, n_samples=n_select, include_derivatives=False,
-    )
-    plots.save_figure(fig, output_dir, f"{model_name}_exp_activity_averaged.png")
-
-    # Figure 3: Individual trajectories (derivatives)
-    fig = plots.plot_individual_trajectories(
-        module_norms_dict, MODULE_TITLES, timesteps,
-        output_dir, model_name, include_derivatives=True, pars=pars,
-    )
-    plots.save_figure(fig, output_dir, f"{model_name}_exp_activity_trajectories_derivatives.png")
-
-    # Figure 4: Averaged derivatives
-    fig = plots.plot_averaged_activity(
-        module_norms_dict, MODULE_TITLES, timesteps,
-        output_dir, model_name, n_samples=n_select, include_derivatives=True,
-    )
-    plots.save_figure(fig, output_dir, f"{model_name}_exp_activity_averaged_derivatives.png")
+        fig = plots.plot_averaged_activity(
+            module_norms_dict, MODULE_TITLES, timesteps,
+            output_dir, model_name, n_samples=n_select, include_derivatives=include_derivatives,
+        )
+        plots.save_figure(fig, output_dir, f"{model_name}_exp_activity_averaged{suffix}.png")
 
 
-def run_plot_by_position(module_norms_dict, n_select, output_dir, model_name, cfg):
+def run_plot_by_position(module_norms_dict, n_select, output_dir, model_name, period):
     """Activity / derivatives averaged over sequences, split by within-trial position."""
-    # Figure 1: Averaged activity by within-trial position
-    fig = plots.plot_averaged_activity_by_position(
-        module_norms_dict, MODULE_TITLES, output_dir, model_name,
-        n_samples=n_select, period=cfg.period, include_derivatives=False,
-    )
-    plots.save_figure(fig, output_dir, f"{model_name}_exp_activity_averaged_by_position.png")
-
-    # Figure 2: Averaged derivatives by within-trial position
-    fig = plots.plot_averaged_activity_by_position(
-        module_norms_dict, MODULE_TITLES, output_dir, model_name,
-        n_samples=n_select, period=cfg.period, include_derivatives=True,
-    )
-    plots.save_figure(fig, output_dir, f"{model_name}_exp_activity_averaged_by_position_derivatives.png")
+    for include_derivatives, suffix in DERIVATIVE_SUFFIXES:
+        fig = plots.plot_averaged_activity_by_position(
+            module_norms_dict, MODULE_TITLES, output_dir, model_name,
+            n_samples=n_select, period=period, include_derivatives=include_derivatives,
+        )
+        plots.save_figure(fig, output_dir,
+                          f"{model_name}_exp_activity_averaged_by_position{suffix}.png")
 
 
-def run_plot_deviant(module_norms_dict, dev_pos, n_select, output_dir, model_name, cfg):
+def run_plot_deviant(dev_df, n_select, output_dir, model_name):
     """Activity / derivatives at the deviant timestep, grouped by deviant position."""
-    # Figure 1: Activity at the deviant position
-    fig = plots.plot_deviant_activity_by_position(
-        module_norms_dict, dev_pos, MODULE_TITLES, output_dir, model_name,
-        n_samples=n_select, period=cfg.period, include_derivatives=False,
-    )
-    plots.save_figure(fig, output_dir, f"{model_name}_exp_deviant_activity_by_position.png")
-
-    # Figure 2: Derivatives at the deviant position
-    fig = plots.plot_deviant_activity_by_position(
-        module_norms_dict, dev_pos, MODULE_TITLES, output_dir, model_name,
-        n_samples=n_select, period=cfg.period, include_derivatives=True,
-    )
-    plots.save_figure(fig, output_dir, f"{model_name}_exp_deviant_activity_by_position_derivatives.png")
+    for include_derivatives, suffix in DERIVATIVE_SUFFIXES:
+        fig = plots.plot_deviant_activity_by_position(
+            dev_df, MODULE_TITLES, output_dir, model_name,
+            n_samples=n_select, include_derivatives=include_derivatives,
+        )
+        plots.save_figure(fig, output_dir,
+                          f"{model_name}_exp_deviant_activity_by_position{suffix}.png")
 
 
-def run_plot_stages(model, info, all_files, stages, output_root, model_name, cfg):
-    """Run the requested figure stages.
+def run_plots(info, trial_files, stages, output_root, model_name,
+              n_trajectories, n_sequences, seed, period):
+    """Run the requested figure stages from the CSVs.
 
-    plot_by_position and plot_deviant both need per-module norms over the same
-    (large) file selection, so when both are requested the chunked forward passes
-    are done once and shared.
+    plot_by_position and plot_deviant draw on the same (large) file selection.
     """
-    output_dir = output_root / 'viz_examples'
+    output_dir = output_root / model_name / 'viz_examples'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # If the model was trained with a larger cue vocabulary than the two cues present
-    # in the experimental sequences, re-encode the cues into the dimensionality it expects.
-    n_cue_classes = len(info.data_config_dict['cues_set'])
-
     if 'plot_trajectories' in stages:
-        run_plot_trajectories(model, n_cue_classes, all_files, output_dir, model_name, cfg)
+        run_plot_trajectories(trial_files, output_root, output_dir, model_name,
+                              n_trajectories, seed)
 
     include_by_pos = 'plot_by_position' in stages
     include_dev = 'plot_deviant' in stages
     if include_by_pos or include_dev:
-        selected_files = select_files(all_files, cfg.n_sequences, seed=cfg.seed)
+        selected_files = select_files(trial_files, n_sequences, seed=seed)
         n_select = len(selected_files)
         print(f"[plot_by_position/plot_deviant] using {n_select} trial sequence files")
 
-        module_norms_dict, dev_pos = exp.compute_norms_for_files(
-            model, selected_files, period=cfg.period, chunk_size=cfg.chunk_size,
-            n_cue_classes=n_cue_classes, cue_seed=cfg.cue_seed, return_devpos=include_dev)
-
         if include_by_pos:
-            run_plot_by_position(module_norms_dict, n_select, output_dir, model_name, cfg)
+            module_norms_dict = exp.load_activity_norms(
+                [sequence_csv_path(output_root, model_name, 'activations', f.stem)
+                 for f in selected_files])
+            run_plot_by_position(module_norms_dict, n_select, output_dir, model_name, period)
+
         if include_dev:
-            run_plot_deviant(module_norms_dict, dev_pos, n_select, output_dir, model_name, cfg)
+            _, dpos_shift = dpos_conventions(info)
+            dev_df = exp.load_deviant_activity_frame(
+                [sequence_csv_path(output_root, model_name, 'activations_deviant', f.stem)
+                 for f in selected_files], dpos_shift)
+            run_plot_deviant(dev_df, n_select, output_dir, model_name)
 
     print(f"\nFigures saved to {output_dir}")
 
 
-def run_one_model(model_name, trial_files, stages, cfg):
-    """Run every requested stage for one model, into <output-root>/<model_name>/."""
-    model_path = cfg.model_dir / model_name
-    output_root = cfg.output_root / model_name
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    # Load the model once for every stage.
-    info = ModelInfo.from_path(model_path)
-    model = load_model(info)
-    model.eval()
-    print(f"Loaded model: {model_path.name}")
-    print(f"Output root: {output_root}")
-
-    if any(s in stages for s in CSV_STAGES):
-        run_csv_stages(model, info, trial_files, stages, output_root, cfg)
-
-    if any(s in stages for s in PLOT_STAGES):
-        run_plot_stages(model, info, trial_files, stages, output_root, model_name, cfg)
-
-
-# =============================================================================
-# Entry point
-# =============================================================================
-
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--stages', nargs='+', choices=ALL_STAGES, default=list(ALL_STAGES),
-                   metavar='STAGE',
-                   help=f"stages to run, any of: {', '.join(ALL_STAGES)} (default: all)")
-    p.add_argument('--model-names', nargs='+', default=list(cfg_mod.DEFAULT_MODEL_NAMES),
-                   metavar='NAME',
-                   help='trained model directory names, run in order (default: the '
-                        f'{len(cfg_mod.DEFAULT_MODEL_NAMES)} models in '
-                        'analysis_config.DEFAULT_MODEL_NAMES)')
-    p.add_argument('--model-dir', type=Path, default=cfg_mod.TRAINING_RESULTS_DIR,
-                   help='directory containing the trained models (default: %(default)s)')
-    p.add_argument('--trials-path', type=Path, default=cfg_mod.TRIALS_PATH,
-                   help='directory of experimental sequence files (default: %(default)s)')
-    p.add_argument('--output-root', type=Path, default=cfg_mod.EXP_SEQ_OUTPUT_ROOT,
-                   help='base output directory; each model writes to '
-                        '<output-root>/<model-name>/ (default: %(default)s)')
-    p.add_argument('--n-sequences', type=int, default=None,
-                   help='sequence files used by plot_by_position / plot_deviant '
-                        '(default: all of them)')
-    p.add_argument('--n-trajectories', type=int, default=DEFAULT_N_TRAJECTORIES,
-                   help='sequence files used by plot_trajectories (default: %(default)s)')
-    p.add_argument('--seed', type=int, default=0,
-                   help='seed for random file sampling (default: %(default)s)')
-    p.add_argument('--period', type=int, default=cfg_mod.PERIOD,
-                   help='timesteps per trial (default: %(default)s)')
-    p.add_argument('--cue-seed', type=int, default=cfg_mod.CUE_SEED,
-                   help='seed for cue re-encoding; keep it fixed across stages '
-                        '(default: %(default)s)')
-    p.add_argument('--chunk-size', type=int, default=cfg_mod.CHUNK_SIZE,
-                   help='sequences per batched forward pass (default: %(default)s)')
-    p.add_argument('--no-next-stimulus', dest='include_next_stimulus',
-                   action='store_false',
-                   help='restrict the deviant-only probabilities file to the deviant '
-                        'rows, instead of the deviant plus the immediate next stimulus')
-    p.add_argument('--include-prior', action='store_true',
-                   help='also write the prior (first-call) readout of every module to '
-                        'the probability CSVs, as prior_-prefixed columns; the '
-                        'unprefixed columns stay the posterior readouts')
-    p.add_argument('--parallel', action='store_true',
-                   help='mark this run as one of several concurrent workers sharing a '
-                        'figure directory, so figure provenance is appended under a lock')
-    return p.parse_args(argv)
-
-
 if __name__ == '__main__':
-    cfg = parse_args()
-    plots.set_script_path(__file__, parallel=cfg.parallel)
+    plots.set_script_path(__file__)
 
-    stages = [s for s in ALL_STAGES if s in set(cfg.stages)]   # canonical order
+    # ------------------------- SETTINGS (edit these) -------------------------
+    # Any subset of ALL_STAGES; they always run in ALL_STAGES order.
+    STAGES = list(ALL_STAGES)
+    MODEL_NAMES = cfg.EVALUATION_MODELS
+    MODEL_DIR = cfg.TRAINING_RESULTS_DIR
+    TRIALS_PATH = cfg.TRIALS_PATH
+    # Each model writes to OUTPUT_ROOT/<model name>/.
+    OUTPUT_ROOT = cfg.EXP_SEQ_OUTPUT_ROOT
 
-    trial_files = find_trial_files(cfg.trials_path)
+    # Existing CSVs and figures are trusted and reused. Set True to rewrite them
+    # all, e.g. after retraining a model or changing CUE_SEED, INCLUDE_PRIOR,
+    # INCLUDE_NEXT_STIMULUS, or the figure sampling below.
+    OVERWRITE = False
+
+    # Sequence files used by plot_by_position / plot_deviant (None: all of them),
+    # and by plot_trajectories, which draws one panel row per sequence.
+    N_SEQUENCES = None
+    N_TRAJECTORIES = 2
+    SEED = 0                        # random file sampling
+
+    PERIOD = cfg.PERIOD             # timesteps per trial
+    CUE_SEED = cfg.CUE_SEED         # cue re-encoding; keep it fixed across stages
+    CHUNK_SIZE = cfg.CHUNK_SIZE     # sequences per batched forward pass
+
+    # Deviant-only probabilities file: deviant rows plus the immediate next
+    # stimulus (True), or the deviant rows alone (False).
+    INCLUDE_NEXT_STIMULUS = True
+    # Also write the prior (first-call) readout of every module to the probability
+    # CSVs, as prior_-prefixed columns; the unprefixed columns stay the posterior.
+    INCLUDE_PRIOR = False
+    # -------------------------------------------------------------------------
+
+    unknown_stages = [s for s in STAGES if s not in ALL_STAGES]
+    if unknown_stages:
+        raise ValueError(f"Unknown stage(s) {unknown_stages}; choose from {ALL_STAGES}")
+    figure_stages = [s for s in PLOT_STAGES if s in STAGES]
+    # Figure stages need the CSVs they are drawn from.
+    extraction_stages = [s for s in EXTRACTION_STAGES
+                         if s in STAGES or s in [FIGURE_SOURCES[f] for f in figure_stages]]
+
+    trial_files = find_trial_files(TRIALS_PATH)
     if not trial_files:
-        raise FileNotFoundError(f"No .csv or .txt sequence files in {cfg.trials_path}")
-    print(f"Found {len(trial_files)} trial sequence files in {cfg.trials_path}")
-    print(f"Stages: {', '.join(stages)}")
-    print(f"Models ({len(cfg.model_names)}): {', '.join(cfg.model_names)}")
+        raise FileNotFoundError(f"No .csv or .txt sequence files in {TRIALS_PATH}")
+    print(f"Found {len(trial_files)} trial sequence files in {TRIALS_PATH}")
+    print(f"Extraction stages: {', '.join(extraction_stages)}")
+    print(f"Figure stages: {', '.join(figure_stages)}")
+    print(f"Models ({len(MODEL_NAMES)}): {', '.join(MODEL_NAMES)}")
 
-    # A failure on one model (a missing checkpoint, say) should not throw away the
-    # models already done or block the ones still queued; report at the end instead.
-    failures = []
-    for i, model_name in enumerate(cfg.model_names, start=1):
-        print(f"\n{'=' * 79}\n[{i}/{len(cfg.model_names)}] {model_name}\n{'=' * 79}")
-        try:
-            run_one_model(model_name, trial_files, stages, cfg)
-        except Exception as exc:
-            print(f"  FAILED: {type(exc).__name__}: {exc}")
-            failures.append((model_name, exc))
+    for i, model_name in enumerate(MODEL_NAMES, start=1):
+        print(f"\n{'=' * 79}\n[{i}/{len(MODEL_NAMES)}] {model_name}\n{'=' * 79}")
+        # Only the config is read here; the weights are loaded when a forward pass is due.
+        info = ModelInfo.from_path(MODEL_DIR / model_name)
 
-    n_ok = len(cfg.model_names) - len(failures)
-    print(f"\nDone: {n_ok}/{len(cfg.model_names)} model(s) completed.")
-    for model_name, exc in failures:
-        print(f"  FAILED {model_name}: {type(exc).__name__}: {exc}")
-    if failures:
-        raise SystemExit(1)
+        pending = pending_extraction(trial_files, extraction_stages, OUTPUT_ROOT,
+                                     model_name, OVERWRITE)
+        print(f"{len(pending)}/{len(trial_files)} sequence file(s) need CSVs written")
+        if pending:
+            model = load_model(info)
+            model.eval()
+            print(f"Loaded model: {model_name}")
+            write_sequence_csvs(model, info, pending, OUTPUT_ROOT, model_name, PERIOD,
+                                CUE_SEED, CHUNK_SIZE, INCLUDE_PRIOR, INCLUDE_NEXT_STIMULUS)
+
+        # A figure stage is stale when a figure is missing or older than a CSV it reads.
+        viz_dir = OUTPUT_ROOT / model_name / 'viz_examples'
+        stale_figures = [s for s in figure_stages
+                         if OVERWRITE or not outputs_up_to_date(
+                             [viz_dir / name for name in figure_files(s, model_name)],
+                             [sequence_csv_path(OUTPUT_ROOT, model_name, FIGURE_SOURCES[s], f.stem)
+                              for f in trial_files])]
+        print(f"Figure stages to draw: {', '.join(stale_figures) or 'none'}")
+        if stale_figures:
+            run_plots(info, trial_files, stale_figures, OUTPUT_ROOT, model_name,
+                      N_TRAJECTORIES, N_SEQUENCES, SEED, PERIOD)

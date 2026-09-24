@@ -2,13 +2,14 @@
 
 Two stages, both toggled in the SETTINGS block below:
 
-  1. per-trial   -- run each model over the experimental sequences and classify
-                    every trial into one dpos case and one ctx case
+  1. per-trial   -- read each model's reports on the experimental sequences from
+                    the probabilities CSVs run_exp_trials_pipeline.py writes, and
+                    classify every trial into one dpos case and one ctx case
                     -> <output-root>/<model>/alignment/<model>_trial_alignment.csv
                     -> ..._alignment_summary.csv (that model's case counts)
   2. per-model   -- read those tables back and write one wide row per model, each
                     cell the proportion of that model's trials in that case
-                    -> <output-root>/alignment_case_proportions.csv
+                    -> <output-root>/dpos_and_ctx_detection_case_proportions.csv
 
 The case taxonomies, the classification logic and the table builders live in
 alignment_cases.py; this file only chooses what to run it on.
@@ -20,8 +21,8 @@ could not run at all: it imported a module name left behind by an earlier rename
 import pandas as pd
 
 import analysis_config as cfg
-import alignment_cases as align
-from analysis_core import find_trial_files, select_files
+import dpos_ctx_detection_alignment_cases as align
+from analysis_core import find_trial_files, outputs_up_to_date, select_files, sequence_csv_path
 
 
 if __name__ == '__main__':
@@ -38,6 +39,10 @@ if __name__ == '__main__':
     # Also write every model's trials into one combined CSV (None = don't).
     COMBINED_CSV = None
 
+    # A model's per-trial tables are reused when newer than its probabilities CSVs.
+    # Set True to redo them all, e.g. after changing N_SEQUENCES, SEED, or run_cfg.
+    OVERWRITE = False
+
     RUN_PER_TRIAL = True    # stage 1
     RUN_CASE_TABLE = True   # stage 2
 
@@ -50,8 +55,6 @@ if __name__ == '__main__':
         model_dir=cfg.TRAINING_RESULTS_DIR,
         output_root=OUTPUT_ROOT,
         period=cfg.PERIOD,
-        cue_seed=cfg.CUE_SEED,
-        chunk_size=cfg.CHUNK_SIZE,
         skip_trials=align.DEFAULT_SKIP_TRIALS,
         ctx_rule='argmax',
         ctx_threshold=align.DEFAULT_CTX_THRESHOLD,
@@ -63,36 +66,32 @@ if __name__ == '__main__':
         all_files = find_trial_files(TRIALS_PATH)
         if not all_files:
             raise FileNotFoundError(f"No .csv or .txt sequence files in {TRIALS_PATH}")
-        files = select_files(all_files, N_SEQUENCES, seed=SEED)
+        sequences = [f.stem for f in select_files(all_files, N_SEQUENCES, seed=SEED)]
         print(f"Found {len(all_files)} trial sequence files in {TRIALS_PATH}; "
-              f"using {len(files)}")
+              f"using {len(sequences)}")
         print(f"Models ({len(MODEL_NAMES)}): {', '.join(MODEL_NAMES)}")
         print(f"ctx report rule: {run_cfg.ctx_rule}"
               + (f" (threshold {run_cfg.ctx_threshold})"
                  if run_cfg.ctx_rule == 'threshold' else ''))
 
-        # A failure on one model (a missing checkpoint, say) should not throw away
-        # the models already done or block the ones still queued; report at the end.
-        seq_cache = {}
-        frames, failures = [], []
+        frames = []
         for i, model_name in enumerate(MODEL_NAMES, start=1):
             print(f"\n{'=' * 79}\n[{i}/{len(MODEL_NAMES)}] {model_name}\n{'=' * 79}")
-            try:
-                df, summary = align.run_one_model(model_name, files, seq_cache, run_cfg)
-                frames.append(df)
-            except Exception as exc:
-                print(f"  FAILED: {type(exc).__name__}: {exc}")
-                failures.append((model_name, exc))
+            outputs = align.alignment_outputs(OUTPUT_ROOT, model_name, run_cfg.no_summary)
+            sources = [sequence_csv_path(OUTPUT_ROOT, model_name, 'probabilities', name)
+                       for name in sequences]
+            if not OVERWRITE and outputs_up_to_date(outputs, sources):
+                print(f"  up to date, skipped: {outputs[0].name}")
+                if COMBINED_CSV:
+                    frames.append(pd.read_csv(outputs[0]))
+                continue
+            df, summary = align.run_one_model(model_name, sequences, run_cfg)
+            frames.append(df)
 
-        if COMBINED_CSV and frames:
+        if COMBINED_CSV:
             COMBINED_CSV.parent.mkdir(parents=True, exist_ok=True)
             pd.concat(frames, ignore_index=True).to_csv(COMBINED_CSV, index=False)
             print(f"\nSaved combined table: {COMBINED_CSV}")
-
-        n_ok = len(MODEL_NAMES) - len(failures)
-        print(f"\nDone: {n_ok}/{len(MODEL_NAMES)} model(s) completed.")
-        for model_name, exc in failures:
-            print(f"  FAILED {model_name}: {type(exc).__name__}: {exc}")
 
     if RUN_CASE_TABLE:
         paths = align.find_trial_tables(OUTPUT_ROOT, MODEL_NAMES)

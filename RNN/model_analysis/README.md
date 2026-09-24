@@ -3,52 +3,36 @@
 Analysis of trained RNN models, on generated test data and on the recorded
 experimental trial sequences.
 
-## Layout
+Core modules providing function and classes to be used in specific run_* modules.
 
-Five library modules, one taxonomy module, and six entry points. Nothing in the
-library modules writes output on import; everything runnable is a `run_*.py`.
 
-### Library (import these, don't run them)
+### Core
 
-| module | holds |
-| --- | --- |
-| `analysis_config.py` | the three filesystem roots, module/column naming conventions, the named model lists, figure defaults |
-| `analysis_core.py` | model loading (`ModelInfo`, `load_model`), synthetic test data, sequence I/O, the forward pass, likelihood helpers, module-activity statistics |
-| `metrics.py` | MSE / log-likelihood / calibration / ctx-dpos-rule scores, the Kalman-filter benchmark, and the evaluation drivers |
-| `plots.py` | every figure, plus `save_figure` — the one place that writes a PNG |
-| `exp_sequence_analysis.py` | running a model over the experimental sequences, and aggregating the CSVs that produces |
-| `alignment_cases.py` | the ctx/dpos detection case taxonomy and its per-trial / per-model tables |
+- `analysis_config.py`: paths to models and data, module/column naming conventions, figure defaults
+- `analysis_core.py`: model loading (`ModelInfo`, `load_model`), generation of artificial test data, experimental sequences data processing, running models' forward pass, likelihood computation, module-activity statistics
+- `metrics.py`: MSE / log-likelihood / calibration / ctx-dpos-rule scores, Kalman-filter benchmark, evaluation drivers
+- `plots.py`: figures generation functions
+- `exp_sequence_analysis.py`: run a model over the experimental sequences and analyzes ground-truth detection likelihoods
+- `dpos_ctx_detection_alignment_cases.py`: ctx/dpos detection case analysis
 
-Dependencies run one way: `analysis_config` → `analysis_core` → {`metrics`,
-`exp_sequence_analysis`, `alignment_cases`} → `plots` → the `run_*` scripts.
 
-### Entry points (run these)
+### Analysis / evaluation
 
-| script | what it does |
-| --- | --- |
-| `run_exp_trials_pipeline.py` | model → experimental sequences: the activation / deviant-activation / probability CSVs and the three activity figure sets. **The only script with a command line** (`--help`); it is the heavy batch driver. |
-| `run_exp_trials_summaries.py` | reads those CSVs back: likelihood averages per sequence, the dpos probability at the true deviant, and the per-trial activity-vs-likelihood join |
-| `run_module_correlations.py` | module-pair correlation scores, then the distribution and association figures |
-| `run_alignment_assessment.py` | ctx/dpos detection cases per trial, collapsed into one row per model |
-| `run_model_evaluation.py` | compares models on generated test data; violin and calibration figures |
-| `run_sample_figures.py` | per-sample prediction figures (synthetic and experimental) and hidden-activity trajectories |
+- `run_exp_trials_pipeline.py`: applies model on experimental sequences and produces analysis of both activation (general, and at deviant positions) and probabilities/likelihoods-
 
-Every entry point except the pipeline is configured by editing the
-`SETTINGS` block at the top of its `__main__`.
 
-## Order of operations
+- `run_exp_trials_summaries.py`: read CSVs of likelihoods and dpos probability, the dpos probability at the true deviant, and the per-trial activity-vs-likelihood join,  averages per sequence
+- `run_module_correlations.py`: compute module-pair correlation scores, produce corr. scores distribution and association figures
+- `run_sample_figures.py`: per-sample prediction figures (artificial test dataset, and experimental from the probability CSVs) and hidden-activity trajectories on synthetic data
 
-`run_exp_trials_pipeline.py` produces the CSVs the other experimental-sequence
-scripts consume, so it runs first:
+- `run_model_evaluation.py`: compare models on generated test data; log-likelihood evaluation for every module (optional KS calibration)
 
-```
-run_exp_trials_pipeline.py          # writes activations/ and probabilities*/
-  ├── run_exp_trials_summaries.py   # needs probabilities_deviant/ (+ activations_deviant/)
-  └── run_module_correlations.py    # needs activations/
-run_alignment_assessment.py         # independent: runs the model itself
-run_model_evaluation.py             # independent: generated test data only
-run_sample_figures.py               # independent
-```
+
+
+- `run_dpos_ctx_detection_alignment_cases_assessment.py`: ctx/dpos detection alignment cases per trial. Read from the probability CSVs, summarize into one row per model
+
+
+
 
 ## Figure provenance
 
@@ -67,8 +51,7 @@ metadoc entry.
 
 ## Paths
 
-`analysis_config.py` derives every root from its own location, so there are no
-absolute paths to edit:
+Paths used:
 
 - `TRAINING_RESULTS_DIR` — `RNN/training_results/N_ctx_2/HierarchicalGM`
 - `TRIALS_PATH` — `Workspace/Jasmin/trialsequences2clem`

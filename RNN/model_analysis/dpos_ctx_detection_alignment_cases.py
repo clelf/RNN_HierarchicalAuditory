@@ -8,10 +8,14 @@ questions are asked:
   2. *ctx module* -- the position at which the ctx module first calls a deviant:
      is it endorsed by the dpos module, and when?
 
+No model is run here: the module reports are read from the per-sequence
+probabilities CSVs run_exp_trials_pipeline.py writes, which hold every readout of
+the forward pass along with the ground truth it is scored against.
+
 Alignment convention
 --------------------
-The model is run on ``y[:, :-1]``, so output row ``k`` is the module's report
-*about* timestep ``k + 1``: within-trial position ``(k + 1) % period``, trial
+The model is run on ``y[:, :-1]``, so output row ``k`` (row ``k`` of a
+probabilities CSV) is the module's report *about* timestep ``k + 1``: within-trial position ``(k + 1) % period``, trial
 ``(k + 1) // period``. This is the same alignment the dpos response window uses at
 training time (``within_trial_pos = arange(1, T) % N_tones`` in
 ``pipeline_core_v2.compute_loss``), where ``rel == 0`` (the deviant timestep) and
@@ -45,14 +49,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 
 from analysis_core import (
     ModelInfo,
+    class_probability_columns,
     dpos_conventions,
-    get_module_probabilities,
-    load_model,
-    load_trial_sequence,
+    sequence_csv_path,
 )
 
 
@@ -103,7 +105,7 @@ SI_R_COLUMNS = ('si_r_fixed', 'si_r_bounds_low', 'si_r_bounds_high')
 DPOS_COLUMNS = [f'case_{code}' for code in DPOS_CASES]
 CTX_COLUMNS = [f'case_{code}' for code in CTX_CASES]
 
-DEFAULT_OUTPUT_NAME = 'alignment_case_proportions.csv'
+DEFAULT_OUTPUT_NAME = 'dpos_and_ctx_detection_case_proportions.csv'
 
 
 # =============================================================================
@@ -119,10 +121,8 @@ class AlignmentConfig:
     `analysis_config` holds the values the project normally uses.
     """
     model_dir: Path          # directory holding the trained model folders
-    output_root: Path        # <output_root>/<model>/alignment/ per model
+    output_root: Path        # reads <model>/probabilities/, writes <model>/alignment/
     period: int              # timesteps per trial
-    cue_seed: int            # cue re-encoding seed; fixed across stages
-    chunk_size: int          # sequences per batched forward pass
     skip_trials: int         # leading trials dropped per sequence
     ctx_rule: str            # one of CTX_RULES
     ctx_threshold: float     # used only by the 'threshold' rule
@@ -130,7 +130,7 @@ class AlignmentConfig:
 
 
 # =============================================================================
-# Sequence loading and the forward pass
+# Reading the module reports back
 # =============================================================================
 def si_r_columns(info):
     """The model's observation-noise setting, as columns for the output tables.
@@ -165,35 +165,6 @@ def si_r_columns(info):
             'si_r_bounds_high': float(bounds['high']) if bounds.get('high') is not None else nan}
 
 
-def load_sequences(files, n_cue_classes, cue_seed, period):
-    """Read every sequence file once, keeping what the assessment needs per trial.
-
-    The per-trial ground truth (true deviant position, rule) is constant within a
-    trial, so it is sampled at the trial's first timestep.
-    """
-    seqs = []
-    for f in files:
-        obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n = load_trial_sequence(
-            f, return_hierarch=True, n_cue_classes=n_cue_classes, cue_seed=cue_seed)
-        n_trials = obs.shape[0] // period
-        ctx_grid = ctx[:n_trials * period].reshape(n_trials, period)
-        seqs.append(dict(
-            name=f.stem,
-            obs=obs,
-            cue=cue,
-            n_trials=n_trials,
-            true_dpos=dpos[::period].astype(np.int16),
-            rule=rule[::period].astype(np.int8),
-            trial_id=np.asarray(trial_n)[::period].astype(np.int32),
-            lim_std=lim_std, d=d, tau_std=tau_std,
-            # Where the deviant actually sits, read off the trial_type column; used
-            # only to check that it agrees with the dpos column.
-            true_dev_count=(ctx_grid == 1).sum(axis=1).astype(np.int8),
-            true_dev_pos=np.argmax(ctx_grid == 1, axis=1).astype(np.int16),
-        ))
-    return seqs
-
-
 def check_ground_truth(seqs):
     """Warn if trial_type and dpos disagree about where the deviant is."""
     bad_count = sum(int((s['true_dev_count'] != 1).sum()) for s in seqs)
@@ -204,73 +175,71 @@ def check_ground_truth(seqs):
         print(f"  Warning: {bad_pos} trial(s) where trial_type==1 is not at the dpos position")
 
 
-def to_trial_grid(arr, period, fill):
-    """(N, T-1) model outputs -> (N, n_trials, period), indexed by within-trial position.
+def to_trial_grid(values, period, fill):
+    """(T-1,) per-row values of one sequence -> (n_trials, period), by within-trial position.
 
-    Output row ``k`` reports about timestep ``k + 1``, so a sentinel column is
-    prepended to put every value at the timestep it refers to. Timestep 0 has no
-    report and receives `fill`.
+    Row ``k`` reports about timestep ``k + 1``, so a sentinel is prepended to put
+    every value at the timestep it refers to. Timestep 0 has no report and
+    receives `fill`.
     """
-    n, length = arr.shape
-    padded = np.concatenate(
-        [np.full((n, 1), fill, dtype=arr.dtype), arr], axis=1)          # (N, T)
-    n_trials, remainder = divmod(padded.shape[1], period)
+    padded = np.concatenate([np.full(1, fill, dtype=values.dtype), values])   # (T,)
+    n_trials, remainder = divmod(len(padded), period)
     if remainder:
-        raise ValueError(f"sequence length {padded.shape[1]} is not a multiple of period {period}")
-    return padded.reshape(n, n_trials, period)
+        raise ValueError(f"sequence length {len(padded)} is not a multiple of period {period}")
+    return padded.reshape(n_trials, period)
 
 
-def run_model_on_sequences(model, seqs, period, chunk_size, dpos_min, dpos_shift, skip_trials):
-    """Batch `seqs` through `model` and return per-trial grids of module reports.
+def read_sequence_reports(prob_csv, name, period, dpos_min, dpos_shift):
+    """One sequence's per-trial ground truth and module reports, from its probabilities CSV.
+
+    Every per-position array is laid out as (n_trials, period), indexed by
+    within-trial position (see to_trial_grid). The per-trial ground truth
+    (true deviant position, rule, trial id) is constant within a trial, so it is
+    read at position 1, the first one every trial -- trial 0 included -- has a
+    row for.
 
     Returns
     -------
-    dpos_pred : (M, period) int16
-        Predicted deviant position (raw within-trial scale, same as the files),
-        per within-trial position.
-    ctx_lab : (M, period) int8
-        ctx module argmax label per within-trial position.
-    ctx_p1 : (M, period) float32
-        ctx module P(deviant) per within-trial position.
-    M is the number of retained trials, sequences concatenated in order.
+    dict with
+        name, n_trials, lim_std, d, tau_std
+        true_dpos, rule, trial_id : (n_trials,) per-trial ground truth; true_dpos
+            on the raw within-trial scale of the sequence files
+        true_dev_count, true_dev_pos : (n_trials,) where the ctx labels put the
+            deviant, used only to check that they agree with true_dpos; timestep 0
+            has no row and counts as no deviant
+        dpos_pred : (n_trials, period) int16 predicted deviant position (raw
+            within-trial scale), NO_REPORT at timestep 0
+        ctx_lab : (n_trials, period) int8 ctx module argmax label
+        ctx_p1 : (n_trials, period) float32 ctx module P(deviant)
     """
-    lengths = {s['obs'].shape[0] for s in seqs}
-    if len(lengths) != 1:
-        raise ValueError(
-            f"sequences have differing lengths {sorted(lengths)}; batching them would "
-            "require truncation, which would silently change the trial grid")
+    df = pd.read_csv(prob_csv)
 
     # class c -> model-convention position c + dpos_min -> raw file position minus the shift
     class_to_position = dpos_min - dpos_shift
+    dpos_cls = df[class_probability_columns(df.columns, 'dpos')].to_numpy().argmax(axis=1)
+    ctx_probs = df[class_probability_columns(df.columns, 'ctx')].to_numpy()
 
-    dpos_chunks, lab_chunks, p1_chunks = [], [], []
-    for start in range(0, len(seqs), chunk_size):
-        chunk = seqs[start:start + chunk_size]
-        y = torch.tensor(np.stack([s['obs'] for s in chunk]),
-                         dtype=torch.float32).unsqueeze(-1)             # (N, T, 1)
-        q = torch.tensor(np.stack([s['cue'] for s in chunk]),
-                         dtype=torch.float32)                           # (N, T, n_cue)
+    # Sentinels for the unreported timestep 0: a dpos position no trial can have,
+    # "no deviant" for the ctx label, and a probability below any threshold.
+    dpos_pred = to_trial_grid((dpos_cls + class_to_position).astype(np.int16), period, NO_REPORT)
+    ctx_lab = to_trial_grid(ctx_probs.argmax(axis=1).astype(np.int8), period, 0)
+    ctx_p1 = to_trial_grid(ctx_probs[:, 1].astype(np.float32), period, -1.0)
 
-        probs = get_module_probabilities(model, y, q)                   # (T-1, N, dim)
-        dpos_cls = np.argmax(probs['dpos'], axis=-1).T.astype(np.int16)  # (N, T-1)
-        ctx_lab = np.argmax(probs['ctx'], axis=-1).T.astype(np.int8)     # (N, T-1)
-        ctx_p1 = probs['ctx'][:, :, 1].T.astype(np.float32)              # (N, T-1)
-
-        # Sentinels for the unreported timestep 0: a dpos position no trial can have,
-        # "no deviant" for the ctx label, and a probability below any threshold.
-        dpos_pos = (dpos_cls + class_to_position).astype(np.int16)       # (N, T-1)
-        dpos_grid = to_trial_grid(dpos_pos, period, NO_REPORT)
-        lab_grid = to_trial_grid(ctx_lab, period, 0)
-        p1_grid = to_trial_grid(ctx_p1, period, -1.0)
-
-        dpos_chunks.append(dpos_grid[:, skip_trials:, :].reshape(-1, period))
-        lab_chunks.append(lab_grid[:, skip_trials:, :].reshape(-1, period))
-        p1_chunks.append(p1_grid[:, skip_trials:, :].reshape(-1, period))
-        print(f"  processed {min(start + chunk_size, len(seqs))}/{len(seqs)} sequences")
-
-    return (np.concatenate(dpos_chunks, axis=0),
-            np.concatenate(lab_chunks, axis=0),
-            np.concatenate(p1_chunks, axis=0))
+    ctx_grid = to_trial_grid(df['ctx'].to_numpy(), period, 0)
+    return dict(
+        name=name,
+        n_trials=dpos_pred.shape[0],
+        lim_std=df['lim_std'].iloc[0], d=df['d'].iloc[0], tau_std=df['tau_std'].iloc[0],
+        # The CSV's dpos column is in the model's convention; shift it back.
+        true_dpos=(to_trial_grid(df['dpos'].to_numpy(), period, 0)[:, 1] - dpos_shift).astype(np.int16),
+        rule=to_trial_grid(df['rule'].to_numpy(), period, 0)[:, 1].astype(np.int8),
+        trial_id=to_trial_grid(df['trial_n'].to_numpy(), period, 0)[:, 1].astype(np.int32),
+        true_dev_count=(ctx_grid == 1).sum(axis=1).astype(np.int8),
+        true_dev_pos=np.argmax(ctx_grid == 1, axis=1).astype(np.int16),
+        dpos_pred=dpos_pred,
+        ctx_lab=ctx_lab,
+        ctx_p1=ctx_p1,
+    )
 
 
 # =============================================================================
@@ -475,49 +444,61 @@ def build_summary_frame(df, model_name):
     return pd.DataFrame(rows)
 
 
-def run_one_model(model_name, files, seq_cache, cfg):
-    """Assess one model over every sequence file; returns (trial frame, summary frame)."""
-    model_path = cfg.model_dir / model_name
-    info = ModelInfo.from_path(model_path)
-    model = load_model(info)
-    model.eval()
+def alignment_outputs(output_root, model_name, no_summary):
+    """The per-trial table and, unless `no_summary`, the case-count summary of one model."""
+    out_dir = output_root / model_name / 'alignment'
+    outputs = [out_dir / f"{model_name}_trial_alignment.csv"]
+    if not no_summary:
+        outputs.append(out_dir / f"{model_name}_alignment_summary.csv")
+    return outputs
 
-    n_cue_classes = len(info.data_config_dict['cues_set'])
+
+def run_one_model(model_name, sequences, cfg):
+    """Assess one model over the named sequences; returns (trial frame, summary frame).
+
+    `sequences` are the stems of the original sequence files; each must have a
+    probabilities CSV under <output_root>/<model_name>/probabilities/.
+    """
+    # Only the config is read: the checkpoint's weights are not needed.
+    info = ModelInfo.from_path(cfg.model_dir / model_name)
     dpos_min, dpos_shift = dpos_conventions(info)
     si_r = si_r_columns(info)
-    print(f"Loaded model: {model_name}")
-    print(f"  cue classes: {n_cue_classes}; dpos class-index offset: {dpos_min}; "
-          f"experimental dpos shift: +{dpos_shift}")
+    print(f"Model: {model_name}")
+    print(f"  dpos class-index offset: {dpos_min}; experimental dpos shift: +{dpos_shift}")
     print("  sigma_r: " + (f"pinned at {si_r['si_r_fixed']}"
                            if si_r['si_r_fixed'] == si_r['si_r_fixed']
                            else f"sampled from [{si_r['si_r_bounds_low']}, "
                                 f"{si_r['si_r_bounds_high']}]"))
 
-    # Sequence loading depends only on the cue encoding, so models that share it
-    # (all of DEFAULT_MODEL_NAMES do) read the 1600+ CSVs once between them.
-    key = (n_cue_classes, cfg.cue_seed)
-    if key not in seq_cache:
-        print(f"  reading {len(files)} sequence file(s) (cue encoding {key})")
-        seq_cache[key] = load_sequences(files, n_cue_classes, cfg.cue_seed, cfg.period)
-        check_ground_truth(seq_cache[key])
-    seqs = seq_cache[key]
+    prob_files = [sequence_csv_path(cfg.output_root, model_name, 'probabilities', name)
+                  for name in sequences]
+    missing = [f for f in prob_files if not f.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)}/{len(prob_files)} probabilities CSV(s) missing for {model_name} "
+            f"(first: {missing[0]}) — run run_exp_trials_pipeline.py with the "
+            "'probabilities' stage first")
 
-    dpos_pred, ctx_lab, ctx_p1 = run_model_on_sequences(
-        model, seqs, cfg.period, cfg.chunk_size, dpos_min, dpos_shift, cfg.skip_trials)
+    print(f"  reading {len(prob_files)} probabilities CSV(s)")
+    seqs = [read_sequence_reports(f, name, cfg.period, dpos_min, dpos_shift)
+            for f, name in zip(prob_files, sequences)]
+    check_ground_truth(seqs)
+
+    dpos_pred, ctx_lab, ctx_p1 = (
+        np.concatenate([s[key][cfg.skip_trials:] for s in seqs], axis=0)
+        for key in ('dpos_pred', 'ctx_lab', 'ctx_p1'))
 
     df = build_trial_frame(model_name, si_r, seqs, cfg.skip_trials,
                            dpos_pred, ctx_lab, ctx_p1, cfg)
     summary = build_summary_frame(df, model_name)
 
-    out_dir = cfg.output_root / model_name / 'alignment'
-    out_dir.mkdir(parents=True, exist_ok=True)
-    trial_file = out_dir / f"{model_name}_trial_alignment.csv"
-    df.to_csv(trial_file, index=False)
-    print(f"  Saved: {trial_file}  ({len(df)} trials)")
+    outputs = alignment_outputs(cfg.output_root, model_name, cfg.no_summary)
+    outputs[0].parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(outputs[0], index=False)
+    print(f"  Saved: {outputs[0]}  ({len(df)} trials)")
     if not cfg.no_summary:
-        summary_file = out_dir / f"{model_name}_alignment_summary.csv"
-        summary.to_csv(summary_file, index=False)
-        print(f"  Saved: {summary_file}")
+        summary.to_csv(outputs[1], index=False)
+        print(f"  Saved: {outputs[1]}")
 
     for family in ('dpos', 'ctx'):
         part = summary[summary['family'] == family]

@@ -6,7 +6,9 @@ Three stages, each toggled in the SETTINGS block:
                         benchmark pickle, which also supplies the KF overlay)
                         -> evaluation_results/example_samples/
   experimental samples  the same figure on the recorded trial sequences, one
-                        figure per sequence so each is named after its file
+                        figure per sequence so each is named after its file; the
+                        predictions are read from the probabilities CSVs
+                        run_exp_trials_pipeline.py writes, not recomputed
                         -> <output-root>/<model>/samples/
   hidden activity       per-module activity trajectories on synthetic data, plus
                         the module-independence metrics written as a .txt
@@ -26,6 +28,7 @@ import pandas as pd
 import torch
 
 import analysis_config as cfg
+import exp_sequence_analysis as exp
 import metrics
 import plots
 from analysis_core import (
@@ -39,6 +42,7 @@ from analysis_core import (
     load_model,
     load_trial_params,
     load_trial_sequence,
+    sequence_csv_path,
 )
 
 # analysis_core has already put RNN/train on sys.path.
@@ -150,88 +154,54 @@ def draw_synthetic_samples(info, output_dir, n_samples, n_plots, rng,
     )
 
 
-def draw_experimental_samples(info, model_name, selected_files, output_dir, seed):
-    """plot_samples on the recorded sequences, one figure per sequence file."""
-    model = load_model(info)
-    model.eval()
+def draw_experimental_samples(info, model_name, selected_files, output_root, output_dir, seed):
+    """plot_samples on the recorded sequences, one figure per sequence file.
+
+    Ground truth comes from the sequence files and the model's predictions from
+    the probabilities CSVs under <output_root>/<model_name>/, so no model is run.
+    """
     data_config = info.data_config_dict
     n_cue_classes = len(data_config['cues_set'])
     # dpos_min is the class-index offset; dpos_shift maps the on-disk experimental
     # dpos into the model's convention so dpos_true and dpos_pred share coordinates.
     dpos_min, dpos_shift = dpos_conventions(info)
 
-    obs_list, cue_list, ctx_list, dpos_list, rule_list = [], [], [], [], []
-    tau_list, lim_list, si_q_list, si_stat_list, si_r_list = [], [], [], [], []
-
     for f in selected_files:
-        obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n = load_trial_sequence(
+        obs, cue, ctx, dpos, rule, *_ = load_trial_sequence(
             f, return_hierarch=True, n_cue_classes=n_cue_classes,
             cue_seed=cfg.CUE_SEED)
-        obs_list.append(obs)
-        cue_list.append(cue)
-        ctx_list.append(ctx)
-        dpos_list.append(dpos + dpos_shift)
-        rule_list.append(rule)
+        prob_df = pd.read_csv(sequence_csv_path(output_root, model_name, 'probabilities', f.stem))
+
+        sample_metrics = {
+            'y': obs[None].astype(np.float32),
+            'kalman_mu': None,
+            'kalman_sigma': None,
+            'contexts': ctx[None],
+            'dpos_true': (dpos + dpos_shift)[None],
+            'rule_true': rule[None],
+            'cues': cue[None],
+            **exp.predictions_from_probabilities(prob_df, dpos_min),
+        }
 
         # Per-sequence scalars for the figure title (n_ctx == 2 expects std/dev
-        # pairs for tau, lim and si_q).
+        # pairs for tau, lim and si_q), each with a batch dimension of one.
         row = pd.read_csv(f, nrows=1).iloc[0]
         params = load_trial_params(f)
-        tau_list.append([float(row['tau_std']), float(row['tau_dev'])])
-        lim_list.append([float(row['lim_std']), float(row['lim_dev'])])
-        si_q_list.append([float(row['sigma_q_std']), float(row['sigma_q_dev'])])
-        si_stat_list.append(params['si_stat'])
-        si_r_list.append(params['si_r'])
+        seq_params = {
+            'tau': np.array([[row['tau_std'], row['tau_dev']]], dtype=float),
+            'lim': np.array([[row['lim_std'], row['lim_dev']]], dtype=float),
+            'si_q': np.array([[row['sigma_q_std'], row['sigma_q_dev']]], dtype=float),
+            'si_stat': np.array([params['si_stat']], dtype=float),
+            'si_r': np.array([params['si_r']], dtype=float),
+        }
 
-    obs_np = np.stack(obs_list).astype(np.float32)
-    cue_np = np.stack(cue_list).astype(np.float32)
-    ctx_np, dpos_np, rule_np = np.stack(ctx_list), np.stack(dpos_list), np.stack(rule_list)
-
-    y = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(-1)
-    q = torch.tensor(cue_np, dtype=torch.float32)
-
-    all_params = {
-        'tau': np.asarray(tau_list, dtype=float),
-        'lim': np.asarray(lim_list, dtype=float),
-        'si_q': np.asarray(si_q_list, dtype=float),
-        'si_stat': np.asarray(si_stat_list, dtype=float),
-        'si_r': np.asarray(si_r_list, dtype=float),
-    }
-
-    with torch.no_grad():
-        model_output = model(y[:, :-1, :], q[:, :-1, :])
-        predictions = get_model_predictions(model, model_output, dpos_min=dpos_min)
-
-    sample_metrics = {
-        'y': obs_np,
-        'mu_estim': predictions['mu_estim'],
-        'sigma_estim': predictions['sigma_estim'],
-        'kalman_mu': None,
-        'kalman_sigma': None,
-        'contexts': ctx_np,
-        'ctx_prob': predictions['ctx_prob'],
-        'ctx_pred': predictions['ctx_pred'],
-        'dpos_true': dpos_np,
-        'dpos_prob': predictions['dpos_prob'],
-        'dpos_pred': predictions['dpos_pred'],
-        'rule_true': rule_np,
-        'rule_prob': predictions['rule_prob'],
-        'rule_pred': predictions['rule_pred'],
-        'cues': cue_np,
-    }
-
-    # plot_samples names figures {save_path}_s{id}.png and picks the batch rows
-    # itself, so a single batched call cannot tie a figure back to its source
-    # file. One length-1 batch per call instead, named after that sequence.
-    for j, src in enumerate(selected_files):
-        seq_metrics = {k: (None if v is None else v[j:j + 1])
-                       for k, v in sample_metrics.items()}
-        seq_params = {k: v[j:j + 1] for k, v in all_params.items()}
+        # plot_samples names figures {save_path}_s{id}.png and picks the batch rows
+        # itself, so one length-1 batch per call ties each figure to its source file.
         np.random.seed(seed)
         plot_samples(
-            sample_metrics=seq_metrics,
-            save_path=str(output_dir / src.stem),
-            title=f"Samples (exp. trials) – {model_name} – {src.stem}",
+            sample_metrics=sample_metrics,
+            save_path=str(output_dir / f.stem),
+            title=f"Samples (exp. trials) – {model_name} – {f.stem}",
             N_plots=1,
             seq_start=None,
             seq_end=None,
@@ -279,7 +249,7 @@ if __name__ == '__main__':
     plots.set_script_path(__file__)
 
     # ------------------------- SETTINGS (edit these) -------------------------
-    MODEL_NAMES = cfg.SIGMA_R_SWEEP_MODELS
+    MODEL_NAMES = cfg.FIXED_SIGMA_R_MODELS
     MODEL_DIR = cfg.TRAINING_RESULTS_DIR
 
     RUN_SYNTHETIC = True
@@ -337,7 +307,8 @@ if __name__ == '__main__':
             out_dir = cfg.EXP_SEQ_OUTPUT_ROOT / model_name / 'samples'
             out_dir.mkdir(parents=True, exist_ok=True)
             print(f"\n=== {model_name}")
-            draw_experimental_samples(info, model_name, selected_files, out_dir, SEED)
+            draw_experimental_samples(info, model_name, selected_files,
+                                      cfg.EXP_SEQ_OUTPUT_ROOT, out_dir, SEED)
 
     if RUN_HIDDEN_ACTIVITY:
         print(f"\n{'=' * 79}\nHidden activity\n{'=' * 79}")

@@ -24,6 +24,23 @@ import pandas as pd
 import analysis_config as cfg
 import exp_sequence_analysis as exp
 import plots
+from analysis_core import model_sequence_csvs, outputs_up_to_date
+
+# Figures each figure stage writes to <model>/module_correlations/ (their names
+# are set inside plots.py), used to tell whether the stage is up to date.
+PAIR_FIGURES = [
+    'obs_ctx__by_lim_std.png', 'obs_ctx__by_d_tau_std.png', 'obs_dpos__by_lim_std.png',
+    'ctx_dpos__by_lim_std_d_tau_std.png', 'ctx_dpos__by_lim_std_d.png',
+    'ctx_rule__by_lim_std_d_tau_std.png', 'ctx_rule__by_lim_std_d.png',
+    'dpos_rule__by_lim_std_d_tau_std.png', 'mean__by_lim_std_d.png',
+    'mean__by_tau_std_per_lim_std_d.png', 'mean__by_lim_std_d_tau_std.png',
+    'pairs_vs_mean__density.png', 'pairs_vs_mean__scatter.png',
+]
+ASSOCIATION_FIGURES = [
+    'sequence_matrix__by_lim_std_d.png', 'sequence_matrix__by_lim_std_d_tau_std.png',
+    'timestep_matrix__first_sequence.png', 'timestep_matrix__mean_over_sequences.png',
+    'timestep_matrix__by_position.png', 'timestep_matrix__by_position_gradient.png',
+]
 
 
 def build_correlation_scores(activations_dir):
@@ -105,12 +122,16 @@ if __name__ == '__main__':
     # ------------------------- SETTINGS (edit these) -------------------------
     # Each model must own an <output-root>/<model>/activations folder filled by
     # run_exp_trials_pipeline.py.
-    MODEL_NAMES = cfg.SIGMA_R_SWEEP_MODELS
+    MODEL_NAMES = cfg.FIXED_SIGMA_R_MODELS
     OUTPUT_ROOT = cfg.EXP_SEQ_OUTPUT_ROOT
 
     RUN_SCORES = True
     RUN_PAIR_FIGURES = True
     RUN_ASSOCIATIONS = True
+
+    # A stage is skipped when all its outputs exist and are newer than its inputs.
+    # Set True to redo every stage regardless.
+    OVERWRITE = False
     # -------------------------------------------------------------------------
 
     for model_name in MODEL_NAMES:
@@ -123,8 +144,12 @@ if __name__ == '__main__':
         if not activations_dir.is_dir():
             print(f"  SKIPPED: no activations folder at {activations_dir}")
             continue
+        activation_csvs = model_sequence_csvs(OUTPUT_ROOT, model_name, 'activations')
+        score_outputs = [correlation_csv, correlation_csv.parent / "score_histograms.png"]
 
-        if RUN_SCORES:
+        if RUN_SCORES and not OVERWRITE and outputs_up_to_date(score_outputs, activation_csvs):
+            print(f"[scores] up to date, skipped: {correlation_csv}")
+        elif RUN_SCORES:
             print("[scores] per-sequence module-pair correlations")
             scores = build_correlation_scores(activations_dir)
             if scores.empty:
@@ -136,7 +161,11 @@ if __name__ == '__main__':
                 fig = plots.plot_score_histograms(scores)
                 plots.save_figure(fig, correlation_csv.parent, "score_histograms.png")
 
-        if RUN_PAIR_FIGURES:
+        pair_outputs = [figures_dir / name for name in PAIR_FIGURES]
+        if (RUN_PAIR_FIGURES and not OVERWRITE and correlation_csv.exists()
+                and outputs_up_to_date(pair_outputs, [correlation_csv])):
+            print("[pair figures] up to date, skipped")
+        elif RUN_PAIR_FIGURES:
             print("[pair figures] score distributions over the generative parameters")
             if not correlation_csv.exists():
                 print(f"  SKIPPED: no correlation table at {correlation_csv}")
@@ -145,7 +174,11 @@ if __name__ == '__main__':
                 print(f"  loaded {len(act_df)} sequence(s) from {correlation_csv.name}")
                 draw_pair_correlation_figures(act_df, figures_dir)
 
-        if RUN_ASSOCIATIONS:
+        association_outputs = [figures_dir / name for name in ASSOCIATION_FIGURES]
+        if (RUN_ASSOCIATIONS and not OVERWRITE
+                and outputs_up_to_date(association_outputs, activation_csvs)):
+            print("[associations] up to date, skipped")
+        elif RUN_ASSOCIATIONS:
             print("[associations] module-to-module scatter matrices")
             seq_files = exp.list_sequence_files(activations_dir)
             if not seq_files:

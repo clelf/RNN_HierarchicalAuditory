@@ -4,3 +4,7 @@
 *.pyc
 *.csv
 *.zip
+*.pkl
+*.out
+*.err
+*.json

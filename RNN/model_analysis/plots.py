@@ -379,9 +379,8 @@ def plot_averaged_activity_by_position(module_norms_dict, module_titles, output_
     return fig
 
 
-def plot_deviant_activity_by_position(module_norms_dict, dev_pos, module_titles,
-                                      output_dir, model_name, n_samples, period=8,
-                                      include_derivatives=False, show_std=True):
+def plot_deviant_activity_by_position(dev_df, module_titles, output_dir, model_name,
+                                      n_samples, include_derivatives=False, show_std=True):
     """Plot per-module activity at each trial's deviant position, grouped by deviant value.
 
     Like :func:`plot_averaged_activity_by_position` the x-axis is the trial index,
@@ -395,28 +394,27 @@ def plot_deviant_activity_by_position(module_norms_dict, dev_pos, module_titles,
 
     Parameters
     ----------
-    module_norms_dict : dict
-        Module name → norms array of shape (seq_len, n_seq).
-    dev_pos : np.ndarray
-        Shape (n_seq, n_trials) — 0-based within-trial deviant position per
-        sequence and trial.
+    dev_df : pandas.DataFrame
+        One row per (sequence, trial): the per-trial deviant-activity CSVs of the
+        sequences to average over, concatenated, with '<module>_norm' /
+        '<module>_deriv' columns sampled at the deviant, 'trial_n', and 'dev_pos'
+        (0-based within-trial deviant position; see
+        exp_sequence_analysis.load_deviant_activity_frame).
     module_titles : dict
-        Module name → display title.
+        Module name → display title; one subplot per module, in this order.
     output_dir : Path
         Output directory (kept for signature parity; saving is done by the caller).
     model_name : str
         Model name (used only for context; the caller handles file names).
     n_samples : int
         Number of sequences (shown in the title).
-    period : int
-        Timesteps per trial. Default 8.
     include_derivatives : bool
         If True, plot temporal derivatives instead of raw activity.
     show_std : bool
         If True (default), shade ±STD across the contributing sequences around
         each deviant-value series. Set False if the bands overlap too much.
     """
-    n_modules = len(module_norms_dict)
+    n_modules = len(module_titles)
 
     fig, axes = plt.subplots(n_modules, 1, figsize=(10, 3 * n_modules), sharex=True)
     if n_modules == 1:
@@ -431,19 +429,17 @@ def plot_deviant_activity_by_position(module_norms_dict, dev_pos, module_titles,
 
     cmap = plt.get_cmap('tab10')
 
-    for ax, (module_name, norms) in zip(axes, module_norms_dict.items()):
+    for ax, module_name in zip(axes, module_titles):
         if include_derivatives:
-            data = compute_derivatives(norms)
+            column = f'{module_name}_deriv'
             ylabel = 'dActivity/dt'
         else:
-            data = norms
+            column = f'{module_name}_norm'
             ylabel = 'Activity (L2 norm)'
 
-        by_dev = extract_deviant_activity(data, dev_pos, period=period)
+        by_dev = extract_deviant_activity(dev_df, column)
         for v in sorted(by_dev):
             rec = by_dev[v]
-            if rec['trials'].size == 0:
-                continue
             color = cmap(v % 10)
             ax.plot(rec['trials'], rec['mean'], linestyle='-',
                     color=color, label=f'pos {v + 1}')

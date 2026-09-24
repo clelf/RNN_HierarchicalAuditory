@@ -5,10 +5,11 @@ Four groups, in order:
   1. Model access      -- ModelInfo (config discovery + loading), load_model,
                           discover_models, infer_bottleneck_dim_from_weights.
   2. Synthetic data    -- generate_test_data, from a model's own training config.
-  3. Sequence I/O and  -- find_trial_files, select_files, load_trial_sequence,
-     the forward pass     to_model_tensors, load_trial_params, dpos_conventions,
-                          run_forward_pass, get_module_output_and_activity,
-                          get_module_probabilities,
+  3. Sequence I/O and  -- find_trial_files, select_files, sequence_csv_path,
+     the forward pass     model_sequence_csvs, outputs_up_to_date,
+                          class_probability_columns, load_trial_sequence,
+                          load_trial_params, dpos_conventions,
+                          get_module_output_and_activity,
                           module_probabilities_from_output, group_by_module.
   4. Numerics          -- gaussian_likelihood, class_likelihood,
                           compute_derivatives, gather_at.
@@ -53,7 +54,7 @@ from pipeline_core_v2 import (
 from config_v2 import RunConfig, DataConfig as TrainDataConfig
 from PreProParadigm.audit_gm import NonHierarchicalAuditGM, HierarchicalAuditGM
 
-from analysis_config import CUE_LABELS, EXPERIMENTAL_DPOS_MIN
+from analysis_config import CUE_LABELS, EXPERIMENTAL_DPOS_MIN, SEQUENCE_CSV_SUFFIXES
 
 
 # =============================================================================
@@ -546,6 +547,43 @@ def select_files(all_files, n_sequences, seed=0):
     return sorted(rng.choice(all_files, size=n_sequences, replace=False).tolist())
 
 
+def sequence_csv_path(output_root, model_name, kind, sequence):
+    """Where run_exp_trials_pipeline.py writes one sequence's CSV of a given kind.
+
+    `kind` is a key of SEQUENCE_CSV_SUFFIXES and `sequence` the stem of the
+    original sequence file.
+    """
+    return output_root / model_name / kind / (sequence + SEQUENCE_CSV_SUFFIXES[kind])
+
+
+def model_sequence_csvs(output_root, model_name, kind):
+    """Every per-sequence CSV of one kind a model has, sorted."""
+    return sorted((output_root / model_name / kind).glob('*' + SEQUENCE_CSV_SUFFIXES[kind]))
+
+
+def outputs_up_to_date(outputs, sources):
+    """True when every output exists and none is older than any of its sources.
+
+    Lets an entry point skip a stage whose results already reflect their inputs,
+    while still redoing it once those inputs have been rewritten (e.g. by a
+    later run of run_exp_trials_pipeline.py).
+    """
+    if not all(p.exists() for p in outputs):
+        return False
+    oldest_output = min(p.stat().st_mtime for p in outputs)
+    return all(p.stat().st_mtime <= oldest_output for p in sources)
+
+
+def class_probability_columns(columns, module):
+    """The '<module>_p<c>' columns of a probabilities CSV, in class order.
+
+    Built from the class count rather than sorted by name, so class 10 cannot
+    land between classes 1 and 2.
+    """
+    n_classes = sum(c.startswith(f'{module}_p') for c in columns)
+    return [f'{module}_p{c}' for c in range(n_classes)]
+
+
 # =============================================================================
 # Sequence I/O and model conventions
 # =============================================================================
@@ -616,13 +654,6 @@ def load_trial_sequence(filepath, return_hierarch=False, n_cue_classes=None, cue
     return obs, cue, lim_std, d, tau_std, trial_n
 
 
-def to_model_tensors(obs, cue):
-    """Convert observation (T,) and one-hot cue (T, 2) arrays to (1, T, dim) float tensors."""
-    y = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
-    q = torch.tensor(cue, dtype=torch.float32).unsqueeze(0)                # (1, T, 2)
-    return y, q
-
-
 def load_trial_params(filepath):
     """Extract scalar trial parameters from a sequence CSV file.
 
@@ -680,54 +711,6 @@ def group_by_module(group):
     return {'obs': obs, 'ctx': ctx, 'dpos': dpos, 'rule': rule}
 
 
-def run_forward_pass(model, y, q, return_prior=False):
-    """Run a forward pass and return raw module outputs and hidden states per module.
-
-    Parameters
-    ----------
-    model : nn.Module
-        Trained model that accepts return_hidden=True.
-    y : torch.Tensor
-        Observation sequences, shape (batch, seq_len, obs_dim).
-    q : torch.Tensor
-        Query sequences, shape (batch, seq_len, q_dim).
-    return_prior : bool
-        If True, also return the prior readouts and prior hidden states, i.e. the
-        output and the state each module holds after its first call, before the
-        feedback sweep of that timestep has reached it.
-
-    Returns
-    -------
-    prob_output : dict
-        Module name → posterior readout tensor, shape (batch, seq_len, out_dim).
-    hidden_states : dict
-        Module name → tensor of shape (seq_len, n_layers, batch, hidden_dim), the
-        state each module ends the timestep with.
-    prior_output : dict
-        Module name → prior readout tensor. Returned only when return_prior=True.
-    prior_hidden_states : dict
-        Module name → prior hidden state tensor, same shape as hidden_states.
-        Returned only when return_prior=True.
-    """
-    with torch.no_grad():
-        forward_output = model(y[:, :-1, :], q[:, :-1, :],
-                               return_hidden=True, return_prior=return_prior)
-
-    # The forward output is made of groups of four (one entry per module), in the
-    # order: posterior readouts, prior readouts, posterior hidden states, prior
-    # hidden states -- the prior groups being present only when asked for.
-    prob_output = group_by_module(forward_output[:4])
-
-    if return_prior:
-        prior_output = group_by_module(forward_output[4:8])
-        hidden_states = group_by_module(forward_output[8:12])
-        prior_hidden_states = group_by_module(forward_output[12:16])
-        return prob_output, hidden_states, prior_output, prior_hidden_states
-
-    hidden_states = group_by_module(forward_output[4:8])
-    return prob_output, hidden_states
-
-
 def compute_hidden_norms(hidden_states, layer_idx=-1):
     """Compute L2 norms across neuron units for one layer of each module.
 
@@ -751,10 +734,12 @@ def compute_hidden_norms(hidden_states, layer_idx=-1):
 
 
 def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False):
-    """Return per-module hidden activity norms and their temporal derivatives.
+    """Per-module output probabilities, hidden activity norms and their derivatives.
 
-    Runs a single forward pass with return_hidden=True, selects the requested
-    layer, reduces across neuron units with an L2 norm, and differentiates.
+    One forward pass with return_hidden=True serves both: the readouts are
+    post-processed into probabilities exactly as in training and evaluation (see
+    module_probabilities_from_output), and the hidden states of the requested
+    layer are reduced across neuron units with an L2 norm, then differentiated.
 
     Parameters
     ----------
@@ -768,47 +753,54 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False
         Which RNN layer to extract. Default: -1 (last layer).
     return_prior : bool
         If True, also return the same three quantities computed on the prior
-        (first-call) readouts and hidden states, as three further elements.
+        (first-call) readouts and hidden states, i.e. what each module holds after
+        its first call, before the feedback sweep of that timestep has reached it.
 
     Returns
     -------
-    prob_output : dict
-        Module name → posterior readout tensor.
+    probabilities : dict
+        Module name → ndarray of shape (seq_len, batch, dim), from the posterior
+        readouts:
+        - 'obs':  dim = 2, columns are (mean, variance) -- a *variance*, the
+          quantity passed to GaussianNLLLoss at training time
+        - others: dim = n_classes, softmax class probabilities
     hidden_activity : dict
         Module name → ndarray of shape (seq_len, batch).
     hidden_derivatives : dict
         Module name → ndarray of shape (seq_len-1, batch).
-    prior_output : dict
-        Module name → prior readout tensor. Returned only when return_prior=True.
-    prior_activity : dict
-        Module name → ndarray of shape (seq_len, batch), norms of the prior hidden
-        states. Returned only when return_prior=True.
-    prior_derivatives : dict
-        Module name → ndarray of shape (seq_len-1, batch). Returned only when
+    prior_probabilities, prior_activity, prior_derivatives : dict
+        The same, from the prior readouts and hidden states. Returned only when
         return_prior=True.
     """
-    if return_prior:
-        prob_output, hidden_states, prior_output, prior_hidden_states = run_forward_pass(
-            model, y, q, return_prior=True)
-    else:
-        prob_output, hidden_states = run_forward_pass(model, y, q)
+    with torch.no_grad():
+        forward_output = model(y[:, :-1, :], q[:, :-1, :],
+                               return_hidden=True, return_prior=return_prior)
 
+    # The forward output is made of groups of four (one entry per module), in the
+    # order: posterior readouts, prior readouts, posterior hidden states, prior
+    # hidden states -- the prior groups being present only when asked for.
+    hidden_start = 8 if return_prior else 4
+
+    probabilities = module_probabilities_from_output(model, forward_output, prior=False)
+    hidden_states = group_by_module(forward_output[hidden_start:hidden_start + 4])
     hidden_activity = compute_hidden_norms(hidden_states, layer_idx=layer_idx)
     hidden_derivatives = {name: compute_derivatives(norms) for name, norms in hidden_activity.items()}
 
     if return_prior:
+        prior_probabilities = module_probabilities_from_output(model, forward_output, prior=True)
+        prior_hidden_states = group_by_module(forward_output[12:16])
         prior_activity = compute_hidden_norms(prior_hidden_states, layer_idx=layer_idx)
         prior_derivatives = {name: compute_derivatives(norms) for name, norms in prior_activity.items()}
-        return (prob_output, hidden_activity, hidden_derivatives,
-                prior_output, prior_activity, prior_derivatives)
+        return (probabilities, hidden_activity, hidden_derivatives,
+                prior_probabilities, prior_activity, prior_derivatives)
 
-    return prob_output, hidden_activity, hidden_derivatives
+    return probabilities, hidden_activity, hidden_derivatives
 
 
 def module_probabilities_from_output(model, model_output, prior=False):
     """Post-process one forward output into per-module probabilities.
 
-    Shared by get_module_probabilities for the posterior and the prior readouts;
+    Shared by get_module_output_and_activity for the posterior and the prior readouts;
     the post-processing itself is delegated to pipeline_core_v2.get_model_predictions
     so both passes are read exactly as in training and evaluation.
 
@@ -842,51 +834,6 @@ def module_probabilities_from_output(model, model_output, prior=False):
         'dpos': np.transpose(pred['dpos_prob'], (1, 0, 2)),
         'rule': np.transpose(pred['rule_prob'], (1, 0, 2)),
     }
-
-
-def get_module_probabilities(model, y, q, return_prior=False):
-    """Return per-module output probabilities/distribution parameters.
-
-    Runs a standard forward pass and delegates the output post-processing to
-    pipeline_core_v2.get_model_predictions, so the observation mean/variance and
-    the class probabilities are computed exactly as in training and evaluation
-    (single source of truth). In particular:
-
-    - 'obs' is a regressor: the returned columns are (mean, variance), where the
-      variance is get_model_predictions' var_estim = softplus(raw) + 1e-6. This
-      is a *variance* (the same quantity passed to GaussianNLLLoss at training
-      time), not a standard deviation.
-    - the remaining modules are classifiers: softmax class probabilities.
-
-    Parameters
-    ----------
-    model : nn.Module
-        Trained model.
-    y : torch.Tensor
-        Observation sequences, shape (batch, seq_len, obs_dim).
-    q : torch.Tensor
-        Query sequences, shape (batch, seq_len, q_dim).
-    return_prior : bool
-        If True, also return the same quantities computed on the prior
-        (first-call) readouts, as a second dict.
-
-    Returns
-    -------
-    probabilities : dict
-        Module name → ndarray of shape (seq_len, batch, dim), from the posterior
-        readouts:
-        - 'obs':  dim = 2, columns are (mean, variance)
-        - others: dim = n_classes, softmax class probabilities
-    prior_probabilities : dict
-        Same, from the prior readouts. Returned only when return_prior=True.
-    """
-    with torch.no_grad():
-        model_output = model(y[:, :-1, :], q[:, :-1, :], return_prior=return_prior)
-
-    probabilities = module_probabilities_from_output(model, model_output, prior=False)
-    if return_prior:
-        return probabilities, module_probabilities_from_output(model, model_output, prior=True)
-    return probabilities
 
 
 def extract_sample_parameters(pars, sample_idx):
@@ -1083,24 +1030,21 @@ def reshape_norms_by_position(data, period=8):
     return by_pos
 
 
-def extract_deviant_activity(data, dev_pos, period=8):
-    """Pick the activity at each trial's deviant position, grouped by deviant value.
+def extract_deviant_activity(dev_df, column):
+    """Activity at each trial's deviant, grouped by deviant position and trial.
 
-    For every trial the deviant tone sits at within-trial position ``dev_pos`` (a
-    0-based index, constant within the trial). The activity at that deviant is the
-    timestep ``trial * period + dev_pos`` of ``data``. Trials are grouped by the
-    *value* of their deviant position and, for each (trial, value) cell, averaged
-    over the sequences whose deviant fell on that position at that trial.
+    For every (deviant position, trial) cell, `column` is averaged over the
+    sequences whose deviant fell on that position at that trial.
 
     Parameters
     ----------
-    data : np.ndarray
-        Shape (seq_len, n_seq) — a module's activity norms or derivatives.
-    dev_pos : np.ndarray
-        Shape (n_seq, n_trials) — 0-based within-trial deviant position for every
-        sequence and trial.
-    period : int
-        Timesteps per trial. Default 8.
+    dev_df : pandas.DataFrame
+        One row per (sequence, trial), as the per-trial deviant-activity CSVs hold
+        them, with a 'trial_n' column and a 'dev_pos' column holding the 0-based
+        within-trial position of the deviant (see
+        exp_sequence_analysis.load_deviant_activity_frame).
+    column : str
+        The activity column to summarise, e.g. 'ctx_norm' or 'ctx_deriv'.
 
     Returns
     -------
@@ -1108,33 +1052,23 @@ def extract_deviant_activity(data, dev_pos, period=8):
         deviant-position value (int) → dict of equal-length arrays:
           - 'trials' : trial index per point (x-axis)
           - 'mean'   : activity at the deviant, averaged over contributing sequences
-          - 'std'    : std across those sequences
+          - 'std'    : std across those sequences (population std, ddof=0)
           - 'count'  : number of contributing sequences
-        A (trial, value) point is dropped when no sequence has that deviant value
-        at that trial, or when its timestep falls past ``seq_len`` (e.g. the very
-        last position of the last trial after the ``y[:, :-1]`` slice).
+        NaN rows are left out: the very last position of the last trial has no
+        activity after the ``y[:, :-1]`` slice, so a cell holding only those
+        rows is dropped.
     """
-    seq_len = data.shape[0]
-    n_trials = dev_pos.shape[1]
-    trials = np.arange(n_trials)
+    grouped = dev_df.dropna(subset=[column]).groupby(['dev_pos', 'trial_n'])[column]
+    stats = pd.DataFrame({'mean': grouped.mean(),
+                          'std': grouped.std(ddof=0),
+                          'count': grouped.count()}).reset_index()
 
     out = {}
-    for v in np.unique(dev_pos):
-        v = int(v)
-        rec = {'trials': [], 'mean': [], 'std': [], 'count': []}
-        for t in trials:
-            g = t * period + v
-            if g >= seq_len:
-                continue
-            mask = dev_pos[:, t] == v          # sequences with deviant at v in trial t
-            if not mask.any():
-                continue
-            vals = data[g, mask]
-            rec['trials'].append(t)
-            rec['mean'].append(vals.mean())
-            rec['std'].append(vals.std())
-            rec['count'].append(int(mask.sum()))
-        out[v] = {k: np.asarray(val) for k, val in rec.items()}
+    for v, rec in stats.groupby('dev_pos'):
+        out[int(v)] = {'trials': rec['trial_n'].to_numpy(),
+                       'mean': rec['mean'].to_numpy(),
+                       'std': rec['std'].to_numpy(),
+                       'count': rec['count'].to_numpy()}
     return out
 
 
