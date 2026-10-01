@@ -16,8 +16,9 @@ or off in the settings of the __main__ block. Paths are relative to
                                -> probabilities_deviant/*_probabilities_deviant.csv
 
   Figures (-> viz_examples/), drawn from the CSVs
-    PLOT_TRAJECTORIES          individual + averaged activity for a small random
-                               sample of sequences          <- activations
+    PLOT_TRAJECTORIES          averaged activity (mean +/- STD) for a random
+                               sample of sequences, plus the individual ones
+                               when the sample is small     <- activations
     PLOT_BY_POSITION           activity averaged over sequences, split by
                                within-trial position        <- activations
     PLOT_DEVIANT               activity at the deviant timestep, grouped by
@@ -65,7 +66,7 @@ def csv_kinds_to_write(trial_file, csv_kinds, output_root, model_name, overwrite
             if not sequence_csv_path(output_root, model_name, kind, trial_file.stem).exists()]
 
 
-def write_sequence_csvs(model, info, trial_files, csv_kinds, output_root, model_name,
+def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root, model_name,
                         period, cue_seed, chunk_size, include_prior, include_next_stimulus,
                         overwrite):
     """Write the missing CSVs of `trial_files`, running one batched forward pass per chunk.
@@ -113,10 +114,13 @@ def write_sequence_csvs(model, info, trial_files, csv_kinds, output_root, model_
         #     others: dim=n_classes, softmax class probabilities
         #   norms:  dict module → (T-1, N);  derivs: dict module → (T-2, N)
         # With include_prior, the probabilities are also read from the prior
-        # (first-call) readout of each module, i.e. before the feedback sweep.
+        # (first-call) readout of each module, i.e. before the feedback sweep, and
+        # the norms and derivatives from the prior hidden states.
         forward = get_module_output_and_activity(model, y, q, return_prior=include_prior)
         probs, norms, derivs = forward[:3]
         prior_probs = forward[3] if include_prior else None
+        prior_norms = forward[4] if include_prior else None
+        prior_derivs = forward[5] if include_prior else None
 
         for j, (trial_file, seq) in enumerate(zip(chunk, seqs)):
             obs, cue, ctx, dpos_raw, rule, lim_std, d, tau_std, trial_n = seq
@@ -124,17 +128,25 @@ def write_sequence_csvs(model, info, trial_files, csv_kinds, output_root, model_
             kinds = csv_kinds_to_write(trial_file, csv_kinds, output_root, model_name, overwrite)
             seq_norms = {name: arr[:, j] for name, arr in norms.items()}      # each: (T-1,)
             seq_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T-2,)
+            seq_prior_norms = None
+            seq_prior_derivs = None
+            if include_prior:
+                seq_prior_norms = {name: arr[:, j] for name, arr in prior_norms.items()}
+                seq_prior_derivs = {name: arr[:, j] for name, arr in prior_derivs.items()}
 
             if 'activations' in kinds:
                 out_df = exp.build_activations_frame(obs, cue, seq_norms, seq_derivs,
-                                                     lim_std, d, tau_std, trial_n)
+                                                     lim_std, d, tau_std, trial_n,
+                                                     prior_norms=seq_prior_norms,
+                                                     prior_derivs=seq_prior_derivs)
                 out_df.to_csv(sequence_csv_path(output_root, model_name, 'activations', stem),
                               index=False)
 
             if 'activations_deviant' in kinds:
                 out_df = exp.build_deviant_activations_frame(
                     obs, dpos_raw, seq_norms, seq_derivs, lim_std, d, tau_std, trial_n,
-                    period=period, dpos_shift=dpos_shift)
+                    period=period, dpos_shift=dpos_shift,
+                    prior_norms=seq_prior_norms, prior_derivs=seq_prior_derivs)
                 out_df.to_csv(sequence_csv_path(output_root, model_name, 'activations_deviant', stem),
                               index=False)
 
@@ -182,44 +194,55 @@ def figures_up_to_date(output_dir, model_name, names, csv_paths):
     return outputs_up_to_date(figure_paths, csv_paths)
 
 
-def plot_trajectories(trial_files, output_root, model_name, n_trajectories, seed, overwrite):
-    """Individual + averaged activity and derivatives.
+def plot_trajectories(trial_files, output_root, model_name, n_trajectories,
+                      max_individual_trajectories, seed, overwrite):
+    """Averaged activity and derivatives (mean +/- STD), plus the individual ones.
 
-    Draws one panel row per sequence, so it runs on a small random sample
-    (`n_trajectories`) rather than the full set.
+    The individual figure draws one line and one legend entry per sequence, so it
+    is only drawn when at most `max_individual_trajectories` sequences are selected.
     """
+    selected_files = select_files(trial_files, n_trajectories, seed=seed)
+    n_select = len(selected_files)
+    draw_individual = n_select <= max_individual_trajectories
+
     output_dir = output_root / model_name / 'viz_examples'
     csv_paths = [sequence_csv_path(output_root, model_name, 'activations', f.stem)
                  for f in trial_files]
-    names = ['exp_activity_trajectories', 'exp_activity_averaged']
+    names = ['exp_activity_averaged']
+    if draw_individual:
+        names.append('exp_activity_trajectories')
     if not overwrite and figures_up_to_date(output_dir, model_name, names, csv_paths):
         print("[plot_trajectories] figures up to date, skipped")
         return
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    selected_files = select_files(trial_files, n_trajectories, seed=seed)
-    n_select = len(selected_files)
     print(f"[plot_trajectories] using {n_select} trial sequence files")
+    if not draw_individual:
+        print(f"[plot_trajectories] more than {max_individual_trajectories} sequences: "
+              f"individual trajectories not drawn, averaged figure only")
 
     # Norms (T-1, N); sequences of unequal length are truncated to the shortest one.
     module_norms_dict = exp.load_activity_norms(
         [sequence_csv_path(output_root, model_name, 'activations', f.stem)
          for f in selected_files])
 
-    # Build pars dict in the format expected by extract_sample_parameters
-    params_list = [load_trial_params(f) for f in selected_files]
-    pars = {key: [p[key] for p in params_list] for key in ['tau', 'lim', 'si_stat', 'si_r']}
-
     seq_len = next(iter(module_norms_dict.values())).shape[0]
     timesteps = np.arange(seq_len)
 
+    if draw_individual:
+        # Build pars dict in the format expected by extract_sample_parameters
+        params_list = [load_trial_params(f) for f in selected_files]
+        pars = {key: [p[key] for p in params_list] for key in ['tau', 'lim', 'si_stat', 'si_r']}
+
+        for include_derivatives in [False, True]:
+            fig = plots.plot_individual_trajectories(
+                module_norms_dict, MODULE_TITLES, timesteps,
+                output_dir, model_name, n_samples=n_select, include_derivatives=include_derivatives, pars=pars,
+            )
+            plots.save_figure(fig, output_dir,
+                              figure_name(model_name, 'exp_activity_trajectories', include_derivatives))
+
     for include_derivatives in [False, True]:
-        fig = plots.plot_individual_trajectories(
-            module_norms_dict, MODULE_TITLES, timesteps,
-            output_dir, model_name, include_derivatives=include_derivatives, pars=pars,
-        )
-        plots.save_figure(fig, output_dir,
-                          figure_name(model_name, 'exp_activity_trajectories', include_derivatives))
 
         fig = plots.plot_averaged_activity(
             module_norms_dict, MODULE_TITLES, timesteps,
@@ -300,23 +323,29 @@ if __name__ == '__main__':
 
     # CSVs, one per sequence file (the only step that runs the model).
     WRITE_ACTIVATIONS = True
-    WRITE_ACTIVATIONS_DEVIANT = True
-    WRITE_PROBABILITIES = True
+    WRITE_ACTIVATIONS_DEVIANT = False
+    WRITE_PROBABILITIES = False
 
     # Figures, drawn from the CSVs.
-    PLOT_TRAJECTORIES = True
-    PLOT_BY_POSITION = True
-    PLOT_DEVIANT = True
+    PLOT_TRAJECTORIES = False
+    PLOT_BY_POSITION = False
+    PLOT_DEVIANT = False
 
     # Existing CSVs and figures are trusted and reused. Set True to rewrite them
     # all, e.g. after retraining a model or changing CUE_SEED, INCLUDE_PRIOR,
     # INCLUDE_NEXT_STIMULUS, or the figure sampling below.
-    OVERWRITE = False
+    OVERWRITE = True
 
     # Sequence files used by PLOT_BY_POSITION / PLOT_DEVIANT (None: all of them),
-    # and by PLOT_TRAJECTORIES, which draws one panel row per sequence.
+    # and by PLOT_TRAJECTORIES.
     N_SEQUENCES = None
-    N_TRAJECTORIES = 2
+    # N_TRAJECTORIES = 2
+    N_TRAJECTORIES = N_SEQUENCES
+    # PLOT_TRAJECTORIES draws one line and one legend entry per sequence in its
+    # individual figure. Above this number of sequences, only its averaged figure
+    # (mean +/- STD) is drawn: the legend no longer fits, and matplotlib's 10
+    # default colors start repeating.
+    MAX_INDIVIDUAL_TRAJECTORIES = 10
     SEED = 0                        # random file sampling
 
     PERIOD = cfg.PERIOD             # timesteps per trial
@@ -327,8 +356,10 @@ if __name__ == '__main__':
     # stimulus (True), or the deviant rows alone (False).
     INCLUDE_NEXT_STIMULUS = True
     # Also write the prior (first-call) readout of every module to the probability
+    # CSVs, and the norm + derivative of its prior hidden state to the activation
     # CSVs, as prior_-prefixed columns; the unprefixed columns stay the posterior.
-    INCLUDE_PRIOR = False
+    # Needed by run_model_pair_correlations.py for its prior quantities.
+    INCLUDE_PRIOR = True
     # -------------------------------------------------------------------------
 
     # CSV kinds to write; asking for a figure also asks for the CSVs it is drawn from.
@@ -360,13 +391,13 @@ if __name__ == '__main__':
             model = load_model(info)
             model.eval()
             print(f"Loaded model: {model_name}")
-            write_sequence_csvs(model, info, files_missing_csvs, csv_kinds, OUTPUT_ROOT,
+            write_proba_and_activ_csvs(model, info, files_missing_csvs, csv_kinds, OUTPUT_ROOT,
                                 model_name, PERIOD, CUE_SEED, CHUNK_SIZE, INCLUDE_PRIOR,
                                 INCLUDE_NEXT_STIMULUS, OVERWRITE)
 
         if PLOT_TRAJECTORIES:
-            plot_trajectories(trial_files, OUTPUT_ROOT, model_name, N_TRAJECTORIES, SEED,
-                              OVERWRITE)
+            plot_trajectories(trial_files, OUTPUT_ROOT, model_name, N_TRAJECTORIES,
+                              MAX_INDIVIDUAL_TRAJECTORIES, SEED, OVERWRITE)
         if PLOT_BY_POSITION:
             plot_by_position(trial_files, OUTPUT_ROOT, model_name, N_SEQUENCES, SEED, PERIOD,
                              OVERWRITE)

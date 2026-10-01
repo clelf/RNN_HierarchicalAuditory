@@ -1,6 +1,6 @@
 """Module-pair correlations on the experimental sequences: scores, then figures.
 
-Three stages, each toggled in the SETTINGS block:
+Three steps, each selectable in the SETTINGS block:
 
   scores        for every sequence, the Pearson correlation between each pair of
                 modules (activities and derivatives) plus three aggregate scores
@@ -131,7 +131,7 @@ if __name__ == '__main__':
 
     # A stage is skipped when all its outputs exist and are newer than its inputs.
     # Set True to redo every stage regardless.
-    OVERWRITE = False
+    OVERWRITE = True
     # -------------------------------------------------------------------------
 
     for model_name in MODEL_NAMES:

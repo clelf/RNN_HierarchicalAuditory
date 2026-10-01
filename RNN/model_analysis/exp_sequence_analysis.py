@@ -38,7 +38,7 @@ from analysis_core import (
     class_likelihood,
     class_probability_columns,
     compute_derivatives,
-    gather_at,
+    read_trial_at,
     gaussian_likelihood,
 )
 
@@ -123,9 +123,9 @@ def add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, n
     module's norm and derivative are gathered at that trial's deviant timestep.
     """
     for name in MODULES:
-        out_df[f'{prefix}{name}_norm'] = gather_at(norms[name], dev_idx, n_out)
+        out_df[f'{prefix}{name}_norm'] = read_trial_at(norms[name], dev_idx, n_out)
     for name in MODULES:
-        out_df[f'{prefix}{name}_deriv'] = gather_at(derivs[name], dev_idx, n_deriv)
+        out_df[f'{prefix}{name}_deriv'] = read_trial_at(derivs[name], dev_idx, n_deriv)
 
 
 def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, tau_std,

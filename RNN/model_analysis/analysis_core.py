@@ -4,15 +4,15 @@ Four groups, in order:
 
   1. Model access      -- ModelInfo (config discovery + loading), load_model,
                           discover_models, infer_bottleneck_dim_from_weights.
-  2. Synthetic data    -- generate_test_data, from a model's own training config.
-  3. Sequence I/O and  -- find_trial_files, select_files, sequence_csv_path,
-     the forward pass     model_sequence_csvs, outputs_up_to_date,
+  2. Artificial data    -- generate_test_data, from a model's own training config.
+  3. Sequence processing  -- find_trial_files, select_files, sequence_csv_path,
+                          model_sequence_csvs, outputs_up_to_date,
                           class_probability_columns, load_trial_sequence,
                           load_trial_params, dpos_conventions,
                           get_module_output_and_activity,
                           module_probabilities_from_output, group_by_module.
   4. Numerics          -- gaussian_likelihood, class_likelihood,
-                          compute_derivatives, gather_at.
+                          compute_derivatives, read_trial_at.
 
 Everything here was previously split between evaluate_models.py and
 model_activations.py; the bodies are unchanged. Anything that draws a figure
@@ -624,6 +624,13 @@ def load_trial_sequence(filepath, return_hierarch=False, n_cue_classes=None, cue
     """
     df = pd.read_csv(filepath)
     obs = df['observation'].to_numpy(dtype=np.float32)
+
+    # Handling cues
+    cues = df["cue"].unique()
+    df["cue"] = df["cue"].replace({
+        cues[0]: "cue_1",
+        cues[1]: "cue_2"
+    })
     cue_raw = df['cue'].to_numpy()
     label_to_idx = {label: i for i, label in enumerate(CUE_LABELS)}
     cue_idx = np.vectorize(label_to_idx.get)(cue_raw)
@@ -970,8 +977,8 @@ def compute_derivatives(norms):
     return np.diff(norms, axis=0)
 
 
-def gather_at(arr, idx, length):
-    """Gather arr[idx], returning NaN where idx falls outside [0, length).
+def read_trial_at(seq, idx, length):
+    """Read seq[idx], returning NaN where idx falls outside [0, length).
 
     Used to sample one value per trial at the trial's deviant timestep; the very
     last within-trial position of the last trial can fall past the activity array
@@ -979,7 +986,7 @@ def gather_at(arr, idx, length):
     """
     out = np.full(len(idx), np.nan, dtype=float)
     valid = idx < length
-    out[valid] = arr[idx[valid]]
+    out[valid] = seq[idx[valid]]
     return out
 
 

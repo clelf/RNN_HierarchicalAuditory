@@ -126,10 +126,10 @@ def save_figure(fig, figures_dir, filename, script_path=None, parallel=None):
 # =============================================================================
 # Experimental-sequence activity figures
 # =============================================================================
-def plot_individual_trajectories(module_norms_dict, module_titles, timesteps, output_dir, model_name, 
-                                  include_derivatives=False, pars=None, sample_indices=None):
+def plot_individual_trajectories(module_norms_dict, module_titles, timesteps, output_dir, model_name,
+                                  n_samples, include_derivatives=False, pars=None, sample_indices=None):
     """Plot individual sample trajectories for all modules.
-    
+
     Parameters
     ----------
     module_norms_dict : dict
@@ -142,6 +142,8 @@ def plot_individual_trajectories(module_norms_dict, module_titles, timesteps, ou
         Output directory for saving
     model_name : str
         Model name for file and title
+    n_samples : int
+        Number of individual samples plotted (shown in the title)
     include_derivatives : bool
         If True, plot derivatives instead of activity
     pars : dict or list, optional
@@ -150,13 +152,13 @@ def plot_individual_trajectories(module_norms_dict, module_titles, timesteps, ou
         Indices of selected samples
     """
     n_modules = len(module_norms_dict)
-    
+
     fig, axes = plt.subplots(n_modules, 1, figsize=(8, 3 * n_modules), sharex=True)
     if n_modules == 1:
         axes = [axes]
-    
+
     title_suffix = "derivatives " if include_derivatives else ""
-    fig.suptitle(f'Hidden activity {title_suffix}for individual samples\n  ', fontsize=16)
+    fig.suptitle(f'Hidden activity {title_suffix}for {n_samples} individual samples', fontsize=16)
     
     # Compute correlation ranges for each module
     corr_ranges = {}

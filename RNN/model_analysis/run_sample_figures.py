@@ -333,7 +333,7 @@ if __name__ == '__main__':
             for include_derivatives, tag in ((False, ''), (True, '_derivatives')):
                 fig = plots.plot_individual_trajectories(
                     module_norms, cfg.MODULE_TITLES, timesteps, out_dir, model_name,
-                    include_derivatives=include_derivatives,
+                    n_samples=N_SAMPLES_HIDDEN, include_derivatives=include_derivatives,
                     pars=test_data['pars'])
                 plots.save_figure(
                     fig, out_dir,
