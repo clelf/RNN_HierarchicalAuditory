@@ -5,8 +5,9 @@ Two halves:
   1. Extraction -- build the per-sequence tables from a model's forward pass over
      the recorded trial sequences (activity norms per timestep, one row per trial
      at the deviant, per-module predicted distributions and ground-truth
-     likelihoods). These are what run_exp_trials_pipeline.py writes to CSV, and
-     the only place a model is run on the experimental sequences.
+     likelihoods), and the per-timestep activity of pools of sequences presented
+     one after the other. These are what run_exp_trials_pipeline.py writes to
+     CSV, and the only place a model is run on the experimental sequences.
 
   2. Aggregation -- read the generated CSVs and summarise them: mean likelihoods per
      sequence (optionally split by deviant position), module-pair correlation
@@ -75,14 +76,15 @@ def add_module_activity_columns(out_df, norms, derivs, n_out, prefix=''):
         out_df[f'{prefix}{name}_deriv'] = np.concatenate([derivs[name], pad])
 
 
-def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_n,
-                            prior_norms=None, prior_derivs=None):
-    """Per-timestep activity CSV: one row per model output timestep.
+def build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs):
+    """Observation, cue and module activity columns, one row per model output timestep.
 
-    Rows are the T-1 model output timesteps; the sequence columns are the raw
-    (unshifted) observation and cue at those same timesteps.
+    The part of the activations CSVs shared by single sequences
+    (build_activations_frame) and pools of sequences (build_pool_activations_frame).
+    Rows are the model output timesteps; the observation and cue columns are the
+    raw (unshifted) ones at those same timesteps.
 
-    `prior_norms` / `prior_derivs`, when given (get_module_output_and_activity(...,
+    `prior_norms` / `prior_derivs`, when not None (get_module_output_and_activity(...,
     return_prior=True)), add the same columns computed on the prior hidden states,
     under a 'prior_' prefix. The unprefixed columns always hold the posterior pass.
     """
@@ -107,11 +109,43 @@ def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_
     if prior_norms is not None:
         add_module_activity_columns(out_df, prior_norms, prior_derivs, n_out,
                                     prefix='prior_')
+    return out_df
 
+
+def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_n,
+                            prior_norms=None, prior_derivs=None):
+    """Per-timestep activity CSV of one sequence: one row per model output timestep.
+
+    Rows are the T-1 model output timesteps; the sequence columns are the raw
+    (unshifted) observation and cue at those same timesteps.
+
+    `prior_norms` / `prior_derivs`, when given (get_module_output_and_activity(...,
+    return_prior=True)), add the same columns computed on the prior hidden states,
+    under a 'prior_' prefix. The unprefixed columns always hold the posterior pass.
+    """
+    out_df = build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs)
+    n_out = len(out_df)
     out_df['lim_std'] = lim_std
     out_df['d'] = d
     out_df['tau_std'] = tau_std
     out_df['trial_n'] = trial_n.values[:n_out]
+    return out_df
+
+
+def build_pool_activations_frame(obs, cue, norms, derivs, timesteps, prior_norms, prior_derivs):
+    """Per-timestep activity CSV of one pool of sequences presented one after the other.
+
+    Same columns as build_activations_frame, from one forward pass over the joined
+    sequences of the pool (analysis_core.load_pool_sequence). The sequence
+    parameters change from one sequence of the pool to the next, so they are
+    per-timestep columns here, taken from `timesteps`: 'sequence_name',
+    'pool_position', 'lim_std', 'd', 'tau_std' and 'trial_n'. Rows are the T_total-1
+    model output timesteps: the last timestep of the last sequence has none.
+    """
+    out_df = build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs)
+    n_out = len(out_df)
+    for column in ['sequence_name', 'pool_position', 'lim_std', 'd', 'tau_std', 'trial_n']:
+        out_df[column] = timesteps[column].to_numpy()[:n_out]
     return out_df
 
 

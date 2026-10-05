@@ -54,6 +54,27 @@ metadoc entry.
 Paths used:
 
 - `TRAINING_RESULTS_DIR` — `RNN/training_results/N_ctx_2/HierarchicalGM`
-- `TRIALS_PATH` — `Workspace/Jasmin/trialsequences2clem`
-- `EXP_SEQ_OUTPUT_ROOT` — `RNN/exp_seq_act_output`
+- `TRIALS_PATH` — `Workspace/Jasmin/<trials folder>`, e.g. `trialsequences_new`
+- `EXP_SEQ_OUTPUT_ROOT` — `RNN/exp_seq_act_output/<trials folder>`: one output root per
+  folder of trial sequences, named after it, so the outputs of different sets of
+  sequences are never mixed. Put every new set of sequences in a new folder.
 - `EVALUATION_RESULTS_DIR` — `RNN/evaluation_results`
+
+Layout under `EXP_SEQ_OUTPUT_ROOT`:
+
+```
+<model>/
+  activations/<sequence>_activations.csv               (and the other per-sequence kinds)
+  pool_activations/seed<POOL_SEED>_pool_000_pool_activations.csv
+model_pair_correlations/
+  model_pair_correlations_meanabs.csv                  (+ _by_condition, _all_conditions)
+  model_pair_correlations_pools_seed<POOL_SEED>_meanabs.csv
+  <same name start>_settings.txt                       models compared and settings of the run
+  <name start, no _meanabs>_<quantity>.png             one figure per quantity: one row per
+                                                       module, one column per pair of models
+  <the same>_<quantity>_allseq.png                     the same, one point per timestep
+                                                       averaged over every sequence
+```
+
+A per-sequence or pool CSV is rewritten when it is older than its sequence file(s)
+or the model's weights file.

@@ -47,6 +47,7 @@ from analysis_config import (
     DPI,
     LIKELIHOOD_LABELS,
     MODULE_NAMES as MODULES,
+    MODULE_TITLES,
     PLOT_LIKELIHOOD_COLS,
 )
 from analysis_core import (
@@ -1421,7 +1422,7 @@ def plot_timestep_matrix_by_position(ts_means, pos_order, figures_dir):
                         ax=ax, s=20, legend=legend)
 
     fig, axs = module_matrix_figure(draw_cell)
-    fig.suptitle('Per-timestep mean over all sequences, '
+    fig.suptitle('Per-timestep mean activity over all sequences, '
                  'coloured by within-trial position (from trial_n)', fontsize=13)
     legend_to_right(fig, axs, 'position', rect_right=0.93, anchor_x=0.94)
     save_figure(fig, figures_dir, "timestep_matrix__by_position.png")
@@ -1445,13 +1446,22 @@ def plot_timestep_matrix_by_position_gradient(ts_means, pos_order, figures_dir):
                        s=20, vmin=t_min, vmax=t_max)
 
     fig, _ = module_matrix_figure(draw_cell)
-    fig.suptitle('Module-pair activity association at deviant positions, per position, '
-                 'and across trials (light: early trials, darker: late trials)', fontsize=11)
+    fig.suptitle('Per-timestep mean activity over all sequences, per within-trial position'
+                 '(light: early trials, darker: late trials)', fontsize=11)
     fig.tight_layout(rect=[0, 0, 0.88, 1])
+    position_gradient_legend(fig, positions)
+    save_figure(fig, figures_dir, "timestep_matrix__by_position_gradient.png")
 
-    # Right-side legend: one stacked gradient bar per position (ax.scatter draws
-    # no legend of its own, so `legend_to_right` does not apply here).
-    cbar_x, cbar_w, cbar_h, cbar_gap = 0.895, 0.07, 0.028, 0.022
+
+def position_gradient_legend(fig, positions, cbar_x=.895, cbar_w=.07, cbar_h=.028, cbar_gap=.022):
+    """Right-side legend of the position colormaps: one stacked gradient bar per position.
+
+    Drawn for the figures that give each within-trial position its own
+    sequential colormap over the timesteps, light for the early trials and dark
+    for the late ones. ax.scatter draws no legend of its own, so `legend_to_right`
+    does not apply to them. The strip the bars sit in must already have been
+    reserved, e.g. ``fig.tight_layout(rect=[0, 0, 0.88, 1])``.
+    """
     n = len(positions)
     total_h = n * cbar_h + (n - 1) * cbar_gap
     top_y = 0.5 + total_h / 2
@@ -1472,7 +1482,134 @@ def plot_timestep_matrix_by_position_gradient(ts_means, pos_order, figures_dir):
     fig.text(cbar_x, top_y + 0.005, 'early t', ha='left', va='bottom', fontsize=7)
     fig.text(cbar_x + cbar_w, top_y + 0.005, 'late t', ha='right', va='bottom', fontsize=7)
 
-    save_figure(fig, figures_dir, "timestep_matrix__by_position_gradient.png")
+
+# =============================================================================
+# Correlations between models
+# =============================================================================
+
+def panel_correlation(x_values, y_values):
+    """Pearson correlation of the points plotted in one panel.
+
+    Same convention as exp_sequence_analysis.compute_pairwise_module_correlations,
+    whose per-sequence correlations the figure summarises: pearsonr is undefined
+    for a constant vector, which is read here as no correlation.
+    """
+    if x_values.std() == 0 or y_values.std() == 0:
+        return 0.0
+    return pearsonr(x_values, y_values)[0]
+
+
+def plot_model_pair_correlations(activation_quantities, scores, quantity, pairs,
+                                 mean_abs=False, point_density=False, by_trial_position=False,
+                                 timestep_gradient=False, panel_size=2.6):
+    """Correlations between models of one quantity: one row per module, one column per pair.
+
+    `activation_quantities` holds the time courses the correlations are computed
+    from, one row per (module, quantity, timestep) and one column per model,
+    named after the short model name, as returned by
+    run_model_pair_correlations.get_sequence_activation_quantities. `scores`
+    holds one row per sequence (or pool), module and quantity, with one column
+    per pair of models. Only the rows of `quantity` are plotted, one row of
+    panels per module, in the order of MODULES.
+
+    `pairs` is a list of [score column, model on x, model on y] and sets the
+    columns, in order: the two model names are columns of
+    `activation_quantities`, the score column is a column of `scores`.
+
+    Each panel scatters the two models' values against each other, one
+    point per timestep of the sequences `activation_quantities` was built from,
+    and is annotated both with the correlation of the points plotted ('r') and
+    with the mean over the sequences of `scores` of their per-sequence
+    correlations ('mean'), over the absolute correlations when `mean_abs`. With
+    `point_density`, the points are plotted as a 2D histogram instead, which
+    stays readable when `activation_quantities` holds many more of them. With
+    `by_trial_position`, each point takes the colour of the position its
+    timestep holds within its trial, read from the 'trial_position' column, and
+    the figure gets one legend on the right; a 2D histogram has no per-point
+    colour, so the two options cannot be used together.
+
+    `timestep_gradient` additionally shades each position's colour over the
+    'timestep' column, light for the first timesteps and dark for the last, as
+    plot_timestep_matrix_by_position_gradient does. It is meant for points that
+    are means over the sequences, one per timestep, where the shading reads as
+    the progression from the early to the late trials, and it needs
+    `by_trial_position`, whose positions it shades.
+    """
+    if point_density and by_trial_position:
+        raise ValueError("point_density plots a 2D histogram of all the points at once, "
+                         "which has no colour per point: use one option or the other")
+
+    n_rows = len(MODULES)
+    n_cols = len(pairs)
+    fig, axs = plt.subplots(n_rows, n_cols,
+                            figsize=(panel_size * n_cols, panel_size * n_rows))
+    axs = np.atleast_2d(axs)
+
+    # Positions as strings: discrete colours rather than a continuous scale.
+    position_order = []
+    position_colors = []
+    if by_trial_position:
+        for position in sorted(activation_quantities['trial_position'].unique()):
+            position_order.append(str(position))
+        position_colors = sns.color_palette('tab10', len(position_order))
+
+    for row_index, module in enumerate(MODULES):
+        module_quantities = activation_quantities[
+            (activation_quantities['module'] == module)
+            & (activation_quantities['quantity'] == quantity)]
+        module_scores = scores[(scores['module'] == module) & (scores['quantity'] == quantity)]
+
+        for col_index, (score_column, model_x, model_y) in enumerate(pairs):
+            ax = axs[row_index, col_index]
+            if point_density:
+                sns.histplot(data=module_quantities, x=model_x, y=model_y, ax=ax,
+                             bins=40, pthresh=.05, cmap='mako')
+            elif by_trial_position and timestep_gradient:
+                # One sequential colormap per position, spanning its timesteps.
+                for position_index, position in enumerate(position_order):
+                    at_position = module_quantities[
+                        module_quantities['trial_position'].astype(str) == position]
+                    ax.scatter(at_position[model_x], at_position[model_y],
+                               c=at_position['timestep'],
+                               cmap=POSITION_CMAPS[position_index % len(POSITION_CMAPS)],
+                               vmin=at_position['timestep'].min(),
+                               vmax=at_position['timestep'].max(),
+                               s=6, linewidth=0)
+                ax.set_xlabel(model_x)
+                ax.set_ylabel(model_y)
+            elif by_trial_position:
+                sns.scatterplot(data=module_quantities, x=model_x, y=model_y, ax=ax,
+                                hue=module_quantities['trial_position'].astype(str),
+                                hue_order=position_order, palette=position_colors,
+                                s=4, alpha=.3, linewidth=0, legend=False)
+            else:
+                sns.scatterplot(data=module_quantities, x=model_x, y=model_y, ax=ax,
+                                s=4, alpha=.3, linewidth=0)
+            plotted = panel_correlation(module_quantities[model_x].to_numpy(),
+                                        module_quantities[model_y].to_numpy())
+            
+            ax.text(.03, .97, f'r = {plotted:.2f}',
+                    transform=ax.transAxes, ha='left', va='top', fontsize=8)
+
+        # Module of the row, written outside the leftmost panel: save_figure's
+        # tight bounding box keeps it in the PNG.
+        axs[row_index, 0].text(-.55, .5, MODULE_TITLES[module],
+                               transform=axs[row_index, 0].transAxes,
+                               fontsize=11, ha='right', va='center')
+
+    if by_trial_position and timestep_gradient:
+        fig.tight_layout(rect=[0, 0, .88, 1])
+        position_gradient_legend(fig, position_order)
+    elif by_trial_position:
+        # One legend for the whole figure, in a strip reserved on the right: the
+        # scatter markers themselves are too small and too transparent to read.
+        fig.tight_layout(rect=[0, 0, .93, 1])
+        fig.legend(handles=legend_handles(position_order, position_colors),
+                   title='within-trial position', loc='center left', bbox_to_anchor=(.94, .5))
+    else:
+        fig.tight_layout()
+    return fig
+
 
 if __name__ == '__main__':
     pass

@@ -27,11 +27,15 @@ WORKSPACE_ROOT = _HERE.parents[3]
 # config.json.
 TRAINING_RESULTS_DIR = RNN_DIR / 'training_results' / 'N_ctx_2' / 'HierarchicalGM'
 
-# Recorded experimental trial sequences (one CSV per sequence).
-TRIALS_PATH = WORKSPACE_ROOT / 'Jasmin' / 'trialsequences2clem'
+# Recorded experimental trial sequences (one CSV per sequence). A folder is
+# identified by its name in the outputs (see EXP_SEQ_OUTPUT_ROOT): put every new
+# set of sequences in a new folder, never replace the files of an existing one.
+TRIALS_PATH = WORKSPACE_ROOT / 'Jasmin' / 'trialsequences_new'
 
 # Everything the experimental-sequence analyses write, under <root>/<model name>/.
-EXP_SEQ_OUTPUT_ROOT = RNN_DIR / 'exp_seq_act_output'
+# One root per folder of trial sequences, named after it, so the outputs of
+# different sets of sequences are never mixed: changing TRIALS_PATH changes it.
+EXP_SEQ_OUTPUT_ROOT = RNN_DIR / 'exp_seq_act_output' / TRIALS_PATH.name
 
 # Figures from the synthetic test-set evaluation.
 EVALUATION_RESULTS_DIR = RNN_DIR / 'evaluation_results'
@@ -70,6 +74,11 @@ MODULE_TITLES = {
 # downstream by the activity/likelihood join.
 CUE_SEED = 11
 
+# Seed of the random pools of sequences presented one after the other (see
+# analysis_core.make_sequence_pools). Must be identical across stages so every
+# model and every analysis is given the same pools.
+POOL_SEED = 0
+
 # Sequences per batched forward pass (bounds hidden-state memory).
 CHUNK_SIZE = 128
 
@@ -85,6 +94,9 @@ SEQUENCE_CSV_SUFFIXES = {
     'activations_deviant':   '_deviant_trial.csv',
     'probabilities':         '_probabilities.csv',
     'probabilities_deviant': '_probabilities_deviant.csv',
+    # One per pool of sequences presented one after the other, named after the pool
+    # (see analysis_core.pool_name) instead of a sequence.
+    'pool_activations':      '_pool_activations.csv',
 }
 
 # Likelihood columns summarised from the *_probabilities_deviant.csv files.

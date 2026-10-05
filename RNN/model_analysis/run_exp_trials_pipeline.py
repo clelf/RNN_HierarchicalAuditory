@@ -26,9 +26,20 @@ or off in the settings of the __main__ block. Paths are relative to
 
 Every figure comes in two versions: the activity norms and their derivatives.
 
+With SEQUENTIAL_PRESENTATION = True, the sequences are presented in random pools
+of four, one per tau_std value (analysis_core.make_sequence_pools): the four
+sequences of a pool are run one after the other, each starting from the hidden
+states the previous one ended with, instead of the trained initial hidden state.
+One activations CSV is then written per pool instead of one per sequence, with
+the same columns plus the sequence and its position in the pool at each timestep
+  -> pool_activations/seed<POOL_SEED>_pool_*_pool_activations.csv
+Only WRITE_ACTIVATIONS is available in this mode for now.
+
 Existing results are reused. A CSV is only written when it does not exist yet,
-and the model is only loaded when at least one CSV is missing. A figure is only
-drawn when it does not exist yet or is older than the CSVs it is drawn from.
+or is older than the sequence file(s) it comes from or the model's weights file
+(e.g. after retraining a model under the same name), and the model is only
+loaded when at least one CSV has to be written. A figure is only drawn when it
+does not exist yet or is older than the CSVs it is drawn from.
 Asking for a figure also writes the CSVs it needs. Set OVERWRITE to True to
 redo everything.
 """
@@ -46,9 +57,12 @@ from analysis_core import (
     find_trial_files,
     get_module_output_and_activity,
     load_model,
+    load_pool_sequence,
     load_trial_params,
     load_trial_sequence,
+    make_sequence_pools,
     outputs_up_to_date,
+    pool_name,
     select_files,
     sequence_csv_path,
 )
@@ -58,12 +72,20 @@ from analysis_core import (
 # CSVs of activations and probabilities
 # =============================================================================
 
-def csv_kinds_to_write(trial_file, csv_kinds, output_root, model_name, overwrite):
-    """The CSV kinds, among `csv_kinds`, that still have to be written for one sequence file."""
+def csv_kinds_to_write(trial_file, csv_kinds, output_root, model_name, weights_path, overwrite):
+    """The CSV kinds, among `csv_kinds`, that still have to be written for one sequence file.
+
+    A CSV has to be written when it does not exist yet, or when it is older than
+    the sequence file or the model's weights file `weights_path`.
+    """
     if overwrite:
         return csv_kinds
-    return [kind for kind in csv_kinds
-            if not sequence_csv_path(output_root, model_name, kind, trial_file.stem).exists()]
+    kinds = []
+    for kind in csv_kinds:
+        csv_path = sequence_csv_path(output_root, model_name, kind, trial_file.stem)
+        if not outputs_up_to_date([csv_path], [trial_file, weights_path]):
+            kinds.append(kind)
+    return kinds
 
 
 def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root, model_name,
@@ -125,7 +147,8 @@ def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root,
         for j, (trial_file, seq) in enumerate(zip(chunk, seqs)):
             obs, cue, ctx, dpos_raw, rule, lim_std, d, tau_std, trial_n = seq
             stem = trial_file.stem
-            kinds = csv_kinds_to_write(trial_file, csv_kinds, output_root, model_name, overwrite)
+            kinds = csv_kinds_to_write(trial_file, csv_kinds, output_root, model_name,
+                                       info.weights_path, overwrite)
             seq_norms = {name: arr[:, j] for name, arr in norms.items()}      # each: (T-1,)
             seq_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T-2,)
             seq_prior_norms = None
@@ -172,6 +195,61 @@ def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root,
 
     for kind in csv_kinds:
         print(f"  {kind}: {output_root / model_name / kind}")
+
+
+def write_pool_activations_csvs(model, info, pools, pool_indices, pool_seed, output_root,
+                                model_name, cue_seed, chunk_size, include_prior):
+    """Write the activations CSVs of the pools in `pool_indices`, one batched forward pass per chunk.
+
+    The sequences of a pool are joined end to end (analysis_core.load_pool_sequence)
+    and the model is run once on the result, so that each sequence starts from the
+    hidden states the previous one ended with. `pools` is the list of
+    analysis_core.make_sequence_pools drawn with `pool_seed`, and `chunk_size` a
+    number of pools.
+    """
+    (output_root / model_name / 'pool_activations').mkdir(parents=True, exist_ok=True)
+
+    # Cue re-encoding, as in write_proba_and_activ_csvs.
+    n_cue_classes = len(info.data_config_dict['cues_set'])
+
+    for start in range(0, len(pool_indices), chunk_size):
+        chunk = pool_indices[start:start + chunk_size]
+        # Each entry: obs, cue, timesteps, for the joined sequences of one pool.
+        loaded_pools = [load_pool_sequence(pools[pool_index], n_cue_classes, cue_seed)
+                        for pool_index in chunk]
+
+        # Stacking requires every pool of a chunk to have the same length.
+        y = torch.tensor(np.stack([loaded_pool[0] for loaded_pool in loaded_pools]),
+                         dtype=torch.float32).unsqueeze(-1)             # (N, T_total, 1)
+        q = torch.tensor(np.stack([loaded_pool[1] for loaded_pool in loaded_pools]),
+                         dtype=torch.float32)                           # (N, T_total, n_cue)
+
+        #   norms:  dict module → (T_total-1, N);  derivs: dict module → (T_total-2, N)
+        # With include_prior, also the norms and derivatives of the prior hidden states.
+        forward = get_module_output_and_activity(model, y, q, return_prior=include_prior)
+        norms, derivs = forward[1:3]
+        prior_norms = forward[4] if include_prior else None
+        prior_derivs = forward[5] if include_prior else None
+
+        for j, (pool_index, loaded_pool) in enumerate(zip(chunk, loaded_pools)):
+            obs, cue, timesteps = loaded_pool
+            pool_norms = {name: arr[:, j] for name, arr in norms.items()}      # each: (T_total-1,)
+            pool_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T_total-2,)
+            pool_prior_norms = None
+            pool_prior_derivs = None
+            if include_prior:
+                pool_prior_norms = {name: arr[:, j] for name, arr in prior_norms.items()}
+                pool_prior_derivs = {name: arr[:, j] for name, arr in prior_derivs.items()}
+
+            out_df = exp.build_pool_activations_frame(obs, cue, pool_norms, pool_derivs, timesteps,
+                                                      pool_prior_norms, pool_prior_derivs)
+            out_df.to_csv(sequence_csv_path(output_root, model_name, 'pool_activations',
+                                            pool_name(pool_index, pool_seed)),
+                          index=False)
+
+        print(f"  processed {min(start + chunk_size, len(pool_indices))}/{len(pool_indices)} pools")
+
+    print(f"  pool_activations: {output_root / model_name / 'pool_activations'}")
 
 
 # =============================================================================
@@ -317,9 +395,11 @@ if __name__ == '__main__':
     # ------------------------- SETTINGS (edit these) -------------------------
     MODEL_NAMES = cfg.EVALUATION_MODELS
     MODEL_DIR = cfg.TRAINING_RESULTS_DIR
-    TRIALS_PATH = cfg.TRIALS_PATH
+    TRIALS_PATH = cfg.WORKSPACE_ROOT / 'Jasmin' / 'trialsequences_new'
+
     # Each model writes to OUTPUT_ROOT/<model name>/.
-    OUTPUT_ROOT = cfg.EXP_SEQ_OUTPUT_ROOT
+    OUTPUT_ROOT = cfg.RNN_DIR / 'exp_seq_act_output' / TRIALS_PATH.name
+
 
     # CSVs, one per sequence file (the only step that runs the model).
     WRITE_ACTIVATIONS = True
@@ -331,8 +411,9 @@ if __name__ == '__main__':
     PLOT_BY_POSITION = False
     PLOT_DEVIANT = False
 
-    # Existing CSVs and figures are trusted and reused. Set True to rewrite them
-    # all, e.g. after retraining a model or changing CUE_SEED, INCLUDE_PRIOR,
+    # Existing CSVs and figures are reused when they are newer than what they come
+    # from (sequence files and model weights for the CSVs, CSVs for the figures).
+    # Set True to rewrite them all, e.g. after changing CUE_SEED, INCLUDE_PRIOR,
     # INCLUDE_NEXT_STIMULUS, or the figure sampling below.
     OVERWRITE = True
 
@@ -360,22 +441,48 @@ if __name__ == '__main__':
     # CSVs, as prior_-prefixed columns; the unprefixed columns stay the posterior.
     # Needed by run_model_pair_correlations.py for its prior quantities.
     INCLUDE_PRIOR = True
+
+    # Sequential presentation: the sequences are grouped into random pools of
+    # four, one per tau_std value, and the four sequences of a pool are run one
+    # after the other, each starting from the hidden states the previous one
+    # ended with. One activations CSV is written per pool, to pool_activations/,
+    # instead of one per sequence. Only WRITE_ACTIVATIONS is available in this
+    # mode for now. Read by run_model_pair_correlations.py with its own
+    # SEQUENTIAL_PRESENTATION = True.
+    SEQUENTIAL_PRESENTATION = True
+    POOL_SEED = cfg.POOL_SEED       # random pools; keep it fixed across runs
+    # Pools per batched forward pass: a pool is four sequences long, so this
+    # keeps the memory of one forward pass the same as with CHUNK_SIZE sequences.
+    POOL_CHUNK_SIZE = cfg.CHUNK_SIZE // 4
     # -------------------------------------------------------------------------
 
     # CSV kinds to write; asking for a figure also asks for the CSVs it is drawn from.
     csv_kinds = []
-    if WRITE_ACTIVATIONS or PLOT_TRAJECTORIES or PLOT_BY_POSITION:
-        csv_kinds.append('activations')
-    if WRITE_ACTIVATIONS_DEVIANT or PLOT_DEVIANT:
-        csv_kinds.append('activations_deviant')
-    if WRITE_PROBABILITIES:
-        csv_kinds.append('probabilities')
-        csv_kinds.append('probabilities_deviant')
+    if SEQUENTIAL_PRESENTATION:
+        if (not WRITE_ACTIVATIONS or WRITE_ACTIVATIONS_DEVIANT or WRITE_PROBABILITIES
+                or PLOT_TRAJECTORIES or PLOT_BY_POSITION or PLOT_DEVIANT):
+            raise ValueError("SEQUENTIAL_PRESENTATION = True only writes the activations "
+                             "CSVs for now: set WRITE_ACTIVATIONS = True, and every other "
+                             "WRITE_* and PLOT_* setting to False")
+        csv_kinds.append('pool_activations')
+    else:
+        if WRITE_ACTIVATIONS or PLOT_TRAJECTORIES or PLOT_BY_POSITION:
+            csv_kinds.append('activations')
+        if WRITE_ACTIVATIONS_DEVIANT or PLOT_DEVIANT:
+            csv_kinds.append('activations_deviant')
+        if WRITE_PROBABILITIES:
+            csv_kinds.append('probabilities')
+            csv_kinds.append('probabilities_deviant')
 
     trial_files = find_trial_files(TRIALS_PATH)
     if not trial_files:
         raise FileNotFoundError(f"No .csv or .txt sequence files in {TRIALS_PATH}")
     print(f"Found {len(trial_files)} trial sequence files in {TRIALS_PATH}")
+    if SEQUENTIAL_PRESENTATION:
+        pools = make_sequence_pools(trial_files, POOL_SEED)
+        n_left_out = len(trial_files) - len(pools) * len(pools[0])
+        print(f"{len(pools)} pools of {len(pools[0])} sequences, one per tau_std value; "
+              f"{n_left_out} sequence file(s) left out")
     print(f"CSVs: {', '.join(csv_kinds)}")
     print(f"Models ({len(MODEL_NAMES)}): {', '.join(MODEL_NAMES)}")
 
@@ -384,16 +491,35 @@ if __name__ == '__main__':
         # Only the config is read here; the weights are loaded when a forward pass is due.
         info = ModelInfo.from_path(MODEL_DIR / model_name)
 
-        files_missing_csvs = [f for f in trial_files
-                              if csv_kinds_to_write(f, csv_kinds, OUTPUT_ROOT, model_name, OVERWRITE)]
-        print(f"{len(files_missing_csvs)}/{len(trial_files)} sequence file(s) need CSVs written")
-        if files_missing_csvs:
-            model = load_model(info)
-            model.eval()
-            print(f"Loaded model: {model_name}")
-            write_proba_and_activ_csvs(model, info, files_missing_csvs, csv_kinds, OUTPUT_ROOT,
-                                model_name, PERIOD, CUE_SEED, CHUNK_SIZE, INCLUDE_PRIOR,
-                                INCLUDE_NEXT_STIMULUS, OVERWRITE)
+        if SEQUENTIAL_PRESENTATION:
+            pools_missing_csvs = []
+            for pool_index in range(len(pools)):
+                pool_csv = sequence_csv_path(OUTPUT_ROOT, model_name, 'pool_activations',
+                                             pool_name(pool_index, POOL_SEED))
+                # Rewritten when older than one of its sequence files or the weights.
+                sources = pools[pool_index] + [info.weights_path]
+                if OVERWRITE or not outputs_up_to_date([pool_csv], sources):
+                    pools_missing_csvs.append(pool_index)
+            print(f"{len(pools_missing_csvs)}/{len(pools)} pool(s) need CSVs written")
+            if pools_missing_csvs:
+                model = load_model(info)
+                model.eval()
+                print(f"Loaded model: {model_name}")
+                write_pool_activations_csvs(model, info, pools, pools_missing_csvs, POOL_SEED,
+                                            OUTPUT_ROOT, model_name, CUE_SEED, POOL_CHUNK_SIZE,
+                                            INCLUDE_PRIOR)
+        else:
+            files_missing_csvs = [f for f in trial_files
+                                  if csv_kinds_to_write(f, csv_kinds, OUTPUT_ROOT, model_name,
+                                                        info.weights_path, OVERWRITE)]
+            print(f"{len(files_missing_csvs)}/{len(trial_files)} sequence file(s) need CSVs written")
+            if files_missing_csvs:
+                model = load_model(info)
+                model.eval()
+                print(f"Loaded model: {model_name}")
+                write_proba_and_activ_csvs(model, info, files_missing_csvs, csv_kinds, OUTPUT_ROOT,
+                                           model_name, PERIOD, CUE_SEED, CHUNK_SIZE, INCLUDE_PRIOR,
+                                           INCLUDE_NEXT_STIMULUS, OVERWRITE)
 
         if PLOT_TRAJECTORIES:
             plot_trajectories(trial_files, OUTPUT_ROOT, model_name, N_TRAJECTORIES,

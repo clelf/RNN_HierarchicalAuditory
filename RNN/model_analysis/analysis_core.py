@@ -5,9 +5,10 @@ Four groups, in order:
   1. Model access      -- ModelInfo (config discovery + loading), load_model,
                           discover_models, infer_bottleneck_dim_from_weights.
   2. Artificial data    -- generate_test_data, from a model's own training config.
-  3. Sequence processing  -- find_trial_files, select_files, sequence_csv_path,
-                          model_sequence_csvs, outputs_up_to_date,
-                          class_probability_columns, load_trial_sequence,
+  3. Sequence processing  -- find_trial_files, select_files, make_sequence_pools,
+                          pool_name, sequence_csv_path, model_sequence_csvs,
+                          outputs_up_to_date, class_probability_columns,
+                          load_trial_sequence, load_pool_sequence,
                           load_trial_params, dpos_conventions,
                           get_module_output_and_activity,
                           module_probabilities_from_output, group_by_module.
@@ -547,11 +548,66 @@ def select_files(all_files, n_sequences, seed=0):
     return sorted(rng.choice(all_files, size=n_sequences, replace=False).tolist())
 
 
+def make_sequence_pools(trial_files, seed):
+    """Random pools of sequences, one per tau_std value, each sequence used at most once.
+
+    The files are grouped by their tau_std, read from the first row of each file,
+    and every group is shuffled. Pool k is made of the k-th file of every group,
+    then put in a random order: the order in which its sequences are presented.
+    lim_std and d are left free. There are as many pools as files in the smallest
+    group; the files of the larger groups that do not fit in a pool are left out.
+
+    Parameters
+    ----------
+    trial_files : list of Path
+        Sequence files, e.g. from find_trial_files.
+    seed : int
+        Seed of the shuffling: the same files and seed always give the same pools.
+
+    Returns
+    -------
+    list of list of Path
+        One list per pool, holding one file per tau_std value, in presentation order.
+    """
+    files_by_tau = {}
+    for trial_file in trial_files:
+        tau_std = pd.read_csv(trial_file, nrows=1)['tau_std'].iloc[0]
+        if tau_std not in files_by_tau:
+            files_by_tau[tau_std] = []
+        files_by_tau[tau_std].append(trial_file)
+
+    rng = np.random.default_rng(seed=seed)
+    shuffled_groups = []
+    for tau_std in sorted(files_by_tau):
+        group = files_by_tau[tau_std]
+        order = rng.permutation(len(group))
+        shuffled_groups.append([group[i] for i in order])
+    n_pools = min(len(group) for group in shuffled_groups)
+
+    pools = []
+    for k in range(n_pools):
+        pool = [group[k] for group in shuffled_groups]
+        order = rng.permutation(len(pool))
+        pools.append([pool[i] for i in order])
+    return pools
+
+
+def pool_name(pool_index, seed):
+    """Name of a pool, from its index in the list of make_sequence_pools and its seed.
+
+    E.g. 'seed0_pool_000': the seed is part of the name because the same index
+    refers to different sequences with another seed, so the CSVs of pools drawn
+    with different seeds never share a name.
+    """
+    return f'seed{seed}_pool_{pool_index:03d}'
+
+
 def sequence_csv_path(output_root, model_name, kind, sequence):
     """Where run_exp_trials_pipeline.py writes one sequence's CSV of a given kind.
 
     `kind` is a key of SEQUENCE_CSV_SUFFIXES and `sequence` the stem of the
-    original sequence file.
+    original sequence file, or the name of a pool (see pool_name) for the
+    'pool_activations' kind.
     """
     return output_root / model_name / kind / (sequence + SEQUENCE_CSV_SUFFIXES[kind])
 
@@ -659,6 +715,51 @@ def load_trial_sequence(filepath, return_hierarch=False, n_cue_classes=None, cue
         rule = df['rule'].to_numpy(dtype=np.int64)
         return obs, cue, ctx, dpos, rule, lim_std, d, tau_std, trial_n
     return obs, cue, lim_std, d, tau_std, trial_n
+
+
+def load_pool_sequence(pool_files, n_cue_classes, cue_seed):
+    """Observations and cues of a pool of sequences, joined end to end.
+
+    Running a model once on the joined sequences is the same as running it on the
+    sequences one after the other, each one starting from the hidden states the
+    previous one ended with: the forward pass is a loop over timesteps that only
+    carries the hidden states from one timestep to the next, and never resets them.
+
+    Parameters
+    ----------
+    pool_files : list of Path
+        Sequence files of one pool, in presentation order (see make_sequence_pools).
+    n_cue_classes, cue_seed :
+        As in load_trial_sequence. A fixed cue_seed gives every file the same cue
+        re-encoding, so that a cue means the same thing across the pool.
+
+    Returns
+    -------
+    obs : np.ndarray, shape (T_total,)
+    cue : np.ndarray, shape (T_total, n_cue)
+    timesteps : pandas.DataFrame, T_total rows
+        Where each timestep comes from: 'sequence_name' (stem of the sequence file),
+        'pool_position' (0 for the first sequence presented), the 'lim_std', 'd' and
+        'tau_std' of that sequence, and the 'trial_n' within it.
+    """
+    obs_parts = []
+    cue_parts = []
+    timesteps_parts = []
+    for position, trial_file in enumerate(pool_files):
+        obs, cue, lim_std, d, tau_std, trial_n = load_trial_sequence(
+            trial_file, n_cue_classes=n_cue_classes, cue_seed=cue_seed)
+        obs_parts.append(obs)
+        cue_parts.append(cue)
+        timesteps_parts.append(pd.DataFrame({
+            'sequence_name': trial_file.stem,
+            'pool_position': position,
+            'lim_std':       lim_std,
+            'd':             d,
+            'tau_std':       tau_std,
+            'trial_n':       trial_n.to_numpy(),
+        }))
+    timesteps = pd.concat(timesteps_parts, ignore_index=True)
+    return np.concatenate(obs_parts), np.concatenate(cue_parts), timesteps
 
 
 def load_trial_params(filepath):
