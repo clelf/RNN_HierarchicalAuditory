@@ -468,25 +468,25 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             Cues of shape (batch, seq_len, cue_dim)
         return_hidden : bool, optional
             If True, also return hidden states for all modules at each timestep.
-            Default is False for backward compatibility.
+            Default is False.
         return_prior : bool, optional
             If True, also return the prior (first-call) readouts of all modules --
             and, when return_hidden is also True, the prior hidden states, i.e. the
-            hidden state of each module right after its first call. Default is False
-            for backward compatibility.
+            hidden state of each module right after its first call. Default is False.
 
         Returns
         -------
-        tuple
-            Groups of four (one entry per module), appended in a fixed order so that
-            a caller which asks for less gets exactly the tuple it used to get:
-            (obs, ctx, dpos, rule)                                    posterior readouts
-            [+ (obs, ctx, dpos, rule) prior readouts                  if return_prior]
-            [+ (obs, ctx, dpos, rule) posterior hidden states         if return_hidden]
-            [+ (obs, ctx, dpos, rule) prior hidden states             if both]
-            The posterior hidden state of a module is the one it holds at the end of
-            the timestep (after its second call), which is what return_hidden has
-            always returned.
+        dict
+            One entry per group, each a dict with keys 'obs', 'ctx', 'dpos', 'rule'
+            (one entry per module):
+            - 'posterior'        : posterior readouts, (batch, seq_len, output_dim)
+            - 'prior'            : prior readouts                   (if return_prior)
+            - 'posterior_hidden' : posterior hidden states,         (if return_hidden)
+                                   (seq_len, n_layers, batch, hidden_dim)
+            - 'prior_hidden'     : prior hidden states              (if both)
+            Groups that were not requested are absent. The posterior hidden state of
+            a module is the one it holds at the end of the timestep (after its
+            second call).
         """
         batch_size, seq_len, _ = x.size()
 
@@ -600,41 +600,31 @@ class PopulationNetwork(ObsCtxModuleNetwork):
                 rule_hidden_states.append(rule_hx.detach())
 
         # Stack along the time dimension → (batch, seq_len, output_dim)
-        obs_outputs  = torch.cat(obs_outputs,  dim=1)
-        ctx_outputs  = torch.cat(ctx_outputs,  dim=1)
-        dpos_outputs = torch.cat(dpos_outputs, dim=1)
-        rule_outputs = torch.cat(rule_outputs, dim=1)
-
-        # Groups of four are appended in a fixed order, so that a caller that asks for
-        # neither (or only for the hidden states) gets exactly the tuple it used to get.
-        outputs = (obs_outputs, ctx_outputs, dpos_outputs, rule_outputs)
+        outputs = {'posterior': {'obs':  torch.cat(obs_outputs,  dim=1),
+                                 'ctx':  torch.cat(ctx_outputs,  dim=1),
+                                 'dpos': torch.cat(dpos_outputs, dim=1),
+                                 'rule': torch.cat(rule_outputs, dim=1)}}
 
         #### Return options
         if return_prior:
-            prior_obs_outputs  = torch.cat(prior_obs_outputs,  dim=1)
-            prior_ctx_outputs  = torch.cat(prior_ctx_outputs,  dim=1)
-            prior_dpos_outputs = torch.cat(prior_dpos_outputs, dim=1)
-            prior_rule_outputs = torch.cat(prior_rule_outputs, dim=1)
-            outputs = outputs + (prior_obs_outputs, prior_ctx_outputs,
-                                 prior_dpos_outputs, prior_rule_outputs)
+            outputs['prior'] = {'obs':  torch.cat(prior_obs_outputs,  dim=1),
+                                'ctx':  torch.cat(prior_ctx_outputs,  dim=1),
+                                'dpos': torch.cat(prior_dpos_outputs, dim=1),
+                                'rule': torch.cat(prior_rule_outputs, dim=1)}
 
         if return_hidden:
             # Stack hidden states along time dimension
             # Hidden states have shape (n_layers, batch, hidden_dim), stack along time gives (seq_len, n_layers, batch, hidden_dim)
-            obs_hidden_states  = torch.stack(obs_hidden_states,  dim=0)
-            ctx_hidden_states  = torch.stack(ctx_hidden_states,  dim=0)
-            dpos_hidden_states = torch.stack(dpos_hidden_states, dim=0)
-            rule_hidden_states = torch.stack(rule_hidden_states, dim=0)
-            outputs = outputs + (obs_hidden_states, ctx_hidden_states,
-                                 dpos_hidden_states, rule_hidden_states)
+            outputs['posterior_hidden'] = {'obs':  torch.stack(obs_hidden_states,  dim=0),
+                                           'ctx':  torch.stack(ctx_hidden_states,  dim=0),
+                                           'dpos': torch.stack(dpos_hidden_states, dim=0),
+                                           'rule': torch.stack(rule_hidden_states, dim=0)}
 
             if return_prior:
-                prior_obs_hidden_states  = torch.stack(prior_obs_hidden_states,  dim=0)
-                prior_ctx_hidden_states  = torch.stack(prior_ctx_hidden_states,  dim=0)
-                prior_dpos_hidden_states = torch.stack(prior_dpos_hidden_states, dim=0)
-                prior_rule_hidden_states = torch.stack(prior_rule_hidden_states, dim=0)
-                outputs = outputs + (prior_obs_hidden_states, prior_ctx_hidden_states,
-                                     prior_dpos_hidden_states, prior_rule_hidden_states)
+                outputs['prior_hidden'] = {'obs':  torch.stack(prior_obs_hidden_states,  dim=0),
+                                           'ctx':  torch.stack(prior_ctx_hidden_states,  dim=0),
+                                           'dpos': torch.stack(prior_dpos_hidden_states, dim=0),
+                                           'rule': torch.stack(prior_rule_hidden_states, dim=0)}
 
         return outputs
 

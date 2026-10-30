@@ -50,12 +50,13 @@ class Objective:
             The model (SimpleRNN, VRNN, VAE, ModuleNetwork or PopulationNetwork).
         target : torch.Tensor
             The target tensor to compare against.
-        model_output : tuple or torch.Tensor
+        model_output : tuple, dict or torch.Tensor
             The output from the model's forward pass.
             - For RNN: tensor of shape (batch, seq_len, output_dim)
             - For VRNN: tuple (outputs, mus_latent, logvars_latent, mus_prior, logvars_prior)
             - For VAE: tuple (x_output, mu_latent, logvar_latent)
             - For ModuleNetwork: tuple (obs_output, ctx_output)
+            - For PopulationNetwork: dict, see PopulationNetwork.forward
         target_ctx : torch.Tensor, optional
             Target context labels for ModuleNetwork (default: None)
         kappa : float
@@ -330,10 +331,12 @@ class Objective:
     def _population_network_loss(self, module_type, target_obs, target_ctx, target_dpos, target_rule, model_output, learning_objective='all', dpos_weight=None):
         # one loss per module, no competition between them
 
-        # Get outputs. The forward pass may carry extra groups of four (the prior
-        # readouts, the hidden states) after the posterior ones; the loss is always
-        # computed on the posterior readouts, i.e. the first four entries.
-        obs_output, ctx_output, dpos_output, rule_output = model_output[:4]
+        # The loss is always computed on the posterior readouts, whatever other
+        # groups (prior readouts, hidden states) the forward pass returned.
+        obs_output = model_output['posterior']['obs']
+        ctx_output = model_output['posterior']['ctx']
+        dpos_output = model_output['posterior']['dpos']
+        rule_output = model_output['posterior']['rule']
 
         # Observation loss. Regression task: reconstruction (+ KL)
         obs_loss = self._regression_loss(target_obs, obs_output, model_type=module_type)

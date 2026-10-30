@@ -1,7 +1,7 @@
 """Run trained models on the experimental trial sequences, and plot their activity.
 
 For each model in MODEL_NAMES and every sequence file in TRIALS_PATH, the script
-can write three kinds of CSVs and draw three kinds of figures, each switched on
+can write three kinds of analysis output (CSV files) and draw three kinds of figures, each switched on
 or off in the settings of the __main__ block. Paths are relative to
 ``<output-root>/<model name>/``.
 
@@ -74,25 +74,26 @@ from analysis_core import (
 # CSVs of activations and probabilities
 # =============================================================================
 
-def csv_kinds_to_write(trial_file, csv_kinds, output_root, model_name, weights_path, overwrite):
-    """The CSV kinds, among `csv_kinds`, that still have to be written for one sequence file.
+def analysis_output_kinds_to_write(trial_file, analysis_output_kinds, output_root, model_name,
+                                   weights_path, overwrite):
+    """The kinds of analysis output, among `analysis_output_kinds`, that still have to be written for one sequence file.
 
     A CSV has to be written when it does not exist yet, or when it is older than
     the sequence file or the model's weights file `weights_path`.
     """
     if overwrite:
-        return csv_kinds
+        return analysis_output_kinds
     kinds = []
-    for kind in csv_kinds:
+    for kind in analysis_output_kinds:
         csv_path = sequence_csv_path(output_root, model_name, kind, trial_file.stem)
         if not outputs_up_to_date([csv_path], [trial_file, weights_path]):
             kinds.append(kind)
     return kinds
 
 
-def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root, model_name,
-                        period, cue_seed, chunk_size, include_prior, include_next_stimulus,
-                        overwrite):
+def write_proba_and_activ_csvs(model, info, trial_files, analysis_output_kinds, output_root,
+                               model_name, period, cue_seed, chunk_size, include_prior,
+                               include_next_stimulus, overwrite):
     """Write the missing CSVs of `trial_files`, running one batched forward pass per chunk.
 
     - activations: per-timestep module activity norms + derivatives
@@ -100,7 +101,7 @@ def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root,
     - probabilities: per-module predicted distributions + ground-truth likelihoods
     - probabilities_deviant: same as probabilities, but restricted to the deviant rows + optionally the immediate next stimulus row
     """
-    for kind in csv_kinds:
+    for kind in analysis_output_kinds:
         (output_root / model_name / kind).mkdir(parents=True, exist_ok=True)
 
     # If the model was trained with a larger cue vocabulary than the two cues present
@@ -132,7 +133,7 @@ def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root,
         q = torch.tensor(np.stack([seq[1] for seq in seqs]),
                          dtype=torch.float32)                           # (N, T, n_cue)
 
-        # One forward pass serves every kind of CSV:
+        # One forward pass serves every kind of analysis output:
         #   probs:  dict module → (T-1, N, dim)
         #     'obs':  dim=2, columns are (mean, variance) of the predicted Gaussian
         #     others: dim=n_classes, softmax class probabilities
@@ -149,8 +150,8 @@ def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root,
         for j, (trial_file, seq) in enumerate(zip(chunk, seqs)):
             obs, cue, ctx, dpos_raw, rule, lim_std, d, tau_std, trial_n = seq
             stem = trial_file.stem
-            kinds = csv_kinds_to_write(trial_file, csv_kinds, output_root, model_name,
-                                       info.weights_path, overwrite)
+            kinds = analysis_output_kinds_to_write(trial_file, analysis_output_kinds, output_root,
+                                                   model_name, info.weights_path, overwrite)
             seq_norms = {name: arr[:, j] for name, arr in norms.items()}      # each: (T-1,)
             seq_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T-2,)
             seq_prior_norms = None
@@ -195,7 +196,7 @@ def write_proba_and_activ_csvs(model, info, trial_files, csv_kinds, output_root,
 
         print(f"  processed {min(start + chunk_size, len(trial_files))}/{len(trial_files)} sequences")
 
-    for kind in csv_kinds:
+    for kind in analysis_output_kinds:
         print(f"  {kind}: {output_root / model_name / kind}")
 
 
@@ -474,23 +475,23 @@ if __name__ == '__main__':
     POOL_CHUNK_SIZE = cfg.CHUNK_SIZE // 4
     # -------------------------------------------------------------------------
 
-    # CSV kinds to write; asking for a figure also asks for the CSVs it is drawn from.
-    csv_kinds = []
+    # Kinds of analysis output to write; asking for a figure also asks for the analysis outputs it is plotted from.
+    analysis_output_kinds = []
     if SEQUENTIAL_PRESENTATION:
         if WRITE_ACTIVATIONS_DEVIANT or WRITE_PROBABILITIES or PLOT_DEVIANT:
             raise ValueError("SEQUENTIAL_PRESENTATION = True only writes the activations "
                              "CSVs for now: set WRITE_ACTIVATIONS_DEVIANT, "
                              "WRITE_PROBABILITIES and PLOT_DEVIANT to False")
         if WRITE_ACTIVATIONS or PLOT_TRAJECTORIES or PLOT_BY_POSITION:
-            csv_kinds.append('pool_activations')
+            analysis_output_kinds.append('pool_activations')
     else:
         if WRITE_ACTIVATIONS or PLOT_TRAJECTORIES or PLOT_BY_POSITION:
-            csv_kinds.append('activations')
+            analysis_output_kinds.append('activations')
         if WRITE_ACTIVATIONS_DEVIANT or PLOT_DEVIANT:
-            csv_kinds.append('activations_deviant')
+            analysis_output_kinds.append('activations_deviant')
         if WRITE_PROBABILITIES:
-            csv_kinds.append('probabilities')
-            csv_kinds.append('probabilities_deviant')
+            analysis_output_kinds.append('probabilities')
+            analysis_output_kinds.append('probabilities_deviant')
 
     trial_files = find_trial_files(TRIALS_PATH)
     if not trial_files:
@@ -507,7 +508,7 @@ if __name__ == '__main__':
     else:
         figure_suffix = ''
         sample_name = 'sequences'
-    print(f"CSVs: {', '.join(csv_kinds)}")
+    print(f"Analysis outputs: {', '.join(analysis_output_kinds)}")
     print(f"Models ({len(MODEL_NAMES)}): {', '.join(MODEL_NAMES)}")
 
     for i, model_name in enumerate(MODEL_NAMES, start=1):
@@ -526,7 +527,7 @@ if __name__ == '__main__':
                 # Rewritten when older than one of its sequence files or the weights.
                 sources = pools[pool_index] + [info.weights_path]
                 pool_csv_outdated = OVERWRITE or not outputs_up_to_date([pool_csv], sources)
-                if 'pool_activations' in csv_kinds and pool_csv_outdated:
+                if 'pool_activations' in analysis_output_kinds and pool_csv_outdated:
                     pools_missing_csvs.append(pool_index)
             # The sequences of a pool have different parameters: no legend in the
             # figure of the individual trajectories.
@@ -547,16 +548,17 @@ if __name__ == '__main__':
                                                   trial_file.stem))
             legend_trial_files = trial_files
             files_missing_csvs = [f for f in trial_files
-                                  if csv_kinds_to_write(f, csv_kinds, OUTPUT_ROOT, model_name,
-                                                        info.weights_path, OVERWRITE)]
+                                  if analysis_output_kinds_to_write(f, analysis_output_kinds,
+                                                                    OUTPUT_ROOT, model_name,
+                                                                    info.weights_path, OVERWRITE)]
             print(f"{len(files_missing_csvs)}/{len(trial_files)} sequence file(s) need CSVs written")
             if files_missing_csvs:
                 model = load_model(info)
                 model.eval()
                 print(f"Loaded model: {model_name}")
-                write_proba_and_activ_csvs(model, info, files_missing_csvs, csv_kinds, OUTPUT_ROOT,
-                                           model_name, PERIOD, CUE_SEED, CHUNK_SIZE, INCLUDE_PRIOR,
-                                           INCLUDE_NEXT_STIMULUS, OVERWRITE)
+                write_proba_and_activ_csvs(model, info, files_missing_csvs, analysis_output_kinds,
+                                           OUTPUT_ROOT, model_name, PERIOD, CUE_SEED, CHUNK_SIZE,
+                                           INCLUDE_PRIOR, INCLUDE_NEXT_STIMULUS, OVERWRITE)
 
         if PLOT_TRAJECTORIES:
             plot_trajectories(act_csvs, legend_trial_files, OUTPUT_ROOT, model_name,

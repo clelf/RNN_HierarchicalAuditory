@@ -12,7 +12,7 @@ Four groups, in order:
                           load_exp_sequence_test_data, load_exp_pool_test_data,
                           load_trial_params, dpos_conventions,
                           get_module_output_and_activity,
-                          module_probabilities_from_output, group_by_module.
+                          module_probabilities_from_output.
   4. Numerics          -- gaussian_likelihood, class_likelihood,
                           compute_derivatives, read_trial_at.
 
@@ -905,12 +905,6 @@ def dpos_conventions(info, experimental_dpos_min=EXPERIMENTAL_DPOS_MIN):
 # Forward pass
 # =============================================================================
 
-def group_by_module(group):
-    """Name the four entries of one forward-output group, in the model's order."""
-    obs, ctx, dpos, rule = group
-    return {'obs': obs, 'ctx': ctx, 'dpos': dpos, 'rule': rule}
-
-
 def compute_hidden_norms(hidden_states, layer_idx=-1):
     """Compute L2 norms across neuron units for one layer of each module.
 
@@ -976,20 +970,13 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False
         forward_output = model(y[:, :-1, :], q[:, :-1, :],
                                return_hidden=True, return_prior=return_prior)
 
-    # The forward output is made of groups of four (one entry per module), in the
-    # order: posterior readouts, prior readouts, posterior hidden states, prior
-    # hidden states -- the prior groups being present only when asked for.
-    hidden_start = 8 if return_prior else 4
-
     probabilities = module_probabilities_from_output(model, forward_output, prior=False)
-    hidden_states = group_by_module(forward_output[hidden_start:hidden_start + 4])
-    hidden_activity = compute_hidden_norms(hidden_states, layer_idx=layer_idx)
+    hidden_activity = compute_hidden_norms(forward_output['posterior_hidden'], layer_idx=layer_idx)
     hidden_derivatives = {name: compute_derivatives(norms) for name, norms in hidden_activity.items()}
 
     if return_prior:
         prior_probabilities = module_probabilities_from_output(model, forward_output, prior=True)
-        prior_hidden_states = group_by_module(forward_output[12:16])
-        prior_activity = compute_hidden_norms(prior_hidden_states, layer_idx=layer_idx)
+        prior_activity = compute_hidden_norms(forward_output['prior_hidden'], layer_idx=layer_idx)
         prior_derivatives = {name: compute_derivatives(norms) for name, norms in prior_activity.items()}
         return (probabilities, hidden_activity, hidden_derivatives,
                 prior_probabilities, prior_activity, prior_derivatives)
@@ -1008,8 +995,8 @@ def module_probabilities_from_output(model, model_output, prior=False):
     ----------
     model : nn.Module
         Trained model.
-    model_output : tuple
-        Output of the model's forward pass.
+    model_output : dict
+        Output of the model's forward pass (see PopulationNetwork.forward).
     prior : bool
         If True, read the prior (first-call) readouts, which requires model_output
         to come from forward(..., return_prior=True).
