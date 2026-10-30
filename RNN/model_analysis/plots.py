@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.ticker import Formatter, FuncFormatter
 from scipy.stats import norm as sp_norm, pearsonr, spearmanr
 
 # figure_metadoc.py lives at the Workspace root, three levels above this file.
@@ -56,6 +57,7 @@ from analysis_core import (
     compute_pairwise_sample_correlations,
     extract_deviant_activity,
     extract_sample_parameters,
+    mean_and_std_over_selected,
     reshape_norms_by_position,
 )
 from metrics import model_predictions
@@ -69,6 +71,10 @@ from metrics import model_predictions
 KF_METRICS = ('mse', 'obs_loglik', 'ks_statistic')
 KF_COLOR = '#9B59B6'   # dashed KF reference line only; violins are not coloured
 KF_LABEL = 'Kalman Filter'
+
+# Colormap of each rule (list index = rule) in the activity figures split by rule:
+# the lines of the within-trial positions shade from light (first) to dark (last).
+RULE_CMAPS = ['Purples', 'Oranges']
 
 # Upper triangle of the 4x4 module matrix, with the always-empty left column
 # (obs) and bottom row (rule) dropped: rows = obs/ctx/dpos, cols = ctx/dpos/rule.
@@ -295,7 +301,7 @@ def plot_averaged_activity(module_norms_dict, module_titles, timesteps, output_d
 
 
 def plot_averaged_activity_by_position(module_norms_dict, module_titles, output_dir,
-                                       model_name, n_samples, period=8,
+                                       model_name, n_samples, sample_name, period=8,
                                        include_derivatives=False, show_std=True):
     """Plot per-module activity averaged over sequences, split by within-trial position.
 
@@ -319,7 +325,10 @@ def plot_averaged_activity_by_position(module_norms_dict, module_titles, output_
     model_name : str
         Model name (used only for context; the caller handles file names).
     n_samples : int
-        Number of sequences averaged over (shown in the title).
+        Number of sequences (or pools) averaged over (shown in the title).
+    sample_name : str
+        What the n_samples are, after their number in the title: 'sequences', or
+        'pools' of sequences presented one after the other.
     period : int
         Timesteps per trial / number of within-trial positions. Default 8.
     include_derivatives : bool
@@ -337,40 +346,20 @@ def plot_averaged_activity_by_position(module_norms_dict, module_titles, output_
 
     title_suffix = "derivatives " if include_derivatives else ""
     fig.suptitle(
-        f'Average hidden activity {title_suffix}across {n_samples} sequences\n'
-        f'(separated by within-trial position; trial index on x-axis)',
+        f'Average hidden activity {title_suffix}across {n_samples} {sample_name}\n'
+        f'by within-trial position',
         fontsize=16,
     )
 
-    cmap = plt.get_cmap('tab10')
+    if include_derivatives:
+        ylabel = 'dActivity/dt'
+    else:
+        ylabel = 'Activity (L2 norm)'
 
     for ax, (module_name, norms) in zip(axes, module_norms_dict.items()):
-        if include_derivatives:
-            data = compute_derivatives(norms)
-            ylabel = 'dActivity/dt'
-        else:
-            data = norms
-            ylabel = 'Activity (L2 norm)'
-
-        by_pos = reshape_norms_by_position(data, period=period)
-        for p in sorted(by_pos):
-            trials = by_pos[p]['trials']
-            values = by_pos[p]['values']          # (n_trials_p, batch)
-            mean_data = values.mean(axis=1)
-            color = cmap(p % 10)
-            ax.plot(trials, mean_data, '-', linewidth=1.5,
-                    color=color, label=f'pos {p + 1}')
-            if show_std:
-                std_data = values.std(axis=1)
-                ax.fill_between(trials, mean_data - std_data, mean_data + std_data,
-                                color=color, alpha=0.2)
-
-        if include_derivatives:
-            ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
-
+        plot_activity_by_position_panel(ax, norms, period, include_derivatives, show_std)
         ax.set_ylabel(ylabel)
         ax.set_title(module_titles[module_name])
-        ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel('Trial (trial_n)')
 
@@ -380,6 +369,173 @@ def plot_averaged_activity_by_position(module_norms_dict, module_titles, output_
                loc='center left', bbox_to_anchor=(0.98, 0.5))
     plt.tight_layout(rect=[0, 0, 0.97, 1])
     return fig
+
+
+def plot_averaged_activity_by_position_across_models(model_norms_dicts, model_labels,
+                                                     module_titles, n_samples, sample_name,
+                                                     prior, timestep_rules, period=8,
+                                                     include_derivatives=False, show_std=True):
+    """Plot :func:`plot_averaged_activity_by_position` for several models side by side.
+
+    One column per model and one row per module: each column holds what the
+    figure of :func:`plot_averaged_activity_by_position` shows for that model.
+    The y-axis is shared within a row, i.e. across the models for one module, and
+    the legend of the within-trial positions is shown once, to the right.
+
+    With `timestep_rules`, every position is also split by the rule of its trial
+    (see :func:`plot_activity_by_position_and_rule_panel`).
+
+    Parameters
+    ----------
+    model_norms_dicts : list of dict
+        One dict per model, in column order: module name → norms array of shape
+        (seq_len, batch), as for :func:`plot_averaged_activity_by_position`.
+        Every model must be given the same sequences (or pools).
+    model_labels : list of str
+        Column titles, one per model, in the same order.
+    module_titles : dict
+        Module name → display title; one row per module, in this order.
+    n_samples : int
+        Number of sequences (or pools) averaged over (shown in the title).
+    sample_name : str
+        What the n_samples are, after their number in the title: 'sequences', or
+        'pools' of sequences presented one after the other.
+    prior : bool
+        True if the norms are those of the prior hidden states, False for the
+        posterior ones; the title names which.
+    timestep_rules : np.ndarray or None
+        Shape (seq_len, batch): the rule of the trial every timestep belongs to,
+        the same for every model, to split the positions by rule (see
+        exp_sequence_analysis.load_timestep_rules). None: one line per position.
+    period : int
+        Timesteps per trial / number of within-trial positions. Default 8.
+    include_derivatives : bool
+        If True, plot temporal derivatives instead of raw activity.
+    show_std : bool
+        If True (default), shade ±STD across sequences around each position's mean.
+    """
+    n_modules = len(module_titles)
+    n_models = len(model_norms_dicts)
+
+    fig, axes = plt.subplots(n_modules, n_models, figsize=(5 * n_models, 3 * n_modules),
+                             sharex=True, sharey='row', squeeze=False)
+
+    hidden_state = "prior" if prior else "posterior"
+    title_suffix = "derivatives " if include_derivatives else ""
+    split_name = "within-trial position" if timestep_rules is None else "within-trial position and rule"
+    fig.suptitle(
+        f'Average {hidden_state} hidden activity {title_suffix}across {n_samples} {sample_name}\n'
+        f'by {split_name}',
+        fontsize=16,
+    )
+
+    if include_derivatives:
+        ylabel = 'dActivity/dt'
+    else:
+        ylabel = 'Activity (L2 norm)'
+
+    for col, (module_norms_dict, model_label) in enumerate(zip(model_norms_dicts, model_labels)):
+        for row, module_name in enumerate(module_titles):
+            ax = axes[row, col]
+            if timestep_rules is None:
+                plot_activity_by_position_panel(ax, module_norms_dict[module_name], period,
+                                                include_derivatives, show_std)
+            else:
+                plot_activity_by_position_and_rule_panel(ax, module_norms_dict[module_name],
+                                                         timestep_rules, period,
+                                                         include_derivatives, show_std)
+            if row == 0:
+                ax.set_title(f'{model_label}\n{module_titles[module_name]}')
+            else:
+                ax.set_title(module_titles[module_name])
+            if col == 0:
+                ax.set_ylabel(ylabel)
+            if row == n_modules - 1:
+                ax.set_xlabel('Trial (trial_n)')
+
+    # One shared legend to the right of the subplots; split by rule, one column per rule.
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if timestep_rules is None:
+        fig.legend(handles, labels, title='within-trial\nposition',
+                   loc='center left', bbox_to_anchor=(0.98, 0.5))
+    else:
+        fig.legend(handles, labels, title='rule, within-trial position', ncol=2,
+                   loc='center left', bbox_to_anchor=(0.98, 0.5))
+    plt.tight_layout(rect=[0, 0, 0.97, 1])
+    return fig
+
+
+def plot_activity_by_position_panel(ax, norms, period, include_derivatives, show_std):
+    """Plot one module's averaged activity on `ax`, one line per within-trial position.
+
+    Each point is the activity (or its temporal derivative) at a given (trial,
+    position), averaged over the sequences of `norms` (shape (seq_len, batch)),
+    with the trial index on the x-axis. Labels and titles are left to the caller.
+    """
+    if include_derivatives:
+        data = compute_derivatives(norms)
+    else:
+        data = norms
+
+    cmap = plt.get_cmap('tab10')
+    by_pos = reshape_norms_by_position(data, period=period)
+    for p in sorted(by_pos):
+        trials = by_pos[p]['trials']
+        values = by_pos[p]['values']          # (n_trials_p, batch)
+        mean_data = values.mean(axis=1)
+        color = cmap(p % 10)
+        ax.plot(trials, mean_data, '-', linewidth=1.5,
+                color=color, label=f'pos {p + 1}')
+        if show_std:
+            std_data = values.std(axis=1)
+            ax.fill_between(trials, mean_data - std_data, mean_data + std_data,
+                            color=color, alpha=0.2)
+
+    if include_derivatives:
+        ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+
+    ax.grid(True, alpha=0.3)
+
+
+def plot_activity_by_position_and_rule_panel(ax, norms, timestep_rules, period,
+                                             include_derivatives, show_std):
+    """Plot one module's averaged activity on `ax`, one line per (rule, within-trial position).
+
+    As :func:`plot_activity_by_position_panel`, but every position is split by
+    the rule of its trial: a point is the activity at a given (trial, position)
+    averaged over the sequences whose trial has that rule at that trial index, and
+    is left out (NaN) when none has. `timestep_rules` (shape (seq_len, batch))
+    gives the rule of every timestep of `norms`. Each rule is coloured with its
+    colormap of RULE_CMAPS, from light (first position) to dark (last position).
+    """
+    if include_derivatives:
+        data = compute_derivatives(norms)
+    else:
+        data = norms
+
+    # The derivative between timesteps t and t+1 is plotted at t, as in
+    # plot_activity_by_position_panel, so it takes the rule of the trial of t.
+    by_pos = reshape_norms_by_position(data, period=period)
+    rules_by_pos = reshape_norms_by_position(timestep_rules[:len(data)], period=period)
+    # Shades of each colormap used for the positions, light enough to be seen but not white.
+    shades = np.linspace(0.3, 1.0, period)
+    for rule in [0, 1]:
+        cmap = plt.get_cmap(RULE_CMAPS[rule])
+        for p in sorted(by_pos):
+            trials = by_pos[p]['trials']
+            in_rule = rules_by_pos[p]['values'] == rule     # (n_trials_p, batch)
+            mean_data, std_data = mean_and_std_over_selected(by_pos[p]['values'], in_rule)
+            color = cmap(shades[p])
+            ax.plot(trials, mean_data, '-', linewidth=1.5,
+                    color=color, label=f'rule {rule}, pos {p + 1}')
+            if show_std:
+                ax.fill_between(trials, mean_data - std_data, mean_data + std_data,
+                                color=color, alpha=0.2)
+
+    if include_derivatives:
+        ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+
+    ax.grid(True, alpha=0.3)
 
 
 def plot_deviant_activity_by_position(dev_df, module_titles, output_dir, model_name,
@@ -766,19 +922,39 @@ def metric_frame(results_ord, metric, kf_values=None, transform=None):
     return pd.DataFrame(np.array(arrays).T, columns=names)
 
 
-def violin_panel(ax, df, title, log_scale=False, symlog=False,
+def plain_tick_label(value, position):
+    """Tick label of `value` as a plain number with at most 3 significant digits.
+
+    E.g. '1.64' or '−100', never a power of ten such as '1.64188×10⁰', which is
+    how a symlog axis labels its ticks by default. `position`, the index of the
+    tick, is passed by matplotlib's FuncFormatter and not used.
+    """
+    label = np.format_float_positional(value, precision=3, fractional=False, trim='-')
+    # The minus sign of matplotlib's own tick labels
+    return Formatter.fix_minus(label)
+
+
+def violin_panel(ax, df, title, link_sequences, log_scale=False, symlog=False,
                  hline=None, hline_label=None):
     """Draw one violin panel: one violin per column, x tick labels stripped.
 
-    No palette is passed, so the violins take seaborn's default colours.
+    No palette is passed, so the violins take seaborn's default colours. With
+    `link_sequences`, each row of `df` (one sequence, scored by every model) gets
+    a thin gray line through its value in every violin, so that one can see
+    whether the models rank the sequences in the same order.
     """
     sns.violinplot(data=df, ax=ax, cut=0, log_scale=log_scale)
+    if link_sequences:
+        # One line per row; the violins sit at x = 0, 1, ... in column order
+        ax.plot(np.arange(df.shape[1]), df.to_numpy().T, color='gray', alpha=0.5,
+                linewidth=0.5, scalex=False, scaley=False)
     ax.set_title(title)
     ticks = ax.get_xticks()
     ax.set_xticks(ticks=ticks, labels=[''] * len(ticks))
     if symlog:
         ax.set_yscale('symlog')
         ax.set_ylim(top=df.max().max())
+        ax.yaxis.set_major_formatter(FuncFormatter(plain_tick_label))
     if hline is not None:
         ax.axhline(hline, color=KF_COLOR, linestyle='--', linewidth=2, label=hline_label)
     return ax
@@ -793,16 +969,6 @@ def legend_handles(names, colors, kf_label=None):
     handles += [plt.Line2D([0], [0], color=color, linewidth=8, label=name)
                 for name, color in zip(names, colors)]
     return handles
-
-
-def draw_color_legend(ax, names, colors, fontsize=12, row_height=0.07):
-    """Colour-patch legend filling a whole (otherwise unused) axes."""
-    ax.axis('off')
-    for i, (name, color) in enumerate(zip(names, colors)):
-        ax.add_patch(plt.Rectangle((0, 1 - i * row_height), 0.2, 0.05, color=color,
-                                   transform=ax.transAxes, clip_on=False))
-        ax.text(0.25, 1 - i * row_height + 0.025, name, va='center', ha='left',
-                transform=ax.transAxes, fontsize=fontsize)
 
 
 def clip_ylim(ax, df, lo_pct, hi_pct, pad_frac=0.15):
@@ -826,47 +992,61 @@ def clip_ylim(ax, df, lo_pct, hi_pct, pad_frac=0.15):
     ax.set_ylim(lo - pad, hi + pad)
 
 
-def plot_metric_violins(results_ord, metrics, output_dir, kf_metrics=None,
+def plot_metric_violins(results_ord, metrics, output_dir, link_sequences, kf_metrics=None,
                         file_suffix='test', ncols=3, panel_size=(6.5, 5),
                         row_labels=None, log_metrics=('mse',),
                         symlog_metrics=('obs_loglik',), save_individual=True):
     """One violin panel per metric, all models side by side.
 
-    The last panel of the grid holds the model colour legend. When `kf_metrics`
-    is given, observation-level metrics also get a KF violin and a dashed line at
-    the KF median. With `save_individual`, each metric is additionally saved as
-    its own figure (subplot_<metric>_<file_suffix>.png).
+    The panels fill a grid of `ncols` columns, row by row, in the order of
+    `metrics`. A None entry, or a metric no model has, leaves its panel empty, so
+    that related metrics can be lined up in the same column. The model colour
+    legend sits below the grid. When `kf_metrics` is given, observation-level
+    metrics also get a KF violin and a dashed line at the KF median. With
+    `link_sequences`, a thin gray line joins the values of each sequence across
+    the violins (see violin_panel). With `save_individual`, each metric is
+    additionally saved as its own figure (subplot_<metric>_<file_suffix>.png).
 
     Violins take seaborn's default colours, which are assigned by column
     position: the shared legend is therefore only valid while every panel shows
     the same models (a warning is printed when they do not).
     """
     output_dir = Path(output_dir)
-    metrics = [m for m in metrics if any(m in entry for entry in results_ord.values())]
-    if not metrics:
+    available_metrics = []
+    for metric in metrics:
+        if metric is None:
+            continue
+        if any(metric in entry for entry in results_ord.values()):
+            available_metrics.append(metric)
+        else:
+            print(f"  no model has '{metric}': its panel is left empty")
+    if not available_metrics:
         print("No model has any of the requested metrics — nothing to plot.")
         return None
 
-    nrows = int(np.ceil((len(metrics) + 1) / ncols))  # +1 panel for the legend
+    nrows = int(np.ceil(len(metrics) / ncols))
     fig, axs = plt.subplots(nrows, ncols, squeeze=False, constrained_layout=True,
                             figsize=(panel_size[0] * ncols, panel_size[1] * nrows))
     flat_axs = axs.ravel()
 
     column_sets = set()
     for metric, ax in zip(metrics, flat_axs):
+        if metric not in available_metrics:
+            ax.axis('off')
+            continue
         kf_values = kf_metrics.get(metric) if kf_metrics is not None else None
         df = metric_frame(results_ord, metric, kf_values=kf_values)
         kf_median = np.median(kf_values) if kf_values is not None else None
         column_sets.add(tuple(df.columns))
 
-        violin_panel(ax, df, f'{metric} across models',
+        violin_panel(ax, df, metric, link_sequences,
                      log_scale=metric in log_metrics,
                      symlog=metric in symlog_metrics,
                      hline=kf_median, hline_label='KF median')
 
         if save_individual:
             fig_single, ax_single = plt.subplots(figsize=(7, 5))
-            violin_panel(ax_single, df, f'{metric} across models',
+            violin_panel(ax_single, df, metric, link_sequences,
                          log_scale=metric in log_metrics,
                          symlog=metric in symlog_metrics,
                          hline=kf_median, hline_label='KF median')
@@ -884,28 +1064,32 @@ def plot_metric_violins(results_ord, metrics, output_dir, kf_metrics=None,
         for row, label in enumerate(row_labels[:nrows]):
             axs[row][0].set_ylabel(label)
 
-    # Legend in the first free panel; blank out whatever is left.
+    # Panels of the last row left over by the metrics
+    for ax in flat_axs[len(metrics):]:
+        ax.axis('off')
+
+    # Legend below the grid
     if len(column_sets) > 1:
         print("  ! panels do not all show the same models, so the shared legend "
               "matches only the panels holding every column")
     legend_names = max(column_sets, key=len)
-    draw_color_legend(flat_axs[len(metrics)], legend_names,
-                      default_colors(len(legend_names)))
-    for ax in flat_axs[len(metrics) + 1:]:
-        ax.axis('off')
+    fig.legend(handles=legend_handles(legend_names, default_colors(len(legend_names))),
+               loc='outside lower center', ncols=2, frameon=False, fontsize=12)
 
     return save_figure(fig, output_dir,
                        f"model_comparison_metrics_{file_suffix}.png")
 
 
-def plot_kf_ratio_violins(results_ord, kf_metrics, output_dir, metrics=KF_METRICS,
-                          panel_size=(6, 5), default_pct=(2, 98),
+def plot_kf_ratio_violins(results_ord, kf_metrics, output_dir, link_sequences,
+                          metrics=KF_METRICS, panel_size=(6, 5), default_pct=(2, 98),
                           pct_by_metric=None):
     """Violin plots of each model's metric divided by the KF's, per sample.
 
     A ratio of 1 (dashed purple line) means the model matches the KF. The y-axis
     is clipped per metric (see clip_ylim) since the ratios can be very skewed —
     log-likelihood ratios especially, hence the tighter percentiles for them.
+    With `link_sequences`, a thin gray line joins the ratios of each sequence
+    across the violins (see violin_panel).
     """
     output_dir = Path(output_dir)
     pct_by_metric = {'obs_loglik': (10, 90), **(pct_by_metric or {})}
@@ -925,7 +1109,7 @@ def plot_kf_ratio_violins(results_ord, kf_metrics, output_dir, metrics=KF_METRIC
             continue
         columns = max(columns, tuple(df.columns), key=len)
 
-        violin_panel(ax, df, f'{metric}  (model / KF)',
+        violin_panel(ax, df, f'{metric}  (model / KF)', link_sequences,
                      hline=1.0, hline_label='KF baseline')
         clip_ylim(ax, df, *pct_by_metric.get(metric, default_pct))
 

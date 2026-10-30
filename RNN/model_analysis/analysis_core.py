@@ -9,6 +9,7 @@ Four groups, in order:
                           pool_name, sequence_csv_path, model_sequence_csvs,
                           outputs_up_to_date, class_probability_columns,
                           load_trial_sequence, load_pool_sequence,
+                          load_exp_sequence_test_data, load_exp_pool_test_data,
                           load_trial_params, dpos_conventions,
                           get_module_output_and_activity,
                           module_probabilities_from_output, group_by_module.
@@ -376,6 +377,19 @@ def discover_models(
         print(f"  Found {len(results)} models")
     
     return results
+
+
+def short_model_name(model_name):
+    """'sir<value>' for a model trained with a fixed sigma_r, 'sirvar' otherwise.
+
+    The value is read from the 'fixedsir<value>' part of the model name, e.g.
+    'population_network_all_bn8_trainh0_fixedsir0.02_epochs300_lr0.002' -> 'sir0.02'
+    and 'population_network_all_bn8_trainh0_epochs300_lr0.002' -> 'sirvar'.
+    """
+    for part in model_name.split('_'):
+        if part.startswith('fixedsir'):
+            return 'sir' + part[len('fixedsir'):]
+    return 'sirvar'
 
 
 # =============================================================================
@@ -762,6 +776,84 @@ def load_pool_sequence(pool_files, n_cue_classes, cue_seed):
     return np.concatenate(obs_parts), np.concatenate(cue_parts), timesteps
 
 
+def load_exp_sequence_test_data(trial_files, n_cue_classes, cue_seed, dpos_shift, device='cpu'):
+    """Test data made of the experimental sequence files, in the format of generate_test_data.
+
+    Holds the fields metrics.evaluate_model reads, one row per sequence file:
+    - 'y': observations tensor (n_sequences, seq_len, 1) [float32]
+    - 'y_np': observations as numpy array (n_sequences, seq_len)
+    - 'contexts_np': context labels, from the 'trial_type' column
+    - 'dpos_np': deviant positions, from the 'dpos' column plus `dpos_shift`, i.e.
+      in the model's convention (see dpos_conventions)
+    - 'rules_np': rules, from the 'rule' column
+    - 'q': one-hot cues (n_sequences, seq_len, n_cue_classes) [float32]
+
+    `n_cue_classes` and `cue_seed` re-encode the cues as in load_trial_sequence, so
+    that a model is given the cues run_exp_trials_pipeline.py gives it. The
+    sequences are stacked into one batch, so every file must have the same length.
+    """
+    obs_parts = []
+    cue_parts = []
+    ctx_parts = []
+    dpos_parts = []
+    rule_parts = []
+    for trial_file in trial_files:
+        obs, cue, ctx, dpos_raw, rule, lim_std, d, tau_std, trial_n = load_trial_sequence(
+            trial_file, return_hierarch=True, n_cue_classes=n_cue_classes, cue_seed=cue_seed)
+        obs_parts.append(obs)
+        cue_parts.append(cue)
+        ctx_parts.append(ctx)
+        dpos_parts.append(dpos_raw + dpos_shift)
+        rule_parts.append(rule)
+
+    y_np = np.stack(obs_parts)
+    return {
+        'y': torch.tensor(y_np, dtype=torch.float32).unsqueeze(-1).to(device),
+        'y_np': y_np,
+        'contexts_np': np.stack(ctx_parts),
+        'dpos_np': np.stack(dpos_parts),
+        'rules_np': np.stack(rule_parts),
+        'q': torch.tensor(np.stack(cue_parts), dtype=torch.float32).to(device),
+    }
+
+
+def load_exp_pool_test_data(pools, n_cue_classes, cue_seed, dpos_shift, device='cpu'):
+    """Test data made of pools of experimental sequences, one row per pool.
+
+    The fields of load_exp_sequence_test_data, but the sequences of a pool (one
+    list of files of make_sequence_pools, in presentation order) are joined end
+    to end into a single row, as load_pool_sequence joins them for
+    run_exp_trials_pipeline.py: a model run on that row runs through the
+    sequences one after the other, each starting from the hidden states the
+    previous one ended with.
+    """
+    obs_rows = []
+    cue_rows = []
+    ctx_rows = []
+    dpos_rows = []
+    rule_rows = []
+    for pool_files in pools:
+        # One row per sequence of the pool, (n_sequences, seq_len), joined end to
+        # end into one row of n_sequences * seq_len timesteps
+        pool_data = load_exp_sequence_test_data(pool_files, n_cue_classes, cue_seed, dpos_shift,
+                                                device=device)
+        obs_rows.append(pool_data['y_np'].reshape(-1))
+        cue_rows.append(pool_data['q'].reshape(-1, pool_data['q'].shape[-1]))
+        ctx_rows.append(pool_data['contexts_np'].reshape(-1))
+        dpos_rows.append(pool_data['dpos_np'].reshape(-1))
+        rule_rows.append(pool_data['rules_np'].reshape(-1))
+
+    y_np = np.stack(obs_rows)
+    return {
+        'y': torch.tensor(y_np, dtype=torch.float32).unsqueeze(-1).to(device),
+        'y_np': y_np,
+        'contexts_np': np.stack(ctx_rows),
+        'dpos_np': np.stack(dpos_rows),
+        'rules_np': np.stack(rule_rows),
+        'q': torch.stack(cue_rows),
+    }
+
+
 def load_trial_params(filepath):
     """Extract scalar trial parameters from a sequence CSV file.
 
@@ -1136,6 +1228,22 @@ def reshape_norms_by_position(data, period=8):
             'values': data[ts, :],
         }
     return by_pos
+
+
+def mean_and_std_over_selected(values, selected):
+    """Mean and STD of every row of `values`, over its entries where `selected` is True.
+
+    `values` and `selected` have the same 2D shape, e.g. (n_trials, batch). A row
+    without any selected entry gets NaN for both, rather than a value computed
+    over nothing.
+    """
+    mean = np.full(values.shape[0], np.nan)
+    std = np.full(values.shape[0], np.nan)
+    has_selected = selected.any(axis=1)
+    selected_values = np.where(selected, values, np.nan)[has_selected]
+    mean[has_selected] = np.nanmean(selected_values, axis=1)
+    std[has_selected] = np.nanstd(selected_values, axis=1)
+    return mean, std
 
 
 def extract_deviant_activity(dev_df, column):

@@ -78,22 +78,15 @@ import analysis_config as cfg
 import exp_sequence_analysis as exp
 import plots
 from analysis_config import MODULE_NAMES
-from analysis_core import find_trial_files, make_sequence_pools, pool_name, sequence_csv_path
+from analysis_core import (
+    find_trial_files,
+    make_sequence_pools,
+    pool_name,
+    sequence_csv_path,
+    short_model_name,
+)
 
 
-
-
-def short_model_name(model_name):
-    """'sir<value>' for a model trained with a fixed sigma_r, 'sirvar' otherwise.
-
-    The value is read from the 'fixedsir<value>' part of the model name, e.g.
-    'population_network_all_bn8_trainh0_fixedsir0.02_epochs300_lr0.002' -> 'sir0.02'
-    and 'population_network_all_bn8_trainh0_epochs300_lr0.002' -> 'sirvar'.
-    """
-    for part in model_name.split('_'):
-        if part.startswith('fixedsir'):
-            return 'sir' + part[len('fixedsir'):]
-    return 'sirvar'
 
 
 def quantity_column_name(quantity, module):

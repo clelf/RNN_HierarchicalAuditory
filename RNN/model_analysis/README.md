@@ -19,6 +19,7 @@ Core modules providing function and classes to be used in specific run_* modules
 ### Analysis / evaluation
 
 - `run_exp_trials_pipeline.py`: applies model on experimental sequences and produces analysis of both activation (general, and at deviant positions) and probabilities/likelihoods-
+- `run_exp_activity_by_position_across_models.py`: the by-position activity figures of `run_exp_trials_pipeline.py`, for several models side by side (one column per model), for the posterior and the prior hidden states, split by within-trial position and optionally also by rule, from the activations CSVs it wrote
 
 
 - `run_exp_trials_summaries.py`: read CSVs of likelihoods and dpos probability, the dpos probability at the true deviant, and the per-trial activity-vs-likelihood join,  averages per sequence

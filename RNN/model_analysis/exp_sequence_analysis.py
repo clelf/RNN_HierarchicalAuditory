@@ -777,20 +777,55 @@ def load_timestep_means(seq_files, with_position=False):
     return ts_means, pos_order
 
 
-def load_activity_norms(act_files):
+def load_activity_norms(act_files, prior):
     """{module: (T-1, n_files) activity norms}, stacked from per-sequence activations CSVs.
+
+    The norms of the posterior hidden states ('<module>_norm' columns), or with
+    `prior` those of the prior hidden states ('prior_<module>_norm' columns,
+    written by run_exp_trials_pipeline.py with INCLUDE_PRIOR = True).
 
     The layout get_module_output_and_activity returns for a batch, so the activity
     figures draw the same arrays whether they come from a forward pass or from
     disk. Sequences of unequal length are truncated to the shortest one.
     """
-    norm_cols = [f'{m}_norm' for m in MODULES]
+    if prior:
+        prefix = 'prior_'
+    else:
+        prefix = ''
+    norm_cols = [f'{prefix}{m}_norm' for m in MODULES]
     frames = [pd.read_csv(f, usecols=norm_cols) for f in act_files]
     min_len = min(len(df) for df in frames)
     if any(len(df) != min_len for df in frames):
         print(f"  Warning: sequences have unequal lengths — truncating all to {min_len} timesteps")
-    return {m: np.stack([df[f'{m}_norm'].to_numpy()[:min_len] for df in frames], axis=1)
+    return {m: np.stack([df[f'{prefix}{m}_norm'].to_numpy()[:min_len] for df in frames], axis=1)
             for m in MODULES}
+
+
+def load_timestep_rules(act_files, sequence_files_by_csv):
+    """(T-1, n_files) rule of the trial every timestep of the activations CSVs belongs to.
+
+    The same layout and truncation as load_activity_norms, so that the rule of a
+    timestep sits at the same place as its activity norm. The activations CSVs do
+    not hold the rule, so it is read from the sequence files: for every CSV of
+    `act_files`, `sequence_files_by_csv` gives the sequence files it was written
+    from, in presentation order (the one file of a sequence, or the four files of
+    a pool). The rows of a CSV are the timesteps of these files joined end to end,
+    without the last one. A ValueError is raised when the observations of a CSV
+    are not those of its sequence files.
+    """
+    rules_per_file = []
+    for act_file, sequence_files in zip(act_files, sequence_files_by_csv):
+        act_observations = pd.read_csv(act_file, usecols=['observation'])['observation'].to_numpy()
+        sequence_dfs = []
+        for sequence_file in sequence_files:
+            sequence_dfs.append(pd.read_csv(sequence_file, usecols=['observation', 'rule']))
+        joined_df = pd.concat(sequence_dfs, ignore_index=True).iloc[:len(act_observations)]
+        if not np.allclose(joined_df['observation'].to_numpy(), act_observations):
+            raise ValueError(f"The observations of {act_file.name} are not those of "
+                             f"{[f.name for f in sequence_files]}")
+        rules_per_file.append(joined_df['rule'].to_numpy())
+    min_len = min(len(rules) for rules in rules_per_file)
+    return np.stack([rules[:min_len] for rules in rules_per_file], axis=1)
 
 
 def load_deviant_activity_frame(dev_files, dpos_shift):

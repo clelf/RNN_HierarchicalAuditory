@@ -74,7 +74,7 @@ def build_correlation_scores(activations_dir):
     return pd.DataFrame(rows)
 
 
-def draw_pair_correlation_figures(act_df, figures_dir):
+def plot_pair_correlation_figures(act_df, figures_dir):
     """Every distribution figure of the module-pair correlation scores."""
     plots.plot_obs_ctx_by_lim_std(act_df, figures_dir)
     plots.plot_obs_ctx_by_d_tau_std(act_df, figures_dir)
@@ -93,7 +93,7 @@ def draw_pair_correlation_figures(act_df, figures_dir):
                              density=False)
 
 
-def draw_association_figures(seq_files, figures_dir):
+def plot_association_figures(seq_files, figures_dir):
     """Upper-triangle module-pair scatter matrices, at three levels of aggregation."""
     # Per combination of (lim_std, d), then per condition (all params)
     seq_means = exp.load_sequence_means(seq_files)
@@ -172,7 +172,7 @@ if __name__ == '__main__':
             else:
                 act_df = exp.load_correlation_scores(correlation_csv)
                 print(f"  loaded {len(act_df)} sequence(s) from {correlation_csv.name}")
-                draw_pair_correlation_figures(act_df, figures_dir)
+                plot_pair_correlation_figures(act_df, figures_dir)
 
         association_outputs = [figures_dir / name for name in ASSOCIATION_FIGURES]
         if (RUN_ASSOCIATIONS and not OVERWRITE
@@ -185,6 +185,6 @@ if __name__ == '__main__':
                 print(f"  SKIPPED: no '*_activations.csv' files in {activations_dir}")
             else:
                 print(f"  found {len(seq_files)} sequence file(s)")
-                draw_association_figures(seq_files, figures_dir)
+                plot_association_figures(seq_files, figures_dir)
 
         print(f"Figures written to {figures_dir}")

@@ -30,7 +30,11 @@ from tqdm import tqdm
 
 from analysis_core import (
     ModelInfo,
+    dpos_conventions,
+    load_exp_pool_test_data,
+    load_exp_sequence_test_data,
     load_model,
+    make_sequence_pools,
     generate_test_data,
     get_model_predictions,
 )
@@ -332,21 +336,63 @@ def compute_rule_log_prob(rules_true: np.ndarray, rule_probs: np.ndarray,
     
     # Calculate minimum rule index to handle non-zero-based indexing
     rule_min = rules_true.min()
-    
+
     for i in range(n_samples):
         for t in range(seq_len):
             true_rule = rules_true[i, t]
             # Shift to 0-based index for probability array access
             true_probs[i, t] = rule_probs[i, t, int(true_rule - rule_min)]
-    
+
     # Compute log probability
     log_probs = np.log(true_probs + 1e-10)  # Add small epsilon to avoid log(0)
-    
+
     if reduce:
         return float(np.mean(log_probs))
     else:
         # Mean over sequence dimension, keep sample dimension
         return np.mean(log_probs, axis=1)
+
+
+def compute_true_class_log_probs(labels_true, class_probs):
+    """Log-probability the model gives the true class, at every timestep: (n_samples, seq_len).
+
+    The values compute_context_log_likelihood, compute_dpos_log_prob and
+    compute_rule_log_prob average, computed the same way: the class index of a
+    label is the label minus the lowest label of `labels_true`, and 1e-10 is
+    added before the log. `class_probs` is (n_samples, seq_len, n_classes).
+    """
+    class_index = (labels_true - labels_true.min()).astype(int)
+    true_probs = np.take_along_axis(class_probs, class_index[:, :, np.newaxis], axis=2)[:, :, 0]
+    return np.log(true_probs + 1e-10)
+
+
+def deviant_and_next_timesteps(contexts_true):
+    """True at the timesteps of the true deviants (context 1) and at the timestep right after each.
+
+    The rows exp_sequence_analysis.subset_deviant_rows keeps with
+    include_next_stimulus, the ones run_exp_trials_summaries.py averages.
+    `contexts_true` is (n_samples, seq_len).
+    """
+    deviant = contexts_true == 1
+    selected = deviant.copy()
+    selected[:, 1:] = selected[:, 1:] | deviant[:, :-1]
+    return selected
+
+
+def compute_mean_at_timesteps(values, timestep_mask, reduce=True):
+    """Mean of `values` (n_samples, seq_len) over the timesteps where `timestep_mask` is True.
+
+    reduce=True: a single mean, over the selected timesteps of every sample.
+    reduce=False: one mean per sample (n_samples,), NaN for a sample without
+    any selected timestep.
+    """
+    if reduce:
+        return float(np.mean(values[timestep_mask]))
+    means = np.full(len(values), np.nan)
+    for i in range(len(values)):
+        if timestep_mask[i].any():
+            means[i] = np.mean(values[i, timestep_mask[i]])
+    return means
 
 
 def compute_dev_probabilities(dpos_long, rules_long, n_tones, rules_dpos_set,
@@ -582,6 +628,7 @@ def evaluate_model(
     device: str = 'cpu',
     reduce: bool = True,
     min_obs_for_em: Optional[int] = None,
+    at_deviant: bool = False,
 ) -> Dict[str, Any]:
     """
     Evaluate a single model on the test data.
@@ -601,7 +648,12 @@ def evaluate_model(
                         index min_obs_for_em-1 to get predictions for y[min_obs_for_em:].
                         Pass benchmark_data.min_obs_for_em when comparing against a KF
                         benchmark so that per-sample metrics are truly comparable.
-    
+        at_deviant: If True (population_network only), also return the context, dpos
+                    and rule log-likelihoods averaged over the timesteps of the true
+                    deviants and the timesteps right after them only, rather than over
+                    every timestep: 'context_loglik_at_dev', 'dpos_loglik_at_dev',
+                    'rule_loglik_at_dev'.
+
     Returns:
         Dictionary with all computed metrics.
         If reduce=True: values are scalars (calibration includes ks_pvalue)
@@ -731,7 +783,21 @@ def evaluate_model(
         if rule_prob is not None and rules_np_aligned is not None:
             rules_target = rules_np_aligned
             results['rule_loglik'] = compute_rule_log_prob(rules_target, rule_prob, reduce=reduce)
-    
+
+        # The same three log-likelihoods, at the true deviants and the timesteps
+        # right after them only
+        if at_deviant:
+            deviant_mask = deviant_and_next_timesteps(contexts_np_aligned)
+            results['context_loglik_at_dev'] = compute_mean_at_timesteps(
+                compute_true_class_log_probs(contexts_np_aligned, ctx_prob), deviant_mask,
+                reduce=reduce)
+            results['dpos_loglik_at_dev'] = compute_mean_at_timesteps(
+                compute_true_class_log_probs(dpos_np_aligned, dpos_prob), deviant_mask,
+                reduce=reduce)
+            results['rule_loglik_at_dev'] = compute_mean_at_timesteps(
+                compute_true_class_log_probs(rules_np_aligned, rule_prob), deviant_mask,
+                reduce=reduce)
+
     return results
 
 
@@ -1463,7 +1529,68 @@ def build_test_sets(models_info, n_samples, shared=False, benchmark_data=None,
     return test_sets
 
 
-def evaluate_all_models(models_info, test_sets, min_obs_for_em=None, device='cpu'):
+def check_lowest_labels(test_data, dpos_min):
+    """Raise a ValueError when the labels of `test_data` do not reach the model's first class.
+
+    compute_context_log_likelihood, compute_dpos_log_prob and compute_rule_log_prob
+    take the class index of a label to be the label minus the lowest label
+    evaluated (from the second timestep on, the first one having no prediction).
+    That is the model's class index only when the lowest label is the model's
+    first class: 0 for the contexts and rules, dpos_min for the deviant positions.
+    A generated test set always reaches it; a few experimental sequences may not,
+    e.g. when no deviant of theirs sits at the earliest position.
+    """
+    first_classes = [['contexts_np', 0], ['dpos_np', dpos_min], ['rules_np', 0]]
+    for labels_key, first_class in first_classes:
+        lowest_label = test_data[labels_key][:, 1:].min()
+        if lowest_label != first_class:
+            raise ValueError(f"The lowest label of '{labels_key}' is {lowest_label}, not the "
+                             f"model's first class {first_class}: the log-probabilities "
+                             f"would be read from the wrong classes")
+
+
+def build_exp_sequence_test_sets(models_info, trial_files, cue_seed, sequential_presentation,
+                                 pool_seed, device='cpu'):
+    """Test set of every model on the experimental sequences, as {model folder name: test_data}.
+
+    Every model is given the same sequence files, in its own encoding, as
+    run_exp_trials_pipeline.py gives them: the cues re-encoded into as many
+    classes as the model was trained with, and the deviant positions shifted into
+    its convention (dpos_conventions). Models sharing both share one test set.
+
+    Without `sequential_presentation`, one row per sequence file
+    (analysis_core.load_exp_sequence_test_data). With it, the files are grouped
+    into the pools analysis_core.make_sequence_pools draws with `pool_seed`, one
+    sequence per tau_std value, and each pool is one row, its sequences joined
+    end to end (analysis_core.load_exp_pool_test_data), as run_exp_trials_pipeline.py
+    runs them with SEQUENTIAL_PRESENTATION = True.
+    """
+    if sequential_presentation:
+        pools = make_sequence_pools(trial_files, pool_seed)
+        n_left_out = len(trial_files) - len(pools) * len(pools[0])
+        print(f"{len(pools)} pools of {len(pools[0])} sequences, one per tau_std value; "
+              f"{n_left_out} sequence file(s) left out")
+
+    test_sets, by_encoding = {}, {}
+    for info in models_info:
+        n_cue_classes = len(info.data_config_dict['cues_set'])
+        dpos_min, dpos_shift = dpos_conventions(info)
+        key = (n_cue_classes, dpos_shift)
+        if key not in by_encoding:
+            if sequential_presentation:
+                test_data = load_exp_pool_test_data(pools, n_cue_classes, cue_seed,
+                                                    dpos_shift, device=device)
+            else:
+                test_data = load_exp_sequence_test_data(trial_files, n_cue_classes, cue_seed,
+                                                        dpos_shift, device=device)
+            check_lowest_labels(test_data, dpos_min)
+            by_encoding[key] = test_data
+        test_sets[info.model_dir.name] = by_encoding[key]
+    return test_sets
+
+
+def evaluate_all_models(models_info, test_sets, min_obs_for_em=None, device='cpu',
+                        at_deviant=False):
     """Evaluate every model, keeping metrics as per-sample distributions.
 
     `test_sets` maps a model folder name to the test data that model is
@@ -1472,16 +1599,52 @@ def evaluate_all_models(models_info, test_sets, min_obs_for_em=None, device='cpu
 
     Returns {model folder name: metrics dict}. `min_obs_for_em` restricts the
     evaluation to the KF window (y[min_obs_for_em:]) so per-sample model metrics
-    stay comparable with the KF ones.
+    stay comparable with the KF ones. `at_deviant` adds the context, dpos and
+    rule log-likelihoods at the true deviants and the timesteps right after them
+    (see evaluate_model).
     """
     results = {}
     for info in tqdm(models_info, desc="Evaluating models"):
         model = load_model(info, device=device)
         results[info.model_dir.name] = evaluate_model(
             model, info, test_sets[info.model_dir.name], device=device, reduce=False,
-            min_obs_for_em=min_obs_for_em,
+            min_obs_for_em=min_obs_for_em, at_deviant=at_deviant,
         )
         del model
+    return results
+
+
+def evaluate_all_models_over_pool_seeds(models_info, trial_files, cue_seed, pool_seeds,
+                                        device='cpu', at_deviant=False):
+    """Evaluate every model on the pools of several pool seeds, the pools of all seeds put together.
+
+    For each seed of `pool_seeds`, the experimental sequences are grouped into
+    the pools that seed draws and every model is evaluated on them, as
+    build_exp_sequence_test_sets and evaluate_all_models do with
+    sequential_presentation=True. One seed is evaluated at a time, so the memory
+    used stays that of a single seed.
+
+    Returns {model folder name: metrics dict}, as evaluate_all_models, where each
+    metric array holds one value per pool of every seed, the pools of the first
+    seed first: n_seeds * n_pools values. Row i of every model is the same pool,
+    so the values of a pool can still be joined across models.
+    """
+    results = {}
+    for pool_seed in pool_seeds:
+        print(f"\nPool seed {pool_seed}")
+        test_sets = build_exp_sequence_test_sets(models_info, trial_files, cue_seed, True,
+                                                 pool_seed, device=device)
+        seed_results = evaluate_all_models(models_info, test_sets, device=device,
+                                           at_deviant=at_deviant)
+        for model_name, model_results in seed_results.items():
+            if model_name not in results:
+                results[model_name] = model_results
+                continue
+            # The metric arrays are appended; the model's description
+            # (model_dir, hidden_dim, ...) is the same for every seed
+            for key, value in model_results.items():
+                if isinstance(value, np.ndarray):
+                    results[model_name][key] = np.concatenate([results[model_name][key], value])
     return results
 
 
