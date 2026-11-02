@@ -180,7 +180,7 @@ def plot_individual_trajectories(module_norms_dict, module_titles, timesteps, ou
         
         if include_derivatives:
             derivatives = compute_derivatives(norms)
-            timesteps_plot = timesteps[:-1]
+            timesteps_plot = timesteps
             data_to_plot = derivatives
             ylabel = 'dActivity/dt'
         else:
@@ -255,7 +255,7 @@ def plot_averaged_activity(module_norms_dict, module_titles, timesteps, output_d
     # Apply derivatives if needed before computing independence
     independence_dict = module_norms_dict
     if include_derivatives:
-        independence_dict = {name: compute_derivatives(norms) for name, norms in module_norms_dict.items()}
+        independence_dict = {name: compute_derivatives(norms)[1:] for name, norms in module_norms_dict.items()}
     
     independence_metrics = compute_module_independence(independence_dict)
     redundancy = independence_metrics['redundancy']  # Lower = more independent
@@ -270,7 +270,7 @@ def plot_averaged_activity(module_norms_dict, module_titles, timesteps, output_d
         
         if include_derivatives:
             derivatives = compute_derivatives(norms)
-            timesteps_plot = timesteps[:-1]
+            timesteps_plot = timesteps
             mean_data = derivatives.mean(axis=1)
             std_data = derivatives.std(axis=1)
             ylabel = 'dActivity/dt'
@@ -513,7 +513,7 @@ def plot_activity_by_position_and_rule_panel(ax, norms, timestep_rules, period,
     else:
         data = norms
 
-    # The derivative between timesteps t and t+1 is plotted at t, as in
+    # The derivative at t is the change on the arrival of timestep t, as in
     # plot_activity_by_position_panel, so it takes the rule of the trial of t.
     by_pos = reshape_norms_by_position(data, period=period)
     rules_by_pos = reshape_norms_by_position(timestep_rules[:len(data)], period=period)

@@ -1,11 +1,11 @@
 """Run trained models on the experimental trial sequences, and plot their activity.
 
 For each model in MODEL_NAMES and every sequence file in TRIALS_PATH, the script
-can write three kinds of analysis output (CSV files) and draw three kinds of figures, each switched on
+can write three kinds of analysis output and plot three kinds of figures, each switched on
 or off in the settings of the __main__ block. Paths are relative to
 ``<output-root>/<model name>/``.
 
-  CSVs (one per sequence file) -- the only step that runs the model
+  Outputs (one per sequence file)
     WRITE_ACTIVATIONS          per-timestep module activity norms + derivatives
                                -> activations/*_activations.csv
     WRITE_ACTIVATIONS_DEVIANT  one row per trial, sampled at the deviant timestep
@@ -15,7 +15,7 @@ or off in the settings of the __main__ block. Paths are relative to
                                -> probabilities/*_probabilities.csv
                                -> probabilities_deviant/*_probabilities_deviant.csv
 
-  Figures (-> viz_examples/), drawn from the CSVs
+  Figures (-> viz_examples/), plot from the output CSVs
     PLOT_TRAJECTORIES          averaged activity (mean +/- STD) for a random
                                sample of sequences, plus the individual ones
                                when the sample is small     <- activations
@@ -24,26 +24,33 @@ or off in the settings of the __main__ block. Paths are relative to
     PLOT_DEVIANT               activity at the deviant timestep, grouped by
                                deviant position             <- activations_deviant
 
-Every figure comes in two versions: the activity norms and their derivatives.
+Every CSV row has a 'timestep' column, the absolute position in the sequence of the
+observation of that row (observation == y[timestep]), so the outputs align by
+joining on it (exp.merge_activations_and_probabilities): activations at t are
+those after seeing y[t] (t = 0 ... T-2) and their derivatives the change on the
+arrival of y[t] (t = 1 ... T-2, NaN at t = 0); probabilities at t are the prediction of y[t]
+made after seeing y[t-1] (t = 1 ... T-1).
 
-With SEQUENTIAL_PRESENTATION = True, the sequences are presented in random pools
-of four, one per tau_std value (analysis_core.make_sequence_pools): the four
+For every figure related to activations, we get two versions: one for activity norms and one for their derivatives.
+
+With SEQUENTIAL_PRESENTATION = True, the sequences are presented in pools
+of four consecutive sequences selected randomly (without replacement) as long as they
+exhibit distinct tau_std value (analysis_core.make_sequence_pools): the four
 sequences of a pool are run one after the other, each starting from the hidden
 states the previous one ended with, instead of the trained initial hidden state.
 One activations CSV is then written per pool instead of one per sequence, with
 the same columns plus the sequence and its position in the pool at each timestep
   -> pool_activations/seed<POOL_SEED>_pool_*_pool_activations.csv
-Only WRITE_ACTIVATIONS, PLOT_TRAJECTORIES and PLOT_BY_POSITION are available in
-this mode for now. These figures are then plotted from the pool CSVs, over the
-four sequences of each pool, and their names end in '_pools_seed<POOL_SEED>'.
+Only WRITE_ACTIVATIONS, PLOT_TRAJECTORIES and PLOT_BY_POSITION can be used with
+SEQUENTIAL_PRESENTATION for now. The figures' names end in '_pools_seed<POOL_SEED>'.
 
 Existing results are reused. A CSV is only written when it does not exist yet,
 or is older than the sequence file(s) it comes from or the model's weights file
 (e.g. after retraining a model under the same name), and the model is only
-loaded when at least one CSV has to be written. A figure is only drawn when it
-does not exist yet or is older than the CSVs it is drawn from.
-Asking for a figure also writes the CSVs it needs. Set OVERWRITE to True to
-redo everything.
+loaded when at least one CSV has to be written. A figure is only plot when it
+does not exist yet or is older than the CSVs it is plot from.
+
+Set OVERWRITE to True to recompute output files and figures.
 """
 
 import numpy as np
@@ -137,7 +144,7 @@ def write_proba_and_activ_csvs(model, info, trial_files, analysis_output_kinds, 
         #   probs:  dict module → (T-1, N, dim)
         #     'obs':  dim=2, columns are (mean, variance) of the predicted Gaussian
         #     others: dim=n_classes, softmax class probabilities
-        #   norms:  dict module → (T-1, N);  derivs: dict module → (T-2, N)
+        #   norms:  dict module → (T-1, N);  derivs: dict module → (T-1, N), row 0 NaN
         # With include_prior, the probabilities are also read from the prior
         # (first-call) readout of each module, i.e. before the feedback sweep, and
         # the norms and derivatives from the prior hidden states.
@@ -153,7 +160,7 @@ def write_proba_and_activ_csvs(model, info, trial_files, analysis_output_kinds, 
             kinds = analysis_output_kinds_to_write(trial_file, analysis_output_kinds, output_root,
                                                    model_name, info.weights_path, overwrite)
             seq_norms = {name: arr[:, j] for name, arr in norms.items()}      # each: (T-1,)
-            seq_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T-2,)
+            seq_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T-1,)
             seq_prior_norms = None
             seq_prior_derivs = None
             if include_prior:
@@ -207,7 +214,7 @@ def write_pool_activations_csvs(model, info, pools, pool_indices, pool_seed, out
     The sequences of a pool are joined end to end (analysis_core.load_pool_sequence)
     and the model is run once on the result, so that each sequence starts from the
     hidden states the previous one ended with. `pools` is the list of
-    analysis_core.make_sequence_pools drawn with `pool_seed`, and `chunk_size` a
+    analysis_core.make_sequence_pools plot with `pool_seed`, and `chunk_size` a
     number of pools.
     """
     (output_root / model_name / 'pool_activations').mkdir(parents=True, exist_ok=True)
@@ -227,7 +234,7 @@ def write_pool_activations_csvs(model, info, pools, pool_indices, pool_seed, out
         q = torch.tensor(np.stack([loaded_pool[1] for loaded_pool in loaded_pools]),
                          dtype=torch.float32)                           # (N, T_total, n_cue)
 
-        #   norms:  dict module → (T_total-1, N);  derivs: dict module → (T_total-2, N)
+        #   norms and derivs:  dict module → (T_total-1, N)
         # With include_prior, also the norms and derivatives of the prior hidden states.
         forward = get_module_output_and_activity(model, y, q, return_prior=include_prior)
         norms, derivs = forward[1:3]
@@ -237,7 +244,7 @@ def write_pool_activations_csvs(model, info, pools, pool_indices, pool_seed, out
         for j, (pool_index, loaded_pool) in enumerate(zip(chunk, loaded_pools)):
             obs, cue, timesteps = loaded_pool
             pool_norms = {name: arr[:, j] for name, arr in norms.items()}      # each: (T_total-1,)
-            pool_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T_total-2,)
+            pool_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T_total-1,)
             pool_prior_norms = None
             pool_prior_derivs = None
             if include_prior:
@@ -256,7 +263,7 @@ def write_pool_activations_csvs(model, info, pools, pool_indices, pool_seed, out
 
 
 # =============================================================================
-# Figures, drawn from the CSVs
+# Figures, plot from the CSVs
 # =============================================================================
 
 def figure_name(model_name, name, include_derivatives):
@@ -287,7 +294,7 @@ def plot_trajectories(act_csvs, trial_files, output_root, model_name, figure_suf
     `figure_suffix` ends the names of the figures.
 
     The individual figure draws one line and one legend entry per sequence, so it
-    is only drawn when at most `max_individual_trajectories` sequences are selected.
+    is only plot when at most `max_individual_trajectories` sequences are selected.
     """
     # Positions, in `act_csvs` and `trial_files`, of the sequences (or pools) plotted.
     selected_positions = select_files(list(range(len(act_csvs))), n_trajectories, seed=seed)
@@ -308,7 +315,7 @@ def plot_trajectories(act_csvs, trial_files, output_root, model_name, figure_suf
     print(f"[plot_trajectories] using {n_select} activations CSVs")
     if not draw_individual:
         print(f"[plot_trajectories] more than {max_individual_trajectories} sequences: "
-              f"individual trajectories not drawn, averaged figure only")
+              f"individual trajectories not plot, averaged figure only")
 
     # Norms (T-1, N); sequences of unequal length are truncated to the shortest one.
     module_norms_dict = exp.load_activity_norms([act_csvs[i] for i in selected_positions],
@@ -411,8 +418,8 @@ if __name__ == '__main__':
     # ------------------------- SETTINGS (edit these) -------------------------
     MODEL_NAMES = cfg.EVALUATION_MODELS
     MODEL_DIR = cfg.TRAINING_RESULTS_DIR
-    # TRIALS_PATH = cfg.WORKSPACE_ROOT / 'Jasmin' / 'trialsequences_new'
-    TRIALS_PATH = cfg.WORKSPACE_ROOT / 'Jasmin' / 'sub-01'
+    TRIALS_PATH = cfg.WORKSPACE_ROOT / 'Jasmin' / 'trialsequences_new'
+    # TRIALS_PATH = cfg.WORKSPACE_ROOT / 'Jasmin' / 'sub-01'
 
     # Each model writes to OUTPUT_ROOT/<model name>/.
     OUTPUT_ROOT = cfg.RNN_DIR / 'exp_seq_act_output' / TRIALS_PATH.name
@@ -421,10 +428,10 @@ if __name__ == '__main__':
     # CSVs, one per sequence file (the only step that runs the model).
     WRITE_ACTIVATIONS = True
     WRITE_ACTIVATIONS_DEVIANT = False
-    WRITE_PROBABILITIES = False
+    WRITE_PROBABILITIES = True
 
     # Figures, created using data from the CSVs.
-    PLOT_TRAJECTORIES = False
+    PLOT_TRAJECTORIES = True
     PLOT_BY_POSITION = True
     PLOT_DEVIANT = False
 
@@ -441,7 +448,7 @@ if __name__ == '__main__':
     N_TRAJECTORIES = N_SEQUENCES
     # PLOT_TRAJECTORIES draws one line and one legend entry per sequence in its
     # individual figure. Above this number of sequences, only its averaged figure
-    # (mean +/- STD) is drawn: the legend no longer fits, and matplotlib's 10
+    # (mean +/- STD) is plot: the legend no longer fits, and matplotlib's 10
     # default colors start repeating.
     MAX_INDIVIDUAL_TRAJECTORIES = 10
     SEED = 0                        # random file sampling
@@ -468,7 +475,7 @@ if __name__ == '__main__':
     # over the four sequences of each pool, and their names end in
     # '_pools_seed<POOL_SEED>'. Read by run_model_pair_correlations.py with its
     # own SEQUENTIAL_PRESENTATION = True.
-    SEQUENTIAL_PRESENTATION = True
+    SEQUENTIAL_PRESENTATION = False
     POOL_SEED = cfg.POOL_SEED       # random pools; keep it fixed across runs
     # Pools per batched forward pass: a pool is four sequences long, so this
     # keeps the memory of one forward pass the same as with CHUNK_SIZE sequences.

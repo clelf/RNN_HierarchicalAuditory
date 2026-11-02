@@ -59,21 +59,34 @@ def add_module_activity_columns(out_df, norms, derivs, n_out, prefix=''):
     out_df : pandas.DataFrame
         Frame to add the columns to, modified in place.
     norms : dict
-        Module name → ndarray of shape (n_out,).
+        Module name → ndarray of shape (n_out,); row t holds the norm after
+        seeing the observation of timestep t.
     derivs : dict
-        Module name → ndarray of shape (n_out - 1,), padded with NaN on the right
-        so every column of the frame has the same length.
+        Module name → ndarray of shape (n_out,), as returned by compute_derivatives:
+        row t holds norms[t] - norms[t-1], the change in activity on the arrival
+        of the observation of timestep t, and row 0 is NaN.
     n_out : int
         Number of rows of the frame, i.e. of model output timesteps.
     prefix : str
         Prepended to every column name written here.
     """
-    n_deriv = next(iter(derivs.values())).shape[0]
-    pad = np.full(n_out - n_deriv, np.nan)
     for name in MODULES:
         out_df[f'{prefix}{name}_norm'] = norms[name]
     for name in MODULES:
-        out_df[f'{prefix}{name}_deriv'] = np.concatenate([derivs[name], pad])
+        out_df[f'{prefix}{name}_deriv'] = derivs[name]
+
+
+def get_two_cue_encoding(cue):
+    """The two cues of a sequence as a (T, 2) one-hot, from the model's (T, n_cue_classes) cue input.
+
+    `cue` may be a (T, n_cue_classes) one-hot where only the two cues used in this
+    sequence are ever active (analysis_core.load_trial_sequence). The two active
+    columns are recovered in ascending class order, matching CUE_LABELS order, so
+    the CSVs keep their original two-cue encoding. `cue` must be the whole
+    sequence, so that both cues are present in it.
+    """
+    used_cols = np.flatnonzero(cue.any(axis=0))
+    return cue[:, used_cols]
 
 
 def build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs):
@@ -81,8 +94,13 @@ def build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_der
 
     The part of the activations CSVs shared by single sequences
     (build_activations_frame) and pools of sequences (build_pool_activations_frame).
-    Rows are the model output timesteps; the observation and cue columns are the
-    raw (unshifted) ones at those same timesteps.
+    Rows are the model output timesteps t = 0 ... T-2 of the 'timestep' column,
+    the absolute position in the sequence of the observation `obs[t]` of the same
+    row; the observation and cue columns are the raw (unshifted) ones at those
+    timesteps. The norm of a row is the activity after seeing `obs[t]`, and its
+    derivative the change in activity on the arrival of `obs[t]` (NaN at t = 0).
+    The probabilities CSVs use the same 'timestep' column, so the two kinds of
+    output are aligned by joining on it (merge_activations_and_probabilities).
 
     `prior_norms` / `prior_derivs`, when not None (get_module_output_and_activity(...,
     return_prior=True)), add the same columns computed on the prior hidden states,
@@ -91,19 +109,15 @@ def build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_der
     n_out = next(iter(norms.values())).shape[0]
 
     obs_out = obs[:n_out]
-    # `cue` may be a (T, n_cue_classes) one-hot where only the two cues used in this
-    # sequence are ever active. Recover those two columns (ascending class order,
-    # matching CUE_LABELS order) so the CSV keeps its original two-cue encoding.
-    used_cols = np.flatnonzero(cue.any(axis=0))
-    cue_out = cue[:n_out][:, used_cols]  # (n_out, 2)
+    cue_out = get_two_cue_encoding(cue)[:n_out]  # (n_out, 2)
 
     out_df = pd.DataFrame({
+        'timestep':     np.arange(n_out),
         'observation':  obs_out,
         'cue_1':        cue_out[:, 0].astype(int),
         'cue_2':        cue_out[:, 1].astype(int),
     })
 
-    # Derivatives are one step shorter than the norms and get NaN-padded inside.
     add_module_activity_columns(out_df, norms, derivs, n_out)
 
     if prior_norms is not None:
@@ -116,8 +130,10 @@ def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_
                             prior_norms=None, prior_derivs=None):
     """Per-timestep activity CSV of one sequence: one row per model output timestep.
 
-    Rows are the T-1 model output timesteps; the sequence columns are the raw
-    (unshifted) observation and cue at those same timesteps.
+    Rows are the T-1 model output timesteps t = 0 ... T-2 ('timestep' column); the
+    sequence columns are the raw (unshifted) observation and cue at those same
+    timesteps. See build_activity_columns_frame for what the norms and
+    derivatives of a row are.
 
     `prior_norms` / `prior_derivs`, when given (get_module_output_and_activity(...,
     return_prior=True)), add the same columns computed on the prior hidden states,
@@ -140,7 +156,8 @@ def build_pool_activations_frame(obs, cue, norms, derivs, timesteps, prior_norms
     parameters change from one sequence of the pool to the next, so they are
     per-timestep columns here, taken from `timesteps`: 'sequence_name',
     'pool_position', 'lim_std', 'd', 'tau_std' and 'trial_n'. Rows are the T_total-1
-    model output timesteps: the last timestep of the last sequence has none.
+    model output timesteps t = 0 ... T_total-2: the last timestep of the last
+    sequence has none. 'timestep' runs over the joined sequences of the pool.
     """
     out_df = build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs)
     n_out = len(out_df)
@@ -149,17 +166,18 @@ def build_pool_activations_frame(obs, cue, norms, derivs, timesteps, prior_norms
     return out_df
 
 
-def add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, n_deriv,
-                                        prefix=''):
+def add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, prefix=''):
     """Append per-module activity sampled at the deviant timestep of each trial.
 
     Same column block as add_module_activity_columns, but one row per trial: each
-    module's norm and derivative are gathered at that trial's deviant timestep.
+    module's norm and derivative are gathered at that trial's deviant timestep
+    `dev_idx`: the norm is the activity after seeing the deviant, the derivative
+    the change in activity on its arrival, derivs[dev_idx] (see compute_derivatives).
     """
     for name in MODULES:
         out_df[f'{prefix}{name}_norm'] = read_trial_at(norms[name], dev_idx, n_out)
     for name in MODULES:
-        out_df[f'{prefix}{name}_deriv'] = read_trial_at(derivs[name], dev_idx, n_deriv)
+        out_df[f'{prefix}{name}_deriv'] = read_trial_at(derivs[name], dev_idx, n_out)
 
 
 def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, tau_std,
@@ -176,8 +194,7 @@ def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, ta
     `prior_norms` / `prior_derivs`, when given, add the same columns computed on the
     prior hidden states, under a 'prior_' prefix.
     """
-    n_out = next(iter(norms.values())).shape[0]     # T-1
-    n_deriv = next(iter(derivs.values())).shape[0]  # T-2
+    n_out = next(iter(norms.values())).shape[0]     # T-1: norms and derivs at timesteps 0 ... T-2
 
     # dpos is constant within a trial, so take the first timestep of each trial.
     T = obs.shape[0]
@@ -190,15 +207,16 @@ def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, ta
     deviant_pos = deviant_pos_phys + dpos_shift
 
     out_df = pd.DataFrame({
+        'timestep':     dev_idx,
         'trial_n':      trial_ids,
         'deviant_pos':  deviant_pos,
     })
 
-    add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, n_deriv)
+    add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out)
 
     if prior_norms is not None:
         add_module_deviant_activity_columns(out_df, prior_norms, prior_derivs, dev_idx,
-                                            n_out, n_deriv, prefix='prior_')
+                                            n_out, prefix='prior_')
 
     out_df['lim_std'] = lim_std
     out_df['d'] = d
@@ -256,6 +274,13 @@ def build_probabilities_frame(obs, cue, ctx, dpos_model, rule, probs,
                               prior_probs=None):
     """Predicted distributions + ground-truth likelihoods, per timestep.
 
+    Rows are the T-1 model outputs; output k is the prediction made after seeing
+    `obs[k]`, of the observation of timestep k+1. The 'timestep' column is that
+    predicted timestep, 1 ... T-1, so that the 'observation' of a row is
+    `obs[timestep]`, as in the activations CSVs (build_activity_columns_frame),
+    and the two align by joining on 'timestep'
+    (merge_activations_and_probabilities).
+
     `dpos_model` must already be in the model's convention (raw + shift), so that
     dpos_model - dpos_min is a valid 0-based class index.
 
@@ -271,7 +296,7 @@ def build_probabilities_frame(obs, cue, ctx, dpos_model, rule, probs,
 
     # Next-step prediction alignment: ground truth that each output row is predicting.
     obs_gt = obs[1:n_out + 1]           # (n_out,)
-    cue_gt = cue[1:n_out + 1, :]        # (n_out, 2)
+    cue_gt = get_two_cue_encoding(cue)[1:n_out + 1]  # (n_out, 2)
     ctx_gt = ctx[1:n_out + 1]           # (n_out,)
     dpos_gt = dpos_model[1:n_out + 1]   # (n_out,)
     rule_gt = rule[1:n_out + 1]         # (n_out,)
@@ -283,6 +308,7 @@ def build_probabilities_frame(obs, cue, ctx, dpos_model, rule, probs,
     # next-step (prediction-target) values so every column in a row refers to the
     # same timestep as that row's likelihoods.
     out_df = pd.DataFrame({
+        'timestep':     np.arange(1, n_out + 1),
         'observation':  obs_gt,
         'cue_1':        cue_gt[:, 0].astype(int),
         'cue_2':        cue_gt[:, 1].astype(int),
@@ -303,6 +329,35 @@ def build_probabilities_frame(obs, cue, ctx, dpos_model, rule, probs,
     out_df['tau_std'] = tau_std
     out_df['trial_n'] = trial_n.values[1:n_out + 1]
     return out_df
+
+
+def merge_activations_and_probabilities(activations_df, probabilities_df):
+    """Activations and probabilities of one sequence, one row per timestep of the sequence.
+
+    Outer join of the two CSVs on 'timestep', the absolute position in the
+    sequence of the observation of the row (t = 0 ... T-1). The edge timesteps
+    are kept with NaN where an output does not exist: the probabilities have no
+    row at t = 0 (nothing precedes the first observation), the activations no
+    row at t = T-1 (the model is not run on the last observation), and the
+    derivatives none at t = 0. The columns shared by both CSVs (observation,
+    cues, sequence parameters, trial_n) are filled from whichever side has the
+    row, and must agree where both have it.
+
+    Both CSVs must come from the same sequence (or pool) and model run.
+    """
+    merged_df = pd.merge(activations_df, probabilities_df, on='timestep', how='outer',
+                         suffixes=('', '_probabilities'))
+    shared_columns = [c for c in activations_df.columns
+                      if c in probabilities_df.columns and c != 'timestep']
+    for column in shared_columns:
+        from_probabilities = merged_df.pop(f'{column}_probabilities')
+        both = merged_df[column].notna() & from_probabilities.notna()
+        if not np.allclose(merged_df.loc[both, column].to_numpy(dtype=float),
+                           from_probabilities[both].to_numpy(dtype=float)):
+            raise ValueError(f"Column '{column}' differs between the activations and "
+                             f"probabilities rows of the same timestep")
+        merged_df[column] = merged_df[column].combine_first(from_probabilities)
+    return merged_df.sort_values('timestep').reset_index(drop=True)
 
 
 def subset_deviant_rows(out_df, include_next_stimulus):
@@ -502,8 +557,9 @@ def compute_pairwise_module_correlations(module_norms_dict, use_derivatives=Fals
                 activity_j = module_norms_dict[name_j]
 
                 if use_derivatives:
-                    activity_i = compute_derivatives(activity_i)
-                    activity_j = compute_derivatives(activity_j)
+                    # Row 0 of the derivatives is NaN, nothing precedes it.
+                    activity_i = compute_derivatives(activity_i)[1:]
+                    activity_j = compute_derivatives(activity_j)[1:]
 
                 flat_i = activity_i.reshape(-1)
                 flat_j = activity_j.reshape(-1)
@@ -555,7 +611,7 @@ def compute_intermodule_correlations(module_norms_dict, use_derivatives=False, a
 def load_module_dict(df, suffix):
     """Build {module_name: 1D array} from columns named '<module>_<suffix>'.
 
-    Rows with NaN (e.g. the padded last derivative timestep) are dropped so all
+    Rows with NaN (e.g. the padded first derivative timestep) are dropped so all
     modules keep the same length.
     """
     cols = [f'{m}_{suffix}' for m in MODULES]
@@ -759,7 +815,7 @@ def load_timestep_means(seq_files, with_position=False):
     for f in seq_files:
         seq_df = pd.read_csv(f)
         sub = seq_df[[f'{m}_norm' for m in MODULES]].copy()
-        sub['timestep'] = range(len(sub))
+        sub['timestep'] = seq_df['timestep']
         if with_position:
             # 0-based index of the timestep within its trial
             sub['position'] = seq_df.groupby('trial_n').cumcount()

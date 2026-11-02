@@ -129,7 +129,7 @@ def correlate_model_activation_quantities(dfs, model_names, quantities, mean_abs
     each module and quantity, the time course of every model is correlated with
     the time course of every other model (Pearson), and the mean over the pairs
     is added: of the absolute correlations if `mean_abs`, of the signed ones
-    otherwise. Timesteps where a model has no value (the last row of the
+    otherwise. Timesteps where a model has no value (the first row of the
     derivatives, padded with NaN in the CSVs) are left out of every pair. Every
     row starts with the columns of `row_start`, which identify the sequence or pool.
     """
@@ -181,13 +181,13 @@ def get_sequence_activation_quantities(dfs, model_names, quantities, sequence_or
     pair of columns to scatter against each other, plus the timestep the row
     comes from ('timestep') and its within-trial position ('trial_position'),
     both the same for every model since they are all given the same input.
-    Timesteps where a model has no value (the last row of the derivatives,
+    Timesteps where a model has no value (the first row of the derivatives,
     padded with NaN in the CSVs) are left out, as in
     correlate_model_activation_quantities, so that every row holds a value for
     every model.
     """
     trial_positions = get_trial_positions(dfs[model_names[0]])
-    timesteps = np.arange(len(dfs[model_names[0]]))
+    timesteps = dfs[model_names[0]]['timestep'].to_numpy()
     tables = []
     for module in MODULE_NAMES:
         for quantity in quantities:

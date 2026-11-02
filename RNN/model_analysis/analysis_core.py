@@ -935,6 +935,12 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False
     module_probabilities_from_output), and the hidden states of the requested
     layer are reduced across neuron units with an L2 norm, then differentiated.
 
+    The model is run on y[:, :-1], so index k of every output along the time axis
+    refers to the hidden state or readout after seeing y[:, k]. The probabilities
+    at index k are the prediction of timestep k+1. The derivatives are forward
+    differences placed at the timestep whose arrival caused the change,
+    derivatives[k] = activity[k] - activity[k-1], with NaN at k = 0.
+
     Parameters
     ----------
     model : nn.Module
@@ -953,15 +959,15 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False
     Returns
     -------
     probabilities : dict
-        Module name → ndarray of shape (seq_len, batch, dim), from the posterior
+        Module name → ndarray of shape (seq_len-1, batch, dim), from the posterior
         readouts:
         - 'obs':  dim = 2, columns are (mean, variance) -- a *variance*, the
           quantity passed to GaussianNLLLoss at training time
         - others: dim = n_classes, softmax class probabilities
     hidden_activity : dict
-        Module name → ndarray of shape (seq_len, batch).
-    hidden_derivatives : dict
         Module name → ndarray of shape (seq_len-1, batch).
+    hidden_derivatives : dict
+        Module name → ndarray of shape (seq_len-1, batch); row 0 is NaN.
     prior_probabilities, prior_activity, prior_derivatives : dict
         The same, from the prior readouts and hidden states. Returned only when
         return_prior=True.
@@ -1142,19 +1148,22 @@ def class_likelihood(class_probs, labels):
 
 
 def compute_derivatives(norms):
-    """Compute temporal derivative (finite differences) of activity norms.
+    """Temporal derivative (finite differences) of activity norms, aligned with the norms.
 
     Parameters
     ----------
     norms : np.ndarray
-        Shape (seq_len, batch)
+        Shape (n_timesteps, batch)
 
     Returns
     -------
     derivatives : np.ndarray
-        Shape (seq_len-1, batch) - derivative at each timestep
+        Shape (n_timesteps, batch); derivatives[k] = norms[k] - norms[k-1], the
+        change in activity on the arrival of timestep k. Row 0 is NaN: nothing
+        precedes it.
     """
-    return np.diff(norms, axis=0)
+    first_row = np.full((1,) + norms.shape[1:], np.nan)
+    return np.concatenate([first_row, np.diff(norms, axis=0)])
 
 
 def read_trial_at(seq, idx, length):
@@ -1162,7 +1171,7 @@ def read_trial_at(seq, idx, length):
 
     Used to sample one value per trial at the trial's deviant timestep; the very
     last within-trial position of the last trial can fall past the activity array
-    (which is one step shorter than the raw sequence), so it becomes NaN.
+    (T-1 long, the model not being run on the last observation), so it becomes NaN.
     """
     out = np.full(len(idx), np.nan, dtype=float)
     valid = idx < length
