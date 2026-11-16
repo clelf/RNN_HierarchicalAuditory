@@ -531,7 +531,7 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             x_t = x[:, t:t+1, :]   # (batch, 1, obs_dim)   -- keeps 3-D shape for GRU
             q_t = q[:, t:t+1, :]   # (batch, 1, cue_dim)
 
-            # --- FORWARD PASS (prior sweep) ---
+            # FORWARD PASS (prior)
 
             # 1) Cues through rule module
             prior_rule_output, prior_rule_output_ext, rule_hx = self.rule_module(q_t, hx=rule_hx, return_hidden=True)
@@ -556,7 +556,7 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             # 5) Actual observation processed with prior-informed hidden state
             posterior_obs_output, posterior_obs_output_ext, obs_hx = self.observation_module(x_t, hx=obs_hx, return_hidden=True)  # posterior-informed output and hidden state
 
-            # --- FEEDBACK PASS ---
+            # FEEDBACK PASS (posterior)
 
             # 6) Obs → ctx
             enc_obs2ctx = self.readout_obs2ctx(posterior_obs_output)        # (batch, 1, N_ctx)
