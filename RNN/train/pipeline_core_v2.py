@@ -73,7 +73,7 @@ if os.path.exists(os.path.join(base_path, 'Kalman')):
     from Kalman.kalman_core import contexts_to_probabilities
 elif os.path.exists(os.path.join(base_path, 'KalmanFilterViz1D')):
     from KalmanFilterViz1D.kalman_fit_em import MIN_OBS_FOR_EM, kalman_online_fit_predict_multicontext
-    from Kalman.kalman_core import contexts_to_probabilities
+    from KalmanFilterViz1D.kalman_core import contexts_to_probabilities
 else:
     raise ImportError("Neither 'Kalman' nor 'KalmanFilterViz1D' folder found.")
 

@@ -1345,7 +1345,7 @@ def plot_dpos_prob_hist(avg_df, model_name, value_col, bins=30):
     """Histogram of the per-sequence means, with the overall mean marked.
 
     `value_col` is the summariser's output column for the averaged quantity --
-    'mean_lik_dpos' for the probability of the true deviant-position class.
+    'mean_posterior_lik_dpos' for the probability of the true deviant-position class.
     """
     means = avg_df[value_col].to_numpy(dtype=float)
     valid = means[~np.isnan(means)]

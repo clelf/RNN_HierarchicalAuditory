@@ -98,7 +98,7 @@ if __name__ == '__main__':
             # ...) that the extraction does not copy into the deviant files.
             avg_df = exp.summarise_deviant_files(
                 model_root / 'probabilities_deviant', model_name,
-                value_cols=['lik_dpos'], trials_path=cfg.TRIALS_PATH)
+                value_cols=['posterior_lik_dpos'], trials_path=cfg.TRIALS_PATH)
             if avg_df.empty:
                 continue
             found.append(model_name)
@@ -107,7 +107,7 @@ if __name__ == '__main__':
             avg_df.to_csv(outputs[0], index=False)
             print(f"Saved per-sequence means: {outputs[0]}")
 
-            fig = plots.plot_dpos_prob_hist(avg_df, model_name, 'mean_lik_dpos')
+            fig = plots.plot_dpos_prob_hist(avg_df, model_name, 'mean_posterior_lik_dpos')
             plots.save_figure(fig, avg_path, outputs[1].name)
 
         skipped = [m for m in MODEL_NAMES if m not in found]
@@ -119,7 +119,7 @@ if __name__ == '__main__':
         print(f"\n{'=' * 79}\nActivity against likelihood at the deviant\n{'=' * 79}")
         activity_cols = [f'{m}_norm' for m in cfg.MODULE_NAMES] + ['mean_norm']
         activity_labels = [f'{m} act.' for m in cfg.MODULE_NAMES] + ['mean act.']
-        likelihood_cols = [f'lik_{m}' for m in cfg.MODULE_NAMES]
+        likelihood_cols = [f'posterior_lik_{m}' for m in cfg.MODULE_NAMES]
         likelihood_labels = [f'lik {m}' for m in cfg.MODULE_NAMES]
 
         for model_name in MODEL_NAMES:

@@ -644,14 +644,19 @@ def outputs_up_to_date(outputs, sources):
     return all(p.stat().st_mtime <= oldest_output for p in sources)
 
 
-def class_probability_columns(columns, module):
-    """The '<module>_p<c>' columns of a probabilities CSV, in class order.
+def class_probability_columns(columns, module, prefix):
+    """Names of the '<prefix><module>_p<c>' columns of a probabilities CSV, in class order.
 
     Built from the class count rather than sorted by name, so class 10 cannot
     land between classes 1 and 2.
+
+    Parameters
+    ----------
+    prefix : str
+        'posterior_' for the posterior readouts, 'prior_' for the prior ones.
     """
-    n_classes = sum(c.startswith(f'{module}_p') for c in columns)
-    return [f'{module}_p{c}' for c in range(n_classes)]
+    n_classes = sum(c.startswith(f'{prefix}{module}_p') for c in columns)
+    return [f'{prefix}{module}_p{c}' for c in range(n_classes)]
 
 
 # =============================================================================
@@ -971,6 +976,10 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False
     prior_probabilities, prior_activity, prior_derivatives : dict
         The same, from the prior readouts and hidden states. Returned only when
         return_prior=True.
+    prior_update, posterior_update : dict
+        Module name → ndarray of shape (seq_len-1, batch): size of the hidden state
+        change caused by each pass (see compute_hidden_states_update). Returned only
+        when return_prior=True.
     """
     with torch.no_grad():
         forward_output = model(y[:, :-1, :], q[:, :-1, :],
@@ -978,16 +987,20 @@ def get_module_output_and_activity(model, y, q, layer_idx=-1, return_prior=False
 
     probabilities = module_probabilities_from_output(model, forward_output, prior=False)
     hidden_activity = compute_hidden_norms(forward_output['posterior_hidden'], layer_idx=layer_idx)
-    hidden_derivatives = {name: compute_derivatives(norms) for name, norms in hidden_activity.items()}
+    posterior_derivatives = {name: compute_derivatives(norms) for name, norms in hidden_activity.items()}
 
     if return_prior:
         prior_probabilities = module_probabilities_from_output(model, forward_output, prior=True)
         prior_activity = compute_hidden_norms(forward_output['prior_hidden'], layer_idx=layer_idx)
         prior_derivatives = {name: compute_derivatives(norms) for name, norms in prior_activity.items()}
-        return (probabilities, hidden_activity, hidden_derivatives,
-                prior_probabilities, prior_activity, prior_derivatives)
+        prior_update, posterior_update = compute_hidden_states_update(
+            forward_output['h0'], forward_output['prior_hidden'], forward_output['posterior_hidden'],
+            layer_idx=layer_idx)
+        return (probabilities, hidden_activity, posterior_derivatives,
+                prior_probabilities, prior_activity, prior_derivatives,
+                prior_update, posterior_update)
 
-    return probabilities, hidden_activity, hidden_derivatives
+    return probabilities, hidden_activity, posterior_derivatives
 
 
 def module_probabilities_from_output(model, model_output, prior=False):
@@ -1148,7 +1161,7 @@ def class_likelihood(class_probs, labels):
 
 
 def compute_derivatives(norms):
-    """Temporal derivative (finite differences) of activity norms, aligned with the norms.
+    """Temporal derivative of activity norms, aligned with the norms.
 
     Parameters
     ----------
@@ -1164,6 +1177,46 @@ def compute_derivatives(norms):
     """
     first_row = np.full((1,) + norms.shape[1:], np.nan)
     return np.concatenate([first_row, np.diff(norms, axis=0)])
+
+
+
+
+def compute_hidden_states_update(initial_hidden_states, hidden_states_prior, hidden_states_posterior, layer_idx=-1):
+    """Update in each module's hidden state caused by the incoming information at one given pass.
+    (More specifically: L2 norm across units of the difference states_{after}-states_{before})
+
+    One update per pass:
+    - prior pass: hidden states of module after prior pass - hidden states of module after last timestep's posterior pass (takes h0 for timestep 0)
+    - posterior pass: hidden states of module after posterior pass - hidden states of module after prior pass
+
+    Parameters
+    ----------
+    initial_hidden_states : dict
+        Module name → tensor of shape (n_layers, batch, hidden_dim), as in the 'h0'
+        output of PopulationNetwork.forward.
+    hidden_states_prior, hidden_states_posterior : dict
+        Module name → tensor of shape (seq_len, n_layers, batch, hidden_dim), as in
+        the 'prior_hidden' and 'posterior_hidden' outputs of PopulationNetwork.forward.
+
+    Returns
+    -------
+    prior_update, posterior_update : dict
+        Module name → ndarray of shape (seq_len, batch).
+    """
+    prior_update = {}
+    posterior_update = {}
+    for module_name, hidden_prior in hidden_states_prior.items():
+        hidden_posterior = hidden_states_posterior[module_name] # hidden_states_prior and hidden_states_posterior share the same key
+        initial_hidden = initial_hidden_states[module_name]
+
+        # Define hidden states before the prior: posterior of last timestep, and initial hidden states at t=0 (excluding last posterior at last timestep for equal shapes with other variables and since not used)
+        hidden_before_prior = torch.cat([initial_hidden.unsqueeze(0), hidden_posterior[:-1]], dim=0)
+
+        prior_change = (hidden_prior - hidden_before_prior)[:, layer_idx].cpu().numpy()       # (seq_len, batch, hidden_dim)
+        posterior_change = (hidden_posterior - hidden_prior)[:, layer_idx].cpu().numpy()
+        prior_update[module_name] = np.linalg.norm(prior_change, axis=2)                      # (seq_len, batch)
+        posterior_update[module_name] = np.linalg.norm(posterior_change, axis=2)
+    return prior_update, posterior_update
 
 
 def read_trial_at(seq, idx, length):

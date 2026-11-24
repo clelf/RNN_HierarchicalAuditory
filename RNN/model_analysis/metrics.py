@@ -40,8 +40,8 @@ from analysis_core import (
 )
 
 # Kalman-filter benchmark machinery (config-agnostic numerics).
-from Kalman.kalman import (
-    kalman_online_fit_predict_multicontext,
+from Kalman.kalman_fit_em import kalman_online_fit_predict_multicontext
+from Kalman.kalman_core import (
     likelihood_observation,
     contexts_to_probabilities,
 )
@@ -49,9 +49,9 @@ from Kalman.kalman import (
 # from PreProParadigm/model_RTs.py (single source of truth). They accept a
 # `valid_positions` arg so the same math applies to the RNN HierarchicalGM's
 # rules_dpos_set instead of the old hard-coded positions.
-from PreProParadigm.model_RTs import (
-    prior_dpos_given_prev_rule,
-    pior_dpos_given_prev_rule_and_stds,
+from PreProParadigm.models.baseline_models import (
+    prior_tone_is_dev_given_rule_and_prev_stds,
+    prior_tone_is_dev_given_prev_rule_and_prev_stds,
 )
 
 
@@ -404,8 +404,8 @@ def compute_dev_probabilities(dpos_long, rules_long, n_tones, rules_dpos_set,
     This is the structural part of the benchmark: it depends only on the sequence
     labels (deviant position and rule), not on the observations or any KF
     estimation. It marginalizes the deviant-position and rule levels, reusing
-    prior_dpos_given_prev_rule (the position conditional within a rule) and
-    pior_dpos_given_prev_rule_and_stds (its marginalization over rules) from
+    prior_tone_is_dev_given_rule_and_prev_stds (the position conditional within a rule) and
+    prior_tone_is_dev_given_prev_rule_and_prev_stds (its marginalization over rules) from
     PreProParadigm.model_RTs.
 
     Index convention: index t corresponds to predicting y[t]; j = t % n_tones is
@@ -460,11 +460,11 @@ def compute_dev_probabilities(dpos_long, rules_long, n_tones, rules_dpos_set,
                 continue  # one deviant per trial: positions after it are standards
             if trial == 0:
                 # first trial: no previous rule observed -> uniform rule prior
-                p_dev[i, t] = sum(prior_dpos_given_prev_rule(j, r, valid_positions)
+                p_dev[i, t] = sum(prior_tone_is_dev_given_rule_and_prev_stds(j, r, valid_positions)
                                   for r in valid_positions) / n_rules
             else:
                 prev_rule = int(rules_long[i, trial * n_tones - 1])
-                p_dev[i, t] = pior_dpos_given_prev_rule_and_stds(
+                p_dev[i, t] = prior_tone_is_dev_given_prev_rule_and_prev_stds(
                     j, pi_rules, prev_rule, valid_positions)
     return p_dev[0] if single else p_dev
 

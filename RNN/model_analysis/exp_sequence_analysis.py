@@ -225,12 +225,13 @@ def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, ta
 
 
 def add_module_probability_columns(out_df, probs, obs_gt, ctx_gt, dpos_gt, rule_gt,
-                                   dpos_min, prefix=''):
+                                   dpos_min, prefix):
     """Append one block of module distributions + ground-truth likelihoods to `out_df`.
 
-    Called once per readout of a forward pass: with prefix='' for the posterior
-    readouts (the ones supervised during training) and with prefix='prior_' for the
-    prior readouts, so the two blocks sit side by side in the same row.
+    Called once per readout of a forward pass: with prefix='posterior_' for the
+    posterior readouts (the ones supervised during training) and with
+    prefix='prior_' for the prior readouts, so the two blocks sit side by side in
+    the same row.
 
     Parameters
     ----------
@@ -284,10 +285,10 @@ def build_probabilities_frame(obs, cue, ctx, dpos_model, rule, probs,
     `dpos_model` must already be in the model's convention (raw + shift), so that
     dpos_model - dpos_min is a valid 0-based class index.
 
-    `prior_probs`, when given (get_module_output_and_activity(..., return_prior=True)),
-    adds the same columns computed on the prior readouts, under a 'prior_' prefix.
-    The unprefixed columns always hold the posterior readouts, so files written
-    without priors stay readable by the downstream summaries unchanged.
+    The distribution and likelihood columns of the posterior readouts carry a
+    'posterior_' prefix (e.g. 'posterior_lik_dpos'). `prior_probs`, when given
+    (get_module_output_and_activity(..., return_prior=True)), adds the same columns
+    computed on the prior readouts, under a 'prior_' prefix.
     """
     # Number of timesteps in the output: T-1 (the model is run on y[:, :-1]).
     # The model output at index k predicts timestep k+1, so the outputs align
@@ -317,7 +318,8 @@ def build_probabilities_frame(obs, cue, ctx, dpos_model, rule, probs,
         'rule':         rule_gt,
     })
 
-    add_module_probability_columns(out_df, probs, obs_gt, ctx_gt, dpos_gt, rule_gt, dpos_min)
+    add_module_probability_columns(out_df, probs, obs_gt, ctx_gt, dpos_gt, rule_gt,
+                                   dpos_min, prefix='posterior_')
 
     if prior_probs is not None:
         prior_probs = {name: arr[:, 0, :] for name, arr in prior_probs.items()}
@@ -375,11 +377,12 @@ def subset_deviant_rows(out_df, include_next_stimulus):
 
 # ── Reading and summarising ───────────────────────────────────────────────────
 def add_derived_likelihoods(df):
-    """Add the likelihood columns the extraction stage does not store."""
-    df["cdf_lik_obs"] = scipy.stats.norm.cdf(
-        (df["observation"] - df["obs_mean"]) / np.sqrt(df["obs_var"])
+    """Add the posterior likelihood columns run_exp_trials_pipeline.py does not store."""
+    df["posterior_cdf_lik_obs"] = scipy.stats.norm.cdf(
+        (df["observation"] - df["posterior_obs_mean"]) / np.sqrt(df["posterior_obs_var"])
     )
-    df["log_lik_obs"] = np.log(df["lik_obs"] + 1e-8)  # Add small constant to avoid log(0)
+    # Small constant to avoid log(0)
+    df["posterior_log_lik_obs"] = np.log(df["posterior_lik_obs"] + 1e-8)
     return df
 
 
@@ -655,8 +658,8 @@ def load_deviant_likelihoods(prob_csv, context_label=1, module_names=MODULE_NAME
     The probabilities file has one row per timestep, where the ``ctx`` column is
     the next-step ground-truth context label (1 marks the deviant tone). Filtering
     to ``ctx == context_label`` therefore keeps exactly the deviant of each trial,
-    and ``lik_<module>`` on that row is the likelihood the model assigned to the
-    deviant. There is one such row per trial (verified on the data), but if a file
+    and ``posterior_lik_<module>`` on that row is the likelihood the posterior
+    readout of the model assigned to the deviant. There is one such row per trial (verified on the data), but if a file
     ever had more, duplicates are averaged within a trial.
 
     Parameters
@@ -666,16 +669,16 @@ def load_deviant_likelihoods(prob_csv, context_label=1, module_names=MODULE_NAME
     context_label : int
         Context label marking the deviant tone (default 1).
     module_names : list of str
-        Modules whose likelihood columns (``lik_<module>``) to keep.
+        Modules whose likelihood columns (``posterior_lik_<module>``) to keep.
 
     Returns
     -------
     pandas.DataFrame
-        Columns: trial_n, deviant_pos, lik_<module> for each module.
+        Columns: trial_n, deviant_pos, posterior_lik_<module> for each module.
     """
     df = pd.read_csv(prob_csv)
     dev = df[df['ctx'] == context_label].copy()
-    lik_cols = [f'lik_{m}' for m in module_names]
+    lik_cols = [f'posterior_lik_{m}' for m in module_names]
     keep = ['trial_n', 'dpos'] + lik_cols
     dev = dev[keep].rename(columns={'dpos': 'deviant_pos'})
     dev = dev.groupby(['trial_n', 'deviant_pos'], as_index=False)[lik_cols].mean()
@@ -897,17 +900,18 @@ def load_deviant_activity_frame(dev_files, dpos_shift):
 
 
 def predictions_from_probabilities(prob_df, dpos_min):
-    """One sequence's model predictions, rebuilt from its probabilities CSV.
+    """One sequence's model predictions, rebuilt from the posterior columns of its probabilities CSV.
 
     Same keys and layout as pipeline_core_v2.get_model_predictions returns for a
     batch of one sequence: (1, T-1) for estimates and predicted labels, and
     (1, T-1, n_classes) for class probabilities. Predicted dpos labels are in the
     model's convention (class index + dpos_min), like the dpos column of the CSV.
     """
-    pred = {'mu_estim': prob_df['obs_mean'].to_numpy()[None],
-            'sigma_estim': np.sqrt(prob_df['obs_var'].to_numpy())[None]}
+    pred = {'mu_estim': prob_df['posterior_obs_mean'].to_numpy()[None],
+            'sigma_estim': np.sqrt(prob_df['posterior_obs_var'].to_numpy())[None]}
     for module in ('ctx', 'dpos', 'rule'):
-        probs = prob_df[class_probability_columns(prob_df.columns, module)].to_numpy()[None]
+        probs = prob_df[class_probability_columns(prob_df.columns, module,
+                                                  'posterior_')].to_numpy()[None]
         pred[f'{module}_prob'] = probs
         pred[f'{module}_pred'] = probs.argmax(axis=-1)
     pred['dpos_pred'] = pred['dpos_pred'] + dpos_min

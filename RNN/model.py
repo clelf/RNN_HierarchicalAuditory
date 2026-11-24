@@ -483,6 +483,10 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             - 'prior'            : prior readouts                   (if return_prior)
             - 'posterior_hidden' : posterior hidden states,         (if return_hidden)
                                    (seq_len, n_layers, batch, hidden_dim)
+            - 'h0'               : initial hidden states, the state (if return_hidden)
+                                   each module holds before the
+                                   first timestep,
+                                   (n_layers, batch, hidden_dim)
             - 'prior_hidden'     : prior hidden states              (if both)
             Groups that were not requested are absent. The posterior hidden state of
             a module is the one it holds at the end of the timestep (after its
@@ -491,10 +495,15 @@ class PopulationNetwork(ObsCtxModuleNetwork):
         batch_size, seq_len, _ = x.size()
 
         # Initialise hidden states for all four modules
-        rule_hx = self.rule_module.init_hidden(batch_size)
-        dpos_hx = self.dpos_module.init_hidden(batch_size)
-        ctx_hx  = self.context_module.init_hidden(batch_size)
-        obs_hx  = self.observation_module.init_hidden(batch_size)
+        obs_hx_0  = self.observation_module.init_hidden(batch_size)
+        ctx_hx_0  = self.context_module.init_hidden(batch_size)
+        dpos_hx_0 = self.dpos_module.init_hidden(batch_size)
+        rule_hx_0 = self.rule_module.init_hidden(batch_size)
+       
+        obs_hx  = obs_hx_0
+        ctx_hx  = ctx_hx_0
+        dpos_hx = dpos_hx_0
+        rule_hx = rule_hx_0
 
         # Accumulators for outputs across time
         obs_outputs  = []
@@ -553,10 +562,10 @@ class PopulationNetwork(ObsCtxModuleNetwork):
             _, prior_obs_output_ext, obs_hx = self.observation_module(enc_ctx2obs, hx=obs_hx, return_hidden=True)
             prior_obs_hx = obs_hx
 
+            # FEEDBACK PASS (posterior)
+
             # 5) Actual observation processed with prior-informed hidden state
             posterior_obs_output, posterior_obs_output_ext, obs_hx = self.observation_module(x_t, hx=obs_hx, return_hidden=True)  # posterior-informed output and hidden state
-
-            # FEEDBACK PASS (posterior)
 
             # 6) Obs → ctx
             enc_obs2ctx = self.readout_obs2ctx(posterior_obs_output)        # (batch, 1, N_ctx)
@@ -619,6 +628,13 @@ class PopulationNetwork(ObsCtxModuleNetwork):
                                            'ctx':  torch.stack(ctx_hidden_states,  dim=0),
                                            'dpos': torch.stack(dpos_hidden_states, dim=0),
                                            'rule': torch.stack(rule_hidden_states, dim=0)}
+
+            outputs['h0'] = {
+                'obs': obs_hx_0.detach(),
+                'ctx': ctx_hx_0.detach(),
+                'dpos': dpos_hx_0.detach(),
+                'rule': rule_hx_0.detach()
+            }
 
             if return_prior:
                 outputs['prior_hidden'] = {'obs':  torch.stack(prior_obs_hidden_states,  dim=0),

@@ -439,7 +439,7 @@ if __name__ == '__main__':
     # from (sequence files and model weights for the CSVs, CSVs for the figures).
     # Set True to rewrite them all, e.g. after changing CUE_SEED, INCLUDE_PRIOR,
     # INCLUDE_NEXT_STIMULUS, or the figure sampling below.
-    OVERWRITE = False
+    OVERWRITE = True
 
     # Sequence files used by PLOT_BY_POSITION / PLOT_DEVIANT (None: all of them),
     # and by PLOT_TRAJECTORIES. With SEQUENTIAL_PRESENTATION, numbers of pools.
@@ -462,7 +462,8 @@ if __name__ == '__main__':
     INCLUDE_NEXT_STIMULUS = True
     # Also write the prior (first-call) readout of every module to the probability
     # CSVs, and the norm + derivative of its prior hidden state to the activation
-    # CSVs, as prior_-prefixed columns; the unprefixed columns stay the posterior.
+    # CSVs, as prior_-prefixed columns. The posterior columns are posterior_-prefixed
+    # in the probability CSVs and unprefixed in the activation CSVs.
     # Needed by run_model_pair_correlations.py for its prior quantities.
     INCLUDE_PRIOR = True
 
@@ -548,7 +549,7 @@ if __name__ == '__main__':
                                             OUTPUT_ROOT, model_name, CUE_SEED, POOL_CHUNK_SIZE,
                                             INCLUDE_PRIOR)
         else:
-            # Activations CSVs of the sequences, which the activity figures are plotted from.
+            # Probabilities and activations CSVs of the sequences, which the activity figures are plotted from.
             act_csvs = []
             for trial_file in trial_files:
                 act_csvs.append(sequence_csv_path(OUTPUT_ROOT, model_name, 'activations',

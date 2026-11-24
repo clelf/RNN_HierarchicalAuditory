@@ -216,8 +216,8 @@ def read_sequence_reports(prob_csv, name, period, dpos_min, dpos_shift):
 
     # class c -> model-convention position c + dpos_min -> raw file position minus the shift
     class_to_position = dpos_min - dpos_shift
-    dpos_cls = df[class_probability_columns(df.columns, 'dpos')].to_numpy().argmax(axis=1)
-    ctx_probs = df[class_probability_columns(df.columns, 'ctx')].to_numpy()
+    dpos_cls = df[class_probability_columns(df.columns, 'dpos', 'posterior_')].to_numpy().argmax(axis=1)
+    ctx_probs = df[class_probability_columns(df.columns, 'ctx', 'posterior_')].to_numpy()
 
     # Sentinels for the unreported timestep 0: a dpos position no trial can have,
     # "no deviant" for the ctx label, and a probability below any threshold.

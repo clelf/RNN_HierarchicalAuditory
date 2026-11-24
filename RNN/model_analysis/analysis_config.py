@@ -99,21 +99,24 @@ SEQUENCE_CSV_SUFFIXES = {
     'pool_activations':      '_pool_activations.csv',
 }
 
-# Likelihood columns summarised from the *_probabilities_deviant.csv files.
-# cdf_lik_obs and log_lik_obs are derived on read, not stored by the extraction.
-LIKELIHOOD_COLS = ['lik_obs', 'cdf_lik_obs', 'log_lik_obs', 'lik_ctx', 'lik_dpos', 'lik_rule']
+# Posterior likelihood columns summarised from the *_probabilities_deviant.csv files.
+# posterior_cdf_lik_obs and posterior_log_lik_obs are derived on read, not stored
+# by run_exp_trials_pipeline.py.
+LIKELIHOOD_COLS = ['posterior_lik_obs', 'posterior_cdf_lik_obs', 'posterior_log_lik_obs',
+                   'posterior_lik_ctx', 'posterior_lik_dpos', 'posterior_lik_rule']
 
-# Subset actually drawn: cdf_lik_obs stays in the CSVs but is not plotted.
-PLOT_LIKELIHOOD_COLS = ['lik_obs', 'log_lik_obs', 'lik_ctx', 'lik_dpos', 'lik_rule']
+# Subset actually plotted: posterior_cdf_lik_obs stays in the CSVs but is not plotted.
+PLOT_LIKELIHOOD_COLS = ['posterior_lik_obs', 'posterior_log_lik_obs', 'posterior_lik_ctx',
+                        'posterior_lik_dpos', 'posterior_lik_rule']
 
 # (module, kind of likelihood) shown in each subplot title.
 LIKELIHOOD_LABELS = {
-    'lik_obs':     ('obs',  'Gaussian likelihood'),
-    'cdf_lik_obs': ('obs',  'Gaussian CDF'),
-    'log_lik_obs': ('obs',  'log-likelihood'),
-    'lik_ctx':     ('ctx',  'P(true class)'),
-    'lik_dpos':    ('dpos', 'P(true class)'),
-    'lik_rule':    ('rule', 'P(true class)'),
+    'posterior_lik_obs':     ('obs',  'Gaussian likelihood'),
+    'posterior_cdf_lik_obs': ('obs',  'Gaussian CDF'),
+    'posterior_log_lik_obs': ('obs',  'log-likelihood'),
+    'posterior_lik_ctx':     ('ctx',  'P(true class)'),
+    'posterior_lik_dpos':    ('dpos', 'P(true class)'),
+    'posterior_lik_rule':    ('rule', 'P(true class)'),
 }
 
 # Per-file scalar parameters carried in the deviant-probability CSVs themselves.

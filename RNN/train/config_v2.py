@@ -123,9 +123,10 @@ class DataConfig:
 
     # Parameter testing bounds
     params_testing: bool = True
-    mu_tau_bounds: dict = field(default_factory=lambda: {'low': 1, 'high': 250})
-    si_stat_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
-    si_r_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
+    # mu_tau and si_stat are overwritten in for_hierarchical_experiment
+    # mu_tau_bounds: dict = field(default_factory=lambda: {'low': 1, 'high': 250})
+    # si_stat_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
+    si_r_bounds: dict = field(default_factory=lambda: {'low': 0.01, 'high': 0.2})
 
     # Optional override: pin the observation noise sigma_r to a single value instead of
     # sampling it from si_r_bounds. All other generative parameters keep being sampled
@@ -177,17 +178,12 @@ class DataConfig:
                                     max_cores: Optional[int] = None,
                                     iti: bool = False,
                                     si_r_fixed: Optional[float] = None) -> 'DataConfig':
-        """Canonical HierarchicalGM data configuration.
+        """Reference HierarchicalGM data generation hyperparameters configuration.
 
-        SINGLE SOURCE OF TRUTH for the hierarchical data-generation
-        hyperparameters, shared by model training (experiment.py) and Kalman
-        filter benchmark computation (benchmark_experiment.py). Tune data
-        hyperparameters HERE so that models and their KF benchmarks are always
-        generated from the same distribution.
+        Shared by model training (experiment.py) and Kalman
+        filter benchmark computation (benchmark_experiment.py).
 
-        Sequence length = N_tones * N_blocks (default 8 * 125 = 1000). Pass a
-        smaller N_blocks for fast smoke tests (KF benchmarking is O(T^2) in the
-        sequence length, so shrinking N_blocks is the way to get a quick run).
+        Sequence length = N_tones * N_blocks (default 8 * 125 = 1000)
         """
         return cls(
             gm_name='HierarchicalGM',
@@ -202,7 +198,7 @@ class DataConfig:
             # Deviant positions match the experimental sequences (rule 0 -> {2,3,4},
             # rule 1 -> {4,5,6}); model dpos classes 0..4 then map to positions 2..6.
             rules_dpos_set=np.array([[2, 3, 4], [4, 5, 6]]),
-            mu_rho_rules=0.9,
+            mu_rho_rules=0.85,
             si_rho_rules=0.05,
             si_lim=5,
             # With couple_tau=True these bounds apply to the BASE tau_dev; the standard
@@ -233,14 +229,12 @@ class DataConfig:
                                        si_r_fixed: Optional[float] = None) -> 'DataConfig':
         """Canonical NonHierarchicalGM data configuration.
 
-        Companion to for_hierarchical_experiment: SINGLE SOURCE OF TRUTH for the
-        non-hierarchical data-generation hyperparameters, shared by training
-        (experiment.py) and KF benchmark computation (benchmark_experiment.py).
+        Shared by training (experiment.py) and KF benchmark
+        computation (benchmark_experiment.py).
 
         NonHierarchicalAuditGM forces N_blocks = 1 internally, so the full
         sequence length is simply N_tones. Noise bounds mirror
-        for_hierarchical_experiment so the two GMs stay directly comparable;
-        tune NonHierarchicalGM-specific values HERE.
+        for_hierarchical_experiment so the two GMs stay directly comparable.
         """
         return cls(
             gm_name='NonHierarchicalGM',
