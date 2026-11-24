@@ -1309,7 +1309,7 @@ def extract_deviant_activity(dev_df, column):
         within-trial position of the deviant (see
         exp_sequence_analysis.load_deviant_activity_frame).
     column : str
-        The activity column to summarise, e.g. 'ctx_norm' or 'ctx_deriv'.
+        The activity column to summarise, e.g. 'posterior_ctx_norm' or 'posterior_ctx_deriv'.
 
     Returns
     -------

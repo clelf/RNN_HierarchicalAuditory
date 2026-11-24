@@ -6,7 +6,8 @@ or off in the settings of the __main__ block. Paths are relative to
 ``<output-root>/<model name>/``.
 
   Outputs (one per sequence file)
-    WRITE_ACTIVATIONS          per-timestep module activity norms + derivatives
+    WRITE_ACTIVATIONS          per-timestep module activity norms + derivatives,
+                               and hidden state updates with INCLUDE_PRIOR
                                -> activations/*_activations.csv
     WRITE_ACTIVATIONS_DEVIANT  one row per trial, sampled at the deviant timestep
                                -> activations_deviant/*_deviant_trial.csv
@@ -147,12 +148,15 @@ def write_proba_and_activ_csvs(model, info, trial_files, analysis_output_kinds, 
         #   norms:  dict module → (T-1, N);  derivs: dict module → (T-1, N), row 0 NaN
         # With include_prior, the probabilities are also read from the prior
         # (first-call) readout of each module, i.e. before the feedback sweep, and
-        # the norms and derivatives from the prior hidden states.
+        # the norms and derivatives from the prior hidden states. The hidden state
+        # updates of the prior and posterior passes are also read: dict module → (T-1, N).
         forward = get_module_output_and_activity(model, y, q, return_prior=include_prior)
         probs, norms, derivs = forward[:3]
         prior_probs = forward[3] if include_prior else None
         prior_norms = forward[4] if include_prior else None
         prior_derivs = forward[5] if include_prior else None
+        prior_update = forward[6] if include_prior else None
+        posterior_update = forward[7] if include_prior else None
 
         for j, (trial_file, seq) in enumerate(zip(chunk, seqs)):
             obs, cue, ctx, dpos_raw, rule, lim_std, d, tau_std, trial_n = seq
@@ -163,15 +167,21 @@ def write_proba_and_activ_csvs(model, info, trial_files, analysis_output_kinds, 
             seq_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T-1,)
             seq_prior_norms = None
             seq_prior_derivs = None
+            seq_prior_update = None
+            seq_posterior_update = None
             if include_prior:
                 seq_prior_norms = {name: arr[:, j] for name, arr in prior_norms.items()}
                 seq_prior_derivs = {name: arr[:, j] for name, arr in prior_derivs.items()}
+                seq_prior_update = {name: arr[:, j] for name, arr in prior_update.items()}
+                seq_posterior_update = {name: arr[:, j] for name, arr in posterior_update.items()}
 
             if 'activations' in kinds:
                 out_df = exp.build_activations_frame(obs, cue, seq_norms, seq_derivs,
                                                      lim_std, d, tau_std, trial_n,
                                                      prior_norms=seq_prior_norms,
-                                                     prior_derivs=seq_prior_derivs)
+                                                     prior_derivs=seq_prior_derivs,
+                                                     prior_update=seq_prior_update,
+                                                     posterior_update=seq_posterior_update)
                 out_df.to_csv(sequence_csv_path(output_root, model_name, 'activations', stem),
                               index=False)
 
@@ -179,7 +189,8 @@ def write_proba_and_activ_csvs(model, info, trial_files, analysis_output_kinds, 
                 out_df = exp.build_deviant_activations_frame(
                     obs, dpos_raw, seq_norms, seq_derivs, lim_std, d, tau_std, trial_n,
                     period=period, dpos_shift=dpos_shift,
-                    prior_norms=seq_prior_norms, prior_derivs=seq_prior_derivs)
+                    prior_norms=seq_prior_norms, prior_derivs=seq_prior_derivs,
+                    prior_update=seq_prior_update, posterior_update=seq_posterior_update)
                 out_df.to_csv(sequence_csv_path(output_root, model_name, 'activations_deviant', stem),
                               index=False)
 
@@ -235,11 +246,14 @@ def write_pool_activations_csvs(model, info, pools, pool_indices, pool_seed, out
                          dtype=torch.float32)                           # (N, T_total, n_cue)
 
         #   norms and derivs:  dict module → (T_total-1, N)
-        # With include_prior, also the norms and derivatives of the prior hidden states.
+        # With include_prior, also the norms and derivatives of the prior hidden states,
+        # and the hidden state updates of the prior and posterior passes.
         forward = get_module_output_and_activity(model, y, q, return_prior=include_prior)
         norms, derivs = forward[1:3]
         prior_norms = forward[4] if include_prior else None
         prior_derivs = forward[5] if include_prior else None
+        prior_update = forward[6] if include_prior else None
+        posterior_update = forward[7] if include_prior else None
 
         for j, (pool_index, loaded_pool) in enumerate(zip(chunk, loaded_pools)):
             obs, cue, timesteps = loaded_pool
@@ -247,12 +261,17 @@ def write_pool_activations_csvs(model, info, pools, pool_indices, pool_seed, out
             pool_derivs = {name: arr[:, j] for name, arr in derivs.items()}    # each: (T_total-1,)
             pool_prior_norms = None
             pool_prior_derivs = None
+            pool_prior_update = None
+            pool_posterior_update = None
             if include_prior:
                 pool_prior_norms = {name: arr[:, j] for name, arr in prior_norms.items()}
                 pool_prior_derivs = {name: arr[:, j] for name, arr in prior_derivs.items()}
+                pool_prior_update = {name: arr[:, j] for name, arr in prior_update.items()}
+                pool_posterior_update = {name: arr[:, j] for name, arr in posterior_update.items()}
 
             out_df = exp.build_pool_activations_frame(obs, cue, pool_norms, pool_derivs, timesteps,
-                                                      pool_prior_norms, pool_prior_derivs)
+                                                      pool_prior_norms, pool_prior_derivs,
+                                                      pool_prior_update, pool_posterior_update)
             out_df.to_csv(sequence_csv_path(output_root, model_name, 'pool_activations',
                                             pool_name(pool_index, pool_seed)),
                           index=False)
@@ -462,8 +481,9 @@ if __name__ == '__main__':
     INCLUDE_NEXT_STIMULUS = True
     # Also write the prior (first-call) readout of every module to the probability
     # CSVs, and the norm + derivative of its prior hidden state to the activation
-    # CSVs, as prior_-prefixed columns. The posterior columns are posterior_-prefixed
-    # in the probability CSVs and unprefixed in the activation CSVs.
+    # CSVs, as prior_-prefixed columns, next to the posterior_-prefixed ones. Also
+    # writes the hidden state updates of the prior and posterior passes to the
+    # activation CSVs (prior_<module>_update and posterior_<module>_update columns).
     # Needed by run_model_pair_correlations.py for its prior quantities.
     INCLUDE_PRIOR = True
 

@@ -47,11 +47,11 @@ from analysis_core import (
 # =============================================================================
 # Extraction: per-sequence tables
 # =============================================================================
-def add_module_activity_columns(out_df, norms, derivs, n_out, prefix=''):
+def add_module_activity_columns(out_df, norms, derivs, n_out, prefix):
     """Append one block of per-module activity norms and derivatives to `out_df`.
 
-    Called once per pass of a forward cycle: with prefix='' for the posterior
-    hidden states (the state each module ends the timestep with) and with
+    Called once per pass of a forward cycle: with prefix='posterior_' for the
+    posterior hidden states (the state each module ends the timestep with) and with
     prefix='prior_' for the states their first call left them in.
 
     Parameters
@@ -76,6 +76,25 @@ def add_module_activity_columns(out_df, norms, derivs, n_out, prefix=''):
         out_df[f'{prefix}{name}_deriv'] = derivs[name]
 
 
+def add_module_update_columns(out_df, prior_update, posterior_update):
+    """Append per-module hidden state updates to out_df: the size of the change in
+    hidden state caused by the posterior pass ('posterior_<module>_update' columns)
+    and by the prior pass ('prior_<module>_update' columns) of each timestep.
+
+    Parameters
+    ----------
+    out_df : pandas.DataFrame
+        Frame to add the columns to, modified in place.
+    prior_update, posterior_update : dict
+        Module name → ndarray of shape (n_out,), as returned by
+        analysis_core.compute_hidden_states_update for one sequence.
+    """
+    for name in MODULES:
+        out_df[f'posterior_{name}_update'] = posterior_update[name]
+    for name in MODULES:
+        out_df[f'prior_{name}_update'] = prior_update[name]
+
+
 def get_two_cue_encoding(cue):
     """The two cues of a sequence as a (T, 2) one-hot, from the model's (T, n_cue_classes) cue input.
 
@@ -89,7 +108,8 @@ def get_two_cue_encoding(cue):
     return cue[:, used_cols]
 
 
-def build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs):
+def build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs,
+                                 prior_update, posterior_update):
     """Observation, cue and module activity columns, one row per model output timestep.
 
     The part of the activations CSVs shared by single sequences
@@ -102,9 +122,12 @@ def build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_der
     The probabilities CSVs use the same 'timestep' column, so the two kinds of
     output are aligned by joining on it (merge_activations_and_probabilities).
 
+    The activity columns of the posterior hidden states carry a 'posterior_' prefix.
     `prior_norms` / `prior_derivs`, when not None (get_module_output_and_activity(...,
     return_prior=True)), add the same columns computed on the prior hidden states,
-    under a 'prior_' prefix. The unprefixed columns always hold the posterior pass.
+    under a 'prior_' prefix.
+    They come with prior_update / posterior_update, the hidden state updates of both
+    passes (add_module_update_columns).
     """
     n_out = next(iter(norms.values())).shape[0]
 
@@ -118,16 +141,18 @@ def build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_der
         'cue_2':        cue_out[:, 1].astype(int),
     })
 
-    add_module_activity_columns(out_df, norms, derivs, n_out)
+    add_module_activity_columns(out_df, norms, derivs, n_out, prefix='posterior_')
 
     if prior_norms is not None:
         add_module_activity_columns(out_df, prior_norms, prior_derivs, n_out,
                                     prefix='prior_')
+        add_module_update_columns(out_df, prior_update, posterior_update)
     return out_df
 
 
 def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_n,
-                            prior_norms=None, prior_derivs=None):
+                            prior_norms=None, prior_derivs=None,
+                            prior_update=None, posterior_update=None):
     """Per-timestep activity CSV of one sequence: one row per model output timestep.
 
     Rows are the T-1 model output timesteps t = 0 ... T-2 ('timestep' column); the
@@ -137,9 +162,12 @@ def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_
 
     `prior_norms` / `prior_derivs`, when given (get_module_output_and_activity(...,
     return_prior=True)), add the same columns computed on the prior hidden states,
-    under a 'prior_' prefix. The unprefixed columns always hold the posterior pass.
+    under a 'prior_' prefix, next to the 'posterior_' ones.
+    prior_update / posterior_update are given with them and add the hidden state
+    update columns (add_module_update_columns).
     """
-    out_df = build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs)
+    out_df = build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs,
+                                          prior_update, posterior_update)
     n_out = len(out_df)
     out_df['lim_std'] = lim_std
     out_df['d'] = d
@@ -148,7 +176,8 @@ def build_activations_frame(obs, cue, norms, derivs, lim_std, d, tau_std, trial_
     return out_df
 
 
-def build_pool_activations_frame(obs, cue, norms, derivs, timesteps, prior_norms, prior_derivs):
+def build_pool_activations_frame(obs, cue, norms, derivs, timesteps, prior_norms, prior_derivs,
+                                 prior_update, posterior_update):
     """Per-timestep activity CSV of one pool of sequences presented one after the other.
 
     Same columns as build_activations_frame, from one forward pass over the joined
@@ -159,14 +188,15 @@ def build_pool_activations_frame(obs, cue, norms, derivs, timesteps, prior_norms
     model output timesteps t = 0 ... T_total-2: the last timestep of the last
     sequence has none. 'timestep' runs over the joined sequences of the pool.
     """
-    out_df = build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs)
+    out_df = build_activity_columns_frame(obs, cue, norms, derivs, prior_norms, prior_derivs,
+                                          prior_update, posterior_update)
     n_out = len(out_df)
     for column in ['sequence_name', 'pool_position', 'lim_std', 'd', 'tau_std', 'trial_n']:
         out_df[column] = timesteps[column].to_numpy()[:n_out]
     return out_df
 
 
-def add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, prefix=''):
+def add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, prefix):
     """Append per-module activity sampled at the deviant timestep of each trial.
 
     Same column block as add_module_activity_columns, but one row per trial: each
@@ -180,9 +210,22 @@ def add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out, p
         out_df[f'{prefix}{name}_deriv'] = read_trial_at(derivs[name], dev_idx, n_out)
 
 
+def add_module_deviant_update_columns(out_df, prior_update, posterior_update, dev_idx, n_out):
+    """Append per-module hidden state updates sampled at the deviant timestep of each trial.
+
+    Same columns as add_module_update_columns, but one row per trial: the updates
+    caused by the prior and posterior passes of the timestep of the deviant, dev_idx.
+    """
+    for name in MODULES:
+        out_df[f'posterior_{name}_update'] = read_trial_at(posterior_update[name], dev_idx, n_out)
+    for name in MODULES:
+        out_df[f'prior_{name}_update'] = read_trial_at(prior_update[name], dev_idx, n_out)
+
+
 def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, tau_std,
                                     trial_n, period, dpos_shift,
-                                    prior_norms=None, prior_derivs=None):
+                                    prior_norms=None, prior_derivs=None,
+                                    prior_update=None, posterior_update=None):
     """One row per trial, sampled at the deviant timestep.
 
     Two distinct uses of dpos are kept separate:
@@ -191,8 +234,11 @@ def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, ta
       * the stored deviant_pos LABEL is shifted into the model's convention so it
         matches the probabilities stage's dpos column and the model's class mapping.
 
+    The activity columns of the posterior hidden states carry a 'posterior_' prefix.
     `prior_norms` / `prior_derivs`, when given, add the same columns computed on the
-    prior hidden states, under a 'prior_' prefix.
+    prior hidden states, under a 'prior_' prefix. prior_update / posterior_update are
+    given with them and add the hidden state update columns
+    (add_module_deviant_update_columns).
     """
     n_out = next(iter(norms.values())).shape[0]     # T-1: norms and derivs at timesteps 0 ... T-2
 
@@ -212,11 +258,13 @@ def build_deviant_activations_frame(obs, dpos_raw, norms, derivs, lim_std, d, ta
         'deviant_pos':  deviant_pos,
     })
 
-    add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out)
+    add_module_deviant_activity_columns(out_df, norms, derivs, dev_idx, n_out,
+                                        prefix='posterior_')
 
     if prior_norms is not None:
         add_module_deviant_activity_columns(out_df, prior_norms, prior_derivs, dev_idx,
                                             n_out, prefix='prior_')
+        add_module_deviant_update_columns(out_df, prior_update, posterior_update, dev_idx, n_out)
 
     out_df['lim_std'] = lim_std
     out_df['d'] = d
@@ -611,15 +659,15 @@ def compute_intermodule_correlations(module_norms_dict, use_derivatives=False, a
     return float(np.mean(values))
 
 
-def load_module_dict(df, suffix):
-    """Build {module_name: 1D array} from columns named '<module>_<suffix>'.
+def load_module_dict(df, prefix, suffix):
+    """Build {module_name: 1D array} from columns named '<prefix><module>_<suffix>'.
 
     Rows with NaN (e.g. the padded first derivative timestep) are dropped so all
     modules keep the same length.
     """
-    cols = [f'{m}_{suffix}' for m in MODULES]
+    cols = [f'{prefix}{m}_{suffix}' for m in MODULES]
     values = df[cols].dropna()
-    return {m: values[f'{m}_{suffix}'].to_numpy() for m in MODULES}
+    return {m: values[f'{prefix}{m}_{suffix}'].to_numpy() for m in MODULES}
 
 
 def aggregate_scores(pair_correlations):
@@ -647,7 +695,10 @@ def load_deviant_activity(act_csv):
     """Load a per-trial deviant-activity CSV.
 
     Returns the DataFrame as written: one row per trial with columns
-    trial_n, deviant_pos, <module>_norm, <module>_deriv, lim_std, d, tau_std.
+    trial_n, deviant_pos, posterior_<module>_norm, posterior_<module>_deriv,
+    lim_std, d, tau_std, and, when written with INCLUDE_PRIOR = True, the
+    prior_<module>_norm, prior_<module>_deriv, posterior_<module>_update and
+    prior_<module>_update columns.
     """
     return pd.read_csv(act_csv)
 
@@ -688,7 +739,7 @@ def load_deviant_likelihoods(prob_csv, context_label=1, module_names=MODULE_NAME
 def join_activity_likelihood(act_df, lik_df, module_names=MODULE_NAMES):
     """Merge per-trial deviant activity and deviant likelihoods on trial_n.
 
-    Adds a ``mean_norm`` column: the mean activity across modules at the deviant
+    Adds a ``posterior_mean_norm`` column: the mean posterior activity across modules at the deviant
     (the average module activity referred to in the analysis). The merge is an
     inner join on trial_n, so only trials present in both frames are kept.
 
@@ -699,17 +750,17 @@ def join_activity_likelihood(act_df, lik_df, module_names=MODULE_NAMES):
     lik_df : pandas.DataFrame
         Output of :func:`load_deviant_likelihoods`.
     module_names : list of str
-        Modules to average over for ``mean_norm``.
+        Modules to average over for ``posterior_mean_norm``.
 
     Returns
     -------
     pandas.DataFrame
-        The merged per-trial frame with an added ``mean_norm`` column.
+        The merged per-trial frame with an added ``posterior_mean_norm`` column.
     """
     merged = pd.merge(act_df, lik_df, on='trial_n', how='inner',
                       suffixes=('', '_lik'))
-    norm_cols = [f'{m}_norm' for m in module_names]
-    merged['mean_norm'] = merged[norm_cols].mean(axis=1)
+    norm_cols = [f'posterior_{m}_norm' for m in module_names]
+    merged['posterior_mean_norm'] = merged[norm_cols].mean(axis=1)
     return merged
 
 
@@ -798,7 +849,7 @@ def load_sequence_means(seq_files):
     records = []
     for f in seq_files:
         seq_df = pd.read_csv(f)
-        rec = {m: seq_df[f'{m}_norm'].mean() for m in MODULES}
+        rec = {m: seq_df[f'posterior_{m}_norm'].mean() for m in MODULES}
         rec['lim_std'] = seq_df['lim_std'].iloc[0]
         rec['d'] = seq_df['d'].iloc[0]
         rec['tau_std'] = seq_df['tau_std'].iloc[0]
@@ -817,7 +868,7 @@ def load_timestep_means(seq_files, with_position=False):
     per_ts = []
     for f in seq_files:
         seq_df = pd.read_csv(f)
-        sub = seq_df[[f'{m}_norm' for m in MODULES]].copy()
+        sub = seq_df[[f'posterior_{m}_norm' for m in MODULES]].copy()
         sub['timestep'] = seq_df['timestep']
         if with_position:
             # 0-based index of the timestep within its trial
@@ -836,28 +887,47 @@ def load_timestep_means(seq_files, with_position=False):
     return ts_means, pos_order
 
 
-def load_activity_norms(act_files, prior):
-    """{module: (T-1, n_files) activity norms}, stacked from per-sequence activations CSVs.
+def load_module_activity_columns(act_files, column_suffix, prior):
+    """{module: (T-1, n_files) array} of one per-module quantity, stacked from per-sequence activations CSVs.
 
-    The norms of the posterior hidden states ('<module>_norm' columns), or with
-    `prior` those of the prior hidden states ('prior_<module>_norm' columns,
-    written by run_exp_trials_pipeline.py with INCLUDE_PRIOR = True).
+    Reads the 'posterior_<module>_<column_suffix>' columns, or with prior the
+    'prior_<module>_<column_suffix>' columns (written by run_exp_trials_pipeline.py
+    with INCLUDE_PRIOR = True).
 
     The layout get_module_output_and_activity returns for a batch, so the activity
-    figures draw the same arrays whether they come from a forward pass or from
+    figures plot the same arrays whether they come from a forward pass or from
     disk. Sequences of unequal length are truncated to the shortest one.
     """
     if prior:
         prefix = 'prior_'
     else:
-        prefix = ''
-    norm_cols = [f'{prefix}{m}_norm' for m in MODULES]
-    frames = [pd.read_csv(f, usecols=norm_cols) for f in act_files]
-    min_len = min(len(df) for df in frames)
-    if any(len(df) != min_len for df in frames):
+        prefix = 'posterior_'
+    columns = [f'{prefix}{m}_{column_suffix}' for m in MODULES]
+    dfs = [pd.read_csv(f, usecols=columns) for f in act_files]
+    min_len = min(len(df) for df in dfs)
+    if any(len(df) != min_len for df in dfs):
         print(f"  Warning: sequences have unequal lengths — truncating all to {min_len} timesteps")
-    return {m: np.stack([df[f'{prefix}{m}_norm'].to_numpy()[:min_len] for df in frames], axis=1)
+    return {m: np.stack([df[f'{prefix}{m}_{column_suffix}'].to_numpy()[:min_len] for df in dfs], axis=1)
             for m in MODULES}
+
+
+def load_activity_norms(act_files, prior):
+    """{module: (T-1, n_files) activity norms}, stacked from per-sequence activations CSVs.
+
+    The norms of the posterior hidden states, or with prior those of the prior
+    hidden states (see load_module_activity_columns).
+    """
+    return load_module_activity_columns(act_files, 'norm', prior)
+
+
+def load_hidden_states_updates(act_files, prior):
+    """{module: (T-1, n_files) hidden state updates}, stacked from per-sequence activations CSVs.
+
+    The size of the change in hidden state caused by the posterior pass, or with
+    prior by the prior pass, of each timestep (analysis_core.compute_hidden_states_update;
+    see load_module_activity_columns for the layout).
+    """
+    return load_module_activity_columns(act_files, 'update', prior)
 
 
 def load_timestep_rules(act_files, sequence_files_by_csv):

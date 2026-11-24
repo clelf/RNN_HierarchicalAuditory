@@ -46,7 +46,8 @@ ASSOCIATION_FIGURES = [
 def build_correlation_scores(activations_dir):
     """One row per sequence: every module-pair correlation plus the aggregates.
 
-    Both the activities ('*_norm') and the derivatives ('*_deriv') are scored,
+    Both the posterior activities ('posterior_*_norm') and their derivatives
+    ('posterior_*_deriv') are scored,
     giving columns such as 'activity_obs_ctx' and 'derivative_dpos_rule'
     alongside 'activity_mean_abs' / 'activity_abs_mean' / 'activity_mean'.
     """
@@ -60,7 +61,7 @@ def build_correlation_scores(activations_dir):
             'tau_std': df['tau_std'].iloc[0],
         }
         for kind, suffix in [('activity', 'norm'), ('derivative', 'deriv')]:
-            module_dict = exp.load_module_dict(df, suffix)
+            module_dict = exp.load_module_dict(df, 'posterior_', suffix)
             pair_correlations = exp.compute_pairwise_module_correlations(
                 module_dict, use_derivatives=False)
             for pair_name, corr in pair_correlations.items():

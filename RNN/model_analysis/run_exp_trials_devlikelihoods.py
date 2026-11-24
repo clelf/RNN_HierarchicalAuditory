@@ -117,7 +117,7 @@ if __name__ == '__main__':
 
     if RUN_ACTIVITY_JOIN:
         print(f"\n{'=' * 79}\nActivity against likelihood at the deviant\n{'=' * 79}")
-        activity_cols = [f'{m}_norm' for m in cfg.MODULE_NAMES] + ['mean_norm']
+        activity_cols = [f'posterior_{m}_norm' for m in cfg.MODULE_NAMES] + ['posterior_mean_norm']
         activity_labels = [f'{m} act.' for m in cfg.MODULE_NAMES] + ['mean act.']
         likelihood_cols = [f'posterior_lik_{m}' for m in cfg.MODULE_NAMES]
         likelihood_labels = [f'lik {m}' for m in cfg.MODULE_NAMES]

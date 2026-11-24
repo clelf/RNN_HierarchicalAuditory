@@ -8,8 +8,8 @@ every pair of models, plus the mean over the pairs.
 
 The four quantities, read from the activation CSVs of run_exp_trials_pipeline.py:
 
-  posterior_norm    L2 norm of the posterior hidden state    '<module>_norm'
-  posterior_deriv   its temporal derivative                  '<module>_deriv'
+  posterior_norm    L2 norm of the posterior hidden state    'posterior_<module>_norm'
+  posterior_deriv   its temporal derivative                  'posterior_<module>_deriv'
   prior_norm        L2 norm of the prior hidden state        'prior_<module>_norm'
   prior_deriv       its temporal derivative                  'prior_<module>_deriv'
 
@@ -92,14 +92,11 @@ from analysis_core import (
 def quantity_column_name(quantity, module):
     """Name of the activations CSV column holding one quantity of one module.
 
-    The posterior columns are unprefixed ('obs_norm') and the prior ones carry a
-    'prior_' prefix ('prior_obs_norm'), as written by
-    exp_sequence_analysis.build_activations_frame.
+    The columns carry a 'posterior_' or 'prior_' prefix ('posterior_obs_norm',
+    'prior_obs_norm'), as written by exp_sequence_analysis.build_activations_frame.
     """
     hidden_state, measure = quantity.split('_')     # e.g. 'prior', 'norm'
-    if hidden_state == 'prior':
-        return f'prior_{module}_{measure}'
-    return f'{module}_{measure}'
+    return f'{hidden_state}_{module}_{measure}'
 
 
 def model_pair_column(model_a, model_b):

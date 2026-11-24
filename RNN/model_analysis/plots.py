@@ -555,8 +555,8 @@ def plot_deviant_activity_by_position(dev_df, module_titles, output_dir, model_n
     ----------
     dev_df : pandas.DataFrame
         One row per (sequence, trial): the per-trial deviant-activity CSVs of the
-        sequences to average over, concatenated, with '<module>_norm' /
-        '<module>_deriv' columns sampled at the deviant, 'trial_n', and 'dev_pos'
+        sequences to average over, concatenated, with 'posterior_<module>_norm' /
+        'posterior_<module>_deriv' columns sampled at the deviant, 'trial_n', and 'dev_pos'
         (0-based within-trial deviant position; see
         exp_sequence_analysis.load_deviant_activity_frame).
     module_titles : dict
@@ -590,10 +590,10 @@ def plot_deviant_activity_by_position(dev_df, module_titles, output_dir, model_n
 
     for ax, module_name in zip(axes, module_titles):
         if include_derivatives:
-            column = f'{module_name}_deriv'
+            column = f'posterior_{module_name}_deriv'
             ylabel = 'dActivity/dt'
         else:
-            column = f'{module_name}_norm'
+            column = f'posterior_{module_name}_norm'
             ylabel = 'Activity (L2 norm)'
 
         by_dev = extract_deviant_activity(dev_df, column)
@@ -1567,7 +1567,7 @@ def plot_timestep_matrix(ts_df, figures_dir, filename, suptitle):
     with progression through the sequence.
     """
     def draw_cell(ax, mi, mj, legend):
-        sns.scatterplot(data=ts_df, x=f'{mj}_norm', y=f'{mi}_norm',
+        sns.scatterplot(data=ts_df, x=f'posterior_{mj}_norm', y=f'posterior_{mi}_norm',
                         hue='timestep', palette='viridis', ax=ax, s=15,
                         legend=legend)
 
@@ -1601,7 +1601,7 @@ def plot_timestep_matrix_by_position(ts_means, pos_order, figures_dir):
     timestep gradient.
     """
     def draw_cell(ax, mi, mj, legend):
-        sns.scatterplot(data=ts_means, x=f'{mj}_norm', y=f'{mi}_norm',
+        sns.scatterplot(data=ts_means, x=f'posterior_{mj}_norm', y=f'posterior_{mi}_norm',
                         hue='position', hue_order=pos_order, palette='tab10',
                         ax=ax, s=20, legend=legend)
 
@@ -1625,7 +1625,7 @@ def plot_timestep_matrix_by_position_gradient(ts_means, pos_order, figures_dir):
         for p_idx, p in enumerate(positions):
             sub = ts_means[ts_means['position'] == p]
             t_min, t_max = sub['timestep'].min(), sub['timestep'].max()
-            ax.scatter(sub[f'{mj}_norm'], sub[f'{mi}_norm'],
+            ax.scatter(sub[f'posterior_{mj}_norm'], sub[f'posterior_{mi}_norm'],
                        c=sub['timestep'], cmap=POSITION_CMAPS[p_idx % len(POSITION_CMAPS)],
                        s=20, vmin=t_min, vmax=t_max)
 
