@@ -124,8 +124,8 @@ class DataConfig:
     # Parameter testing bounds
     params_testing: bool = True
     # mu_tau and si_stat are overwritten in for_hierarchical_experiment
-    # mu_tau_bounds: dict = field(default_factory=lambda: {'low': 1, 'high': 250})
-    # si_stat_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
+    mu_tau_bounds: dict = field(default_factory=lambda: {'low': 1, 'high': 250})
+    si_stat_bounds: dict = field(default_factory=lambda: {'low': 0.1, 'high': 2})
     si_r_bounds: dict = field(default_factory=lambda: {'low': 0.01, 'high': 0.2})
 
     # Optional override: pin the observation noise sigma_r to a single value instead of
@@ -469,7 +469,6 @@ class RunConfig:
         Deserialize RunConfig from a dictionary (e.g., loaded from JSON).
         """
         # Filter DataConfig fields to only include valid constructor args
-        import inspect
         data_config_fields = {f.name for f in DataConfig.__dataclass_fields__.values()}
         data_dict = {k: v for k, v in d.get('data', {}).items()
                      if k in data_config_fields}
